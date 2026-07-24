@@ -3,12 +3,15 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/internal/testutil"
@@ -76,6 +79,115 @@ func TestWorkspacePlanApplyAllFormats(t *testing.T) {
 				t.Fatalf("retry was not idempotent: %#v", retried)
 			}
 		})
+	}
+}
+
+func TestWorkspacePlanApplyRemoteHost(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", "phase2-test-access-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "phase2-test-secret-key")
+	root := t.TempDir()
+	if output, err := exec.Command("git", "-C", root, "init").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := InitWorkspace(InitWorkspaceRequest{Root: root, Name: "remote-workspace"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetupRepository(SetupRepositoryRequest{
+		Root: root, Name: "python", Format: "pypi", HostType: "s3", Visibility: "public",
+		Bucket: "packages", Prefix: "python", Region: "us-east-1",
+		CanonicalEndpoint: "https://packages.example/python",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := workspaceArtifact(t, root, "pypi", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "python", Artifacts: []string{artifact}}); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "add remote wheel")
+	remote := &recordingHost{}
+	resolver := staticHostResolver{host: remote}
+	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
+	planName := filepath.Join(root, "remote.json")
+	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt,
+		ExpiresIn: time.Hour, Hosts: resolver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := state.LoadPlan(planName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planBytes, err := os.ReadFile(planName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(planBytes), "phase2-test-access-key") || strings.Contains(string(planBytes), "phase2-test-secret-key") {
+		t.Fatal("provider credentials leaked into plan")
+	}
+	if plan.Payload.Repositories[0].Host.Type != "s3" || plan.Payload.Repositories[0].ObservedRevision != "" || plan.Payload.Repositories[0].CanonicalEndpoint != "https://packages.example/python" ||
+		plan.Payload.Repositories[0].InstallDocSHA256 == "" || plan.Payload.Repositories[0].DesiredManifestSHA256 == "" {
+		t.Fatalf("plan did not bind remote host state: %#v", plan.Payload.Repositories[0])
+	}
+	document, err := os.ReadFile(filepath.Join(root, "docs", "install-python.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(document), "python -m pip install --index-url 'https://packages.example/python/simple/' PACKAGE") {
+		t.Fatalf("unexpected install document %q", document)
+	}
+	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, Now: createdAt.Add(time.Minute), StructuralOnly: true, Hosts: resolver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Applied != 1 || remote.stageCalls != 1 || remote.commitCalls != 1 || remote.revision.TreeSHA256 != plan.Payload.Repositories[0].DesiredTreeSHA256 {
+		t.Fatalf("unexpected remote apply result %#v stage=%d commit=%d revision=%#v", result, remote.stageCalls, remote.commitCalls, remote.revision)
+	}
+	retried, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, Now: createdAt.Add(2 * time.Minute), StructuralOnly: true, Hosts: resolver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Current != 1 || remote.stageCalls != 1 || remote.commitCalls != 1 {
+		t.Fatalf("remote retry was not idempotent: %#v", retried)
+	}
+	remote.revision.ManifestSHA256 = strings.Repeat("f", 64)
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, Now: createdAt.Add(3 * time.Minute), StructuralOnly: true, Hosts: resolver,
+	}); err == nil || !strings.Contains(err.Error(), "desired tree was published by another change") {
+		t.Fatalf("apply accepted a different desired manifest: %v", err)
+	}
+	records, err := state.LoadLedger(root, "python")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].PlanID != planned.PlanID {
+		t.Fatalf("unexpected remote publication records %#v", records)
+	}
+	remote.revision.ManifestSHA256 = plan.Payload.Repositories[0].DesiredManifestSHA256
+	secondPlanName := filepath.Join(root, "remote-second.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: secondPlanName, CreatedAt: createdAt.Add(10 * time.Minute), GeneratedAt: createdAt.Add(10 * time.Minute),
+		ExpiresIn: time.Hour, Hosts: resolver,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondPlan, err := state.LoadPlan(secondPlanName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondPlan.Payload.Repositories[0].Action != "update" || secondPlan.Payload.Repositories[0].ObservedTreeSHA256 != secondPlan.Payload.Repositories[0].DesiredTreeSHA256 ||
+		secondPlan.Payload.Repositories[0].ObservedManifestSHA256 == secondPlan.Payload.Repositories[0].DesiredManifestSHA256 {
+		t.Fatalf("same-tree manifest change was not planned as an update: %#v", secondPlan.Payload.Repositories[0])
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: secondPlanName, Now: createdAt.Add(11 * time.Minute), StructuralOnly: true, Hosts: resolver,
+	}); err != nil {
+		t.Fatalf("apply same-tree manifest update: %v", err)
 	}
 }
 
@@ -768,7 +880,12 @@ func initializeRepository(t *testing.T, root, format string) {
 
 func commitWorkspace(t *testing.T, root, message string) {
 	t.Helper()
-	if output, err := exec.Command("git", "-C", root, "add", ".gitignore", "snailmail.toml", "repos").CombinedOutput(); err != nil {
+	paths := []string{".gitignore", "snailmail.toml", "repos"}
+	if info, err := os.Lstat(filepath.Join(root, "docs")); err == nil && info.IsDir() {
+		paths = append(paths, "docs")
+	}
+	arguments := append([]string{"-C", root, "add", "--"}, paths...)
+	if output, err := exec.Command("git", arguments...).CombinedOutput(); err != nil {
 		t.Fatalf("git add: %v: %s", err, output)
 	}
 	command := exec.Command("git", "-C", root,
@@ -817,4 +934,66 @@ func workspaceArtifact(t *testing.T, root, format, version string) string {
 		t.Fatal(err)
 	}
 	return name
+}
+
+type staticHostResolver struct {
+	host host.Host
+}
+
+func (resolver staticHostResolver) Resolve(context.Context, host.Repository) (host.Host, error) {
+	return resolver.host, nil
+}
+
+type recordingHost struct {
+	revision    host.PublishedRevision
+	staged      host.StagedPublication
+	stageCalls  int
+	commitCalls int
+}
+
+func (remote *recordingHost) Capabilities(context.Context, host.Repository) (host.Capabilities, error) {
+	return host.Capabilities{FaithfulPreview: true, ConditionalCommit: true, ConditionalRestore: true}, nil
+}
+
+func (remote *recordingHost) Observe(context.Context, host.Repository) (host.PublishedRevision, error) {
+	return remote.revision, nil
+}
+
+func (remote *recordingHost) Stage(_ context.Context, _ host.Repository, request host.StageRequest) (host.StagedPublication, error) {
+	remote.stageCalls++
+	remote.staged = host.StagedPublication{
+		ID: request.PlanID + ":" + request.ChangeID, PlanID: request.PlanID, ChangeID: request.ChangeID,
+		PreviewEndpoint: "https://preview.example/python",
+		TreeSHA256:      request.TreeSHA256, Files: request.Files, CommitPaths: request.CommitPaths,
+	}
+	return remote.staged, nil
+}
+
+func (remote *recordingHost) Commit(_ context.Context, repository host.Repository, staged host.StagedPublication, expected host.ExpectedRevision) (host.CommitResult, error) {
+	remote.commitCalls++
+	if expected.NativeRevision != remote.revision.NativeRevision || expected.TreeSHA256 != remote.revision.TreeSHA256 || staged.ID != remote.staged.ID {
+		return host.CommitResult{}, errors.New("remote commit precondition mismatch")
+	}
+	manifestSHA256 := ""
+	for _, file := range staged.Files {
+		if file.Path == "snailmail.repository.json" {
+			manifestSHA256 = file.SHA256
+			break
+		}
+	}
+	remote.revision = host.PublishedRevision{
+		NativeRevision: "revision-1", TreeSHA256: staged.TreeSHA256,
+		PlanID: staged.PlanID, ChangeID: staged.ChangeID,
+		ReleaseSHA256: strings.Repeat("1", 64), ManifestSHA256: manifestSHA256,
+		RestoreID: strings.Repeat("2", 64), RestoreSHA256: strings.Repeat("3", 64),
+	}
+	return host.CommitResult{Revision: remote.revision, CanonicalEndpoint: repository.CanonicalEndpoint}, nil
+}
+
+func (remote *recordingHost) Restore(context.Context, host.Repository, host.RestoreRef, host.ExpectedRevision) (host.PublishedRevision, error) {
+	return host.PublishedRevision{}, errors.New("unexpected restore")
+}
+
+func (remote *recordingHost) Abort(context.Context, host.Repository, host.StagedPublication) error {
+	return nil
 }

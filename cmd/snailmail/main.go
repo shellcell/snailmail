@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/shellcell/snailmail/engine"
+	"github.com/shellcell/snailmail/internal/wire"
 )
 
 const defaultGeneratedAt = "1970-01-01T00:00:00Z"
@@ -80,7 +81,7 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 
 func runSetup(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail setup <pypi|deb|helm> --name NAME --output DIR")
+		return errors.New("usage: snailmail setup <pypi|deb|helm> --name NAME --host <local|s3> [host options]")
 	}
 	format := args[0]
 	flags := flag.NewFlagSet("setup "+format, flag.ContinueOnError)
@@ -88,6 +89,14 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	workspace := flags.String("workspace", ".", "workspace root")
 	name := flags.String("name", "", "repository name")
 	output := flags.String("output", "", "workspace-relative published directory")
+	hostType := flags.String("host", "local", "host type: local or s3")
+	visibility := flags.String("visibility", "public", "repository visibility")
+	bucket := flags.String("bucket", "", "S3 bucket")
+	prefix := flags.String("prefix", "", "S3 object prefix")
+	region := flags.String("region", "", "AWS region")
+	endpoint := flags.String("endpoint", "", "optional S3 API endpoint")
+	canonicalEndpoint := flags.String("base-url", "", "canonical public repository URL")
+	usePathStyle := flags.Bool("use-path-style", false, "use path-style S3 requests")
 	suite := flags.String("suite", "stable", "Debian suite")
 	component := flags.String("component", "main", "Debian component")
 	architectures := flags.String("architectures", "amd64", "comma-separated Debian architectures")
@@ -99,13 +108,20 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	}
 	if err := engine.SetupRepository(engine.SetupRepositoryRequest{
 		Root: *workspace, Name: *name, Format: format, Output: *output,
-		Suite: *suite, Component: *component, Architectures: splitList(*architectures),
+		HostType: *hostType, Visibility: *visibility, Bucket: *bucket, Prefix: *prefix,
+		Region: *region, Endpoint: *endpoint, CanonicalEndpoint: *canonicalEndpoint,
+		UsePathStyle: *usePathStyle,
+		Suite:        *suite, Component: *component, Architectures: splitList(*architectures),
 	}); err != nil {
 		return err
 	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  configured %s repository %s\n", format, *name)
-	fmt.Fprintf(stdout, "✉️   desired state will publish to %s\n", *output)
+	target := *output
+	if *hostType == "s3" {
+		target = *canonicalEndpoint
+	}
+	fmt.Fprintf(stdout, "✉️   desired state will publish to %s\n", target)
 	return nil
 }
 
@@ -145,6 +161,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	output := flags.String("out", "snailmail.snailmail-plan.json", "plan output file")
 	generatedAtValue := flags.String("generated-at", "", "explicit RFC3339 repository generation time")
 	expires := flags.Duration("expires", 2*time.Hour, "plan lifetime")
+	structuralOnly := flags.Bool("structural-only", false, "review a plan without ecosystem client verification")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -157,6 +174,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	result, err := engine.PlanWorkspace(ctx, engine.PlanWorkspaceRequest{
 		Root: *workspace, Output: *output, GeneratedAt: generatedAt, ExpiresIn: *expires,
+		Hosts: wire.NewHostResolver(), VerificationMode: verificationMode(*structuralOnly),
 	})
 	if err != nil {
 		return err
@@ -188,6 +206,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	result, err := engine.ApplyWorkspace(ctx, engine.ApplyWorkspaceRequest{
 		Root: *workspace, Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
 		DebianImage: *debianImage, HelmImage: *helmImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
+		Hosts: wire.NewHostResolver(),
 	})
 	if err != nil {
 		if result.Applied != 0 || result.Current != 0 {
@@ -493,6 +512,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm> --name NAME --output DIR")
+	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail add REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
 	fmt.Fprintln(output, "  snailmail apply [--plan snailmail.snailmail-plan.json]")
@@ -514,6 +534,13 @@ func splitList(value string) []string {
 		}
 	}
 	return result
+}
+
+func verificationMode(structuralOnly bool) string {
+	if structuralOnly {
+		return "structural"
+	}
+	return "client"
 }
 
 func optionalTime(value string) (time.Time, error) {

@@ -5,7 +5,9 @@ format — apt, dnf, apk, PyPI, npm, Helm, OCI, Cargo, Go, Maven, Nix, or plain
 artifacts — on hosting you choose, plus **publish into repositories you don't
 own** — AUR, Homebrew, nixpkgs, npmjs, PyPI, ghcr.
 
-Status: **design**. Nothing is implemented yet. This document is the plan.
+Status: **active roadmap**. Phases 0 and 1 are implemented; Phase 2 is in
+progress with public S3-compatible PyPI hosting. `README.md` records the exact
+current implementation surface.
 
 ---
 
@@ -250,7 +252,7 @@ consumes. Changes are marked **reversible** or not (§9).
 
 **Attestation** — signatures, SBOMs, build provenance attached to a
 PackageVersion. Needs a slot in the model from day one; needs no implementation
-until Phase 4. Retrofitting provenance into a model that has no place for it is
+until Phase 5. Retrofitting provenance into a model that has no place for it is
 how you end up with a second, parallel metadata system.
 
 ### 3.2 What deliberately does *not* exist
@@ -834,19 +836,19 @@ signing and apk's RSA are both implementable directly.
 | 2 | **CLI** (incl. `serve`, `verify`) | static binary | Phase 0 |
 | 3 | **Conformance suite** | golden trees + client containers | Phase 0 |
 | 4 | **Verify matrix images** | pinned upstream refs | Phase 0 |
-| 5 | **Container image** | OCI, multi-arch | Phase 1 |
-| 6 | **CI integrations** | Action / CI component / Makefile | Phase 1 |
+| 5 | **Container image** | OCI, multi-arch | Phase 2 |
+| 6 | **CI integrations** | Action / CI component / Makefile | Phase 2 |
 | 7 | **Git state repo** | layout convention + schema | Phase 1 |
-| 8 | **Blob store** | external service + drivers | Phase 1 |
-| 9 | **Public site renderer** | static generator + `status.json` | Phase 1 |
-| 10 | **TUI** | same binary | Phase 2 |
-| 11 | **Knowledge base** | versioned data artifact | Phase 2 |
-| 12 | **`doctor`** | CLI subcommand | Phase 2 |
-| 13 | **`import`** | CLI subcommand | Phase 2 |
-| 14 | **Notifier** | driver | Phase 3 |
-| 15 | **Server** | binary | Phase 4 |
-| 16 | **Console** | SPA over the server API | Phase 4 |
-| 17 | **Forge app** | GitHub App / GitLab app | Phase 4 |
+| 8 | **Blob store** | local CAS, then external drivers | Phase 1 / 2 |
+| 9 | **Public site renderer** | static generator + `status.json` | Phase 2 |
+| 10 | **TUI** | same binary | Phase 3 |
+| 11 | **Knowledge base** | versioned data artifact | Phase 3 |
+| 12 | **`doctor`** | CLI subcommand | Phase 3 |
+| 13 | **`import`** | CLI subcommand | Phase 3 |
+| 14 | **Notifier** | driver | Phase 4 |
+| 15 | **Server** | binary | Phase 5 |
+| 16 | **Console** | SPA over the server API | Phase 5 |
+| 17 | **Forge app** | GitHub App / GitLab app | Phase 5 |
 | 18 | **Format plugin SDK** | stdio protocol + example | Phase 5 |
 | 19 | **Docs site** | static | ongoing |
 
@@ -953,7 +955,7 @@ passing.
 | Infrastructure | none — static files | server + auth |
 | Audience | your users | you |
 | Content | status matrix, install instructions, package browser, key fingerprints, badges, `status.json` | the same, plus mutations, gate approvals, key ops, audit log |
-| Phase | 1 | 4 |
+| Phase | 2 | 5 |
 
 The public page is the user-facing face of every repository you publish, and it
 should be good — install instructions generated from what was actually built
@@ -992,8 +994,9 @@ Seven components, and the project is genuinely useful:
 > engine · CLI · conformance suite · container image · CI integration ·
 > git state repo · public site renderer
 
-Everything else — server, console, forge app, plugins, notifier — is Phase 4+
-and must stay optional. **Dogfood it**: snailmail publishes snailmail, through
+Foreign adapters and notifications are Phase 4; the server, console, forge app,
+attestations, and plugins are Phase 5 and must stay optional. **Dogfood it**:
+snailmail publishes snailmail, through
 snailmail, which is both the credibility argument and the best available test.
 
 ## 12. What it connects to
@@ -1146,29 +1149,42 @@ turn a directory of files into a correct, locally-servable repository. These
 three because pypi is trivially correct, deb is the hard one worth learning
 early, and helm proves the shape generalizes.
 
-**Phase 1 — the wedge.** The model of §3, the lock, `add`/`promote`/`prune`,
-`plan`/`apply`, hosts `github-pages` and `s3`, and `setup` for those three
-formats. Target: **a working private PyPI on GitHub Pages in under five
-minutes.** Genuinely wanted, nothing does it cleanly, and it exercises every
-layer end to end.
+**Phase 1 — Git-backed local reconciliation.** Add the model of §3, manifests,
+locks, local CAS, publication ledgers, `setup`, `add`, and exact `plan`/`apply`.
+The phase is complete when a reviewed Git state can stage, verify,
+conditionally switch, recover, and roll back a local managed release without
+weakening immutable publication bindings. Richer placement mutations remain
+operational breadth rather than a prerequisite for safe reconciliation.
 
-**Phase 2 — keys, distros, breadth.** The compatibility table and `keys audit`;
-the distro matrix and `adopt`; then rpm, apk, nix cache, cargo, go, maven.
-`check`, `status`, the TUI matrix. Name mapping arrives with the second format
-and dependency translation with rpm — the point at which `libssl-dev` versus
-`openssl-devel` stops being hypothetical.
+**Phase 2 — owned hosting.** Generalize publication behind a provider-neutral
+host contract. Public S3-compatible PyPI is the first remote slice. Complete
+the phase with scoped private S3 reads, shared remote blob storage, public
+GitHub Pages, `auto`/`pr`/`approval` gates, generated install and status pages,
+and containerized CI distribution. The private five-minute target uses
+authenticated object storage or a CDN, not GitHub Pages.
 
-**Phase 3 — remotes.** `observe` roles first (drift detection, read-only,
-nothing to break), then `target`: AUR, Homebrew, nix flake, ghcr, npmjs/PyPI
-upload, with gates. This lands on infrastructure that already exists.
+**Phase 3 — signing, operations, and breadth.** Add explicit signer effects,
+key backends, the compatibility table, and `keys new|publish|audit|rotate`;
+then `promote`, `yank`, `prune`, `check`, `status`, `doctor`, `import`/`adopt`,
+the TUI, and the versioned knowledge bundle. Expand Tier 1 deliberately: rpm
+and apk first, followed by nix cache, cargo, go, and maven. Name mapping and
+dependency translation arrive only with formats that prove those abstractions
+are needed.
 
-**Phase 4 — server, attestations, plugins.** Only if 1–3 are being used. A
-great static tool beats a mediocre hosted one.
+**Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
+drift detection, then irreversible `target` operations for AUR, Homebrew,
+nixpkgs, ghcr, and npmjs/PyPI uploads. Every target uses explicit gates,
+version-binding ledgers, live preconditions, and optional notifications.
 
-Each phase is useful alone. If 1–2 turn out to be enough, stop: most of the
-present pain is visibility, policy, and setup — not mechanics.
+**Phase 5 — optional control plane and extensions.** Add the server, management
+console, forge apps, attestations, and the versioned process-plugin protocol
+only if Phases 1–4 are being used. Static reads remain independent of the
+control plane. A great static tool beats a mediocre hosted one.
 
-## 13. Things that will bite
+Each phase is useful alone. If Phases 1–3 are enough, stop: most of the present
+pain is visibility, policy, and setup, not mechanics.
+
+## 15. Things that will bite
 
 - **Scope explosion.** 13 formats × 7 hosts × 3 gates is not a product, it is a
   matrix nobody can test. Tiering is the defense, and it only works if Tier 1 is
@@ -1201,7 +1217,7 @@ present pain is visibility, policy, and setup — not mechanics.
   table that catches the errors everyone else lets you make.* Build those;
   borrow the rest.
 
-## 14. Open questions
+## 16. Open questions
 
 - **Does the lock shard?** 10k placements is a 40k-line TOML and a miserable
   diff. Per-track files? Per-package? A `.jsonl` that diffs well?
@@ -1219,13 +1235,13 @@ present pain is visibility, policy, and setup — not mechanics.
 - **Is `adopt` at scale just mirroring?** Adopting a handful of upstream
   artifacts and running a pull-through cache of all of PyPI differ in degree,
   not in kind. The model already supports the first. Deciding where the line
-  falls determines whether §14's mirroring question is a feature or a product.
+  falls determines whether §16's mirroring question is a feature or a product.
 - **Does `repack` belong here at all?** It is the one place snailmail would
   *build* rather than *arrange*, which is a different job with a different
   failure surface. `nfpm` does it well; the question is whether snailmail drives
   it or merely consumes its output.
 - **Full upstream mirroring** (a pull-through cache of PyPI or Debian) is large,
-  adjacent, and commonly wanted. Out of scope, or Phase 5?
+  adjacent, and commonly wanted. Is it a separate product rather than a phase?
 - **One binary, or library plus thin CLI?** Matters if individual projects'
   release workflows should import it. Leaning library — the server needs it
   anyway.

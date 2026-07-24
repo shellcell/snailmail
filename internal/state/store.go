@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -61,8 +63,13 @@ func Setup(root string, options SetupOptions) error {
 	if options.Format != "pypi" && options.Format != "deb" && options.Format != "helm" {
 		return fmt.Errorf("unsupported repository format %q", options.Format)
 	}
-	if err := validateRelativePath(options.Output); err != nil {
-		return fmt.Errorf("invalid repository output: %w", err)
+	hostType := options.HostType
+	if hostType == "" {
+		hostType = "local"
+	}
+	visibility := options.Visibility
+	if visibility == "" {
+		visibility = "public"
 	}
 	manifest, err := LoadManifest(root)
 	if err != nil {
@@ -72,7 +79,17 @@ func Setup(root string, options SetupOptions) error {
 		return fmt.Errorf("repository %q already exists", options.Name)
 	}
 	lockPath := filepath.ToSlash(filepath.Join("repos", options.Name+".lock.toml"))
-	repository := Repository{Format: options.Format, Lock: lockPath, Output: filepath.ToSlash(options.Output), Gate: "auto"}
+	repository := Repository{
+		Format: options.Format, Lock: lockPath, Gate: "auto", Visibility: visibility,
+		Host: HostConfig{
+			Type: hostType, Path: filepath.ToSlash(options.Output), Bucket: options.Bucket,
+			Prefix: options.Prefix, Region: options.Region, Endpoint: options.Endpoint,
+			CanonicalEndpoint: options.CanonicalEndpoint, UsePathStyle: options.UsePathStyle,
+		},
+	}
+	if err := validateRepositoryHost(options.Name, repository); err != nil {
+		return err
+	}
 	if options.Format == "deb" {
 		repository.Suite = options.Suite
 		repository.Component = options.Component
@@ -97,23 +114,90 @@ func Setup(root string, options SetupOptions) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if _, err := WorkspacePath(root, repository.Output); err != nil {
-		return err
+	if repository.Host.Type == "local" {
+		if _, err := WorkspacePath(root, repository.Host.Path); err != nil {
+			return err
+		}
 	}
 	if err := WriteLock(root, repository, RepositoryLock{SchemaVersion: LockSchema, Repository: options.Name}); err != nil {
+		return err
+	}
+	if err := writeInstallDocument(root, options.Name, repository); err != nil {
 		return err
 	}
 	return WriteManifest(root, manifest)
 }
 
+func writeInstallDocument(root, name string, repository Repository) error {
+	if repository.Host.Type != "s3" || repository.Format != "pypi" {
+		return nil
+	}
+	content := installDocumentContent(name, repository)
+	filename, err := WorkspacePath(root, filepath.ToSlash(filepath.Join("docs", "install-"+name+".md")))
+	if err != nil {
+		return err
+	}
+	return atomicWrite(filename, content, 0o644)
+}
+
+func ValidateInstallDocument(root, name string, repository Repository) error {
+	if repository.Host.Type != "s3" || repository.Format != "pypi" {
+		return nil
+	}
+	filename, err := WorkspacePath(root, filepath.ToSlash(filepath.Join("docs", "install-"+name+".md")))
+	if err != nil {
+		return err
+	}
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(content, installDocumentContent(name, repository)) {
+		return fmt.Errorf("install document for repository %q does not match its canonical endpoint", name)
+	}
+	return nil
+}
+
+func installDocumentContent(name string, repository Repository) []byte {
+	endpoint := strings.TrimSuffix(repository.Host.CanonicalEndpoint, "/") + "/simple/"
+	return []byte("# Install from " + name + "\n\n" +
+		"```sh\npython -m pip install --index-url " + shellQuote(endpoint) + " PACKAGE\n```\n")
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
+}
+
 func LoadManifest(root string) (Manifest, error) {
-	var manifest Manifest
 	name, err := WorkspacePath(root, ManifestFilename)
 	if err != nil {
 		return Manifest{}, err
 	}
-	if err := decodeTOML(name, &manifest); err != nil {
-		return Manifest{}, err
+	content, err := os.ReadFile(name)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("read %q: %w", name, err)
+	}
+	var header struct {
+		SchemaVersion int `toml:"schema_version"`
+	}
+	if err := toml.Unmarshal(content, &header); err != nil {
+		return Manifest{}, fmt.Errorf("decode %q: %w", name, err)
+	}
+	var manifest Manifest
+	if header.SchemaVersion == 1 {
+		var legacy legacyManifest
+		decoder := toml.NewDecoder(bytes.NewReader(content))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&legacy); err != nil {
+			return Manifest{}, fmt.Errorf("decode %q: %w", name, err)
+		}
+		manifest = migrateLegacyManifest(legacy)
+	} else {
+		decoder := toml.NewDecoder(bytes.NewReader(content))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&manifest); err != nil {
+			return Manifest{}, fmt.Errorf("decode %q: %w", name, err)
+		}
 	}
 	if manifest.SchemaVersion != ManifestSchema || !identifierPattern.MatchString(manifest.Workspace.Name) {
 		return Manifest{}, errors.New("invalid workspace manifest schema or name")
@@ -131,11 +215,91 @@ func LoadManifest(root string) (Manifest, error) {
 		if err := validateRelativePath(repository.Lock); err != nil {
 			return Manifest{}, fmt.Errorf("repository %q lock path: %w", name, err)
 		}
-		if err := validateRelativePath(repository.Output); err != nil {
-			return Manifest{}, fmt.Errorf("repository %q output path: %w", name, err)
+		if err := validateRepositoryHost(name, repository); err != nil {
+			return Manifest{}, err
 		}
 	}
 	return manifest, nil
+}
+
+type legacyManifest struct {
+	SchemaVersion int                         `toml:"schema_version"`
+	Workspace     Workspace                   `toml:"workspace"`
+	Repositories  map[string]legacyRepository `toml:"repo"`
+}
+
+type legacyRepository struct {
+	Format        string   `toml:"format"`
+	Lock          string   `toml:"lock"`
+	Output        string   `toml:"output"`
+	Gate          string   `toml:"gate"`
+	Suite         string   `toml:"suite,omitempty"`
+	Component     string   `toml:"component,omitempty"`
+	Architectures []string `toml:"architectures,omitempty"`
+}
+
+func migrateLegacyManifest(legacy legacyManifest) Manifest {
+	manifest := Manifest{SchemaVersion: ManifestSchema, Workspace: legacy.Workspace, Repositories: make(map[string]Repository, len(legacy.Repositories))}
+	for name, repository := range legacy.Repositories {
+		manifest.Repositories[name] = Repository{
+			Format: repository.Format, Lock: repository.Lock, Gate: repository.Gate,
+			Visibility: "public", Host: HostConfig{Type: "local", Path: repository.Output},
+			Suite: repository.Suite, Component: repository.Component,
+			Architectures: append([]string(nil), repository.Architectures...),
+		}
+	}
+	return manifest
+}
+
+func validateRepositoryHost(name string, repository Repository) error {
+	if repository.Visibility != "public" && repository.Visibility != "private" {
+		return fmt.Errorf("repository %q has invalid visibility %q", name, repository.Visibility)
+	}
+	switch repository.Host.Type {
+	case "local":
+		if err := validateRelativePath(repository.Host.Path); err != nil {
+			return fmt.Errorf("repository %q local host path: %w", name, err)
+		}
+		if repository.Host.Bucket != "" || repository.Host.Prefix != "" || repository.Host.Endpoint != "" || repository.Host.CanonicalEndpoint != "" {
+			return fmt.Errorf("repository %q local host has S3-only configuration", name)
+		}
+	case "s3":
+		if repository.Format != "pypi" {
+			return fmt.Errorf("repository %q: the first S3 host slice supports PyPI only", name)
+		}
+		if repository.Visibility != "public" {
+			return fmt.Errorf("repository %q: private S3 hosting requires a scoped read credential broker", name)
+		}
+		if repository.Host.Path != "" || repository.Host.Bucket == "" || repository.Host.CanonicalEndpoint == "" {
+			return fmt.Errorf("repository %q S3 host requires bucket and canonical endpoint, without a local path", name)
+		}
+		prefix := strings.Trim(repository.Host.Prefix, "/")
+		if prefix != repository.Host.Prefix || (prefix != "" && (path.Clean(prefix) != prefix || strings.HasPrefix(prefix, "../"))) {
+			return fmt.Errorf("repository %q has invalid S3 prefix %q", name, repository.Host.Prefix)
+		}
+		if err := validateHTTPURL(repository.Host.CanonicalEndpoint); err != nil {
+			return fmt.Errorf("repository %q canonical endpoint: %w", name, err)
+		}
+		if repository.Host.Endpoint != "" {
+			if err := validateHTTPURL(repository.Host.Endpoint); err != nil {
+				return fmt.Errorf("repository %q S3 endpoint: %w", name, err)
+			}
+		}
+	default:
+		return fmt.Errorf("repository %q has unsupported host type %q", name, repository.Host.Type)
+	}
+	return nil
+}
+
+func validateHTTPURL(value string) error {
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return errors.New("must not contain control characters")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("must be an HTTP(S) URL without credentials, query, or fragment")
+	}
+	return nil
 }
 
 func WriteManifest(root string, manifest Manifest) error {

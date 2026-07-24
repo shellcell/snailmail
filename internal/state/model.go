@@ -3,9 +3,9 @@ package state
 import "time"
 
 const (
-	ManifestSchema = 1
+	ManifestSchema = 2
 	LockSchema     = 1
-	PlanSchema     = 1
+	PlanSchema     = 3
 	LedgerSchema   = 1
 )
 
@@ -20,13 +20,25 @@ type Workspace struct {
 }
 
 type Repository struct {
-	Format        string   `toml:"format"`
-	Lock          string   `toml:"lock"`
-	Output        string   `toml:"output"`
-	Gate          string   `toml:"gate"`
-	Suite         string   `toml:"suite,omitempty"`
-	Component     string   `toml:"component,omitempty"`
-	Architectures []string `toml:"architectures,omitempty"`
+	Format        string     `toml:"format"`
+	Lock          string     `toml:"lock"`
+	Host          HostConfig `toml:"host"`
+	Visibility    string     `toml:"visibility"`
+	Gate          string     `toml:"gate"`
+	Suite         string     `toml:"suite,omitempty"`
+	Component     string     `toml:"component,omitempty"`
+	Architectures []string   `toml:"architectures,omitempty"`
+}
+
+type HostConfig struct {
+	Type              string `toml:"type" json:"type"`
+	Path              string `toml:"path,omitempty" json:"path,omitempty"`
+	Bucket            string `toml:"bucket,omitempty" json:"bucket,omitempty"`
+	Prefix            string `toml:"prefix,omitempty" json:"prefix,omitempty"`
+	Region            string `toml:"region,omitempty" json:"region,omitempty"`
+	Endpoint          string `toml:"endpoint,omitempty" json:"endpoint,omitempty"`
+	CanonicalEndpoint string `toml:"canonical_endpoint,omitempty" json:"canonical_endpoint,omitempty"`
+	UsePathStyle      bool   `toml:"use_path_style,omitempty" json:"use_path_style,omitempty"`
 }
 
 type RepositoryLock struct {
@@ -78,24 +90,41 @@ type Plan struct {
 }
 
 type PlanPayload struct {
-	EngineVersion  string           `json:"engine_version"`
-	GitRevision    string           `json:"git_revision"`
-	ManifestSHA256 string           `json:"manifest_sha256"`
-	GeneratedAt    string           `json:"generated_at"`
-	CreatedAt      string           `json:"created_at"`
-	ExpiresAt      string           `json:"expires_at"`
-	Repositories   []PlanRepository `json:"repositories"`
+	EngineVersion    string           `json:"engine_version"`
+	GitRevision      string           `json:"git_revision"`
+	ManifestSHA256   string           `json:"manifest_sha256"`
+	GeneratedAt      string           `json:"generated_at"`
+	CreatedAt        string           `json:"created_at"`
+	ExpiresAt        string           `json:"expires_at"`
+	VerificationMode string           `json:"verification_mode"`
+	Repositories     []PlanRepository `json:"repositories"`
 }
 
 type PlanRepository struct {
-	Name               string `json:"name"`
-	Format             string `json:"format"`
-	LockSHA256         string `json:"lock_sha256"`
-	Output             string `json:"output"`
-	ObservedTreeSHA256 string `json:"observed_tree_sha256,omitempty"`
-	DesiredTreeSHA256  string `json:"desired_tree_sha256"`
-	ChangeID           string `json:"change_id"`
-	Action             string `json:"action"`
+	Name                      string     `json:"name"`
+	Format                    string     `json:"format"`
+	LockSHA256                string     `json:"lock_sha256"`
+	Host                      HostConfig `json:"host"`
+	Visibility                string     `json:"visibility"`
+	HostIdentitySHA256        string     `json:"host_identity_sha256"`
+	CanonicalEndpoint         string     `json:"canonical_endpoint"`
+	InstallDocSHA256          string     `json:"install_doc_sha256,omitempty"`
+	ObservedRevision          string     `json:"observed_revision,omitempty"`
+	ObservedPlanID            string     `json:"observed_plan_id,omitempty"`
+	ObservedChangeID          string     `json:"observed_change_id,omitempty"`
+	ObservedReleaseSHA256     string     `json:"observed_release_sha256,omitempty"`
+	ObservedManifestSHA256    string     `json:"observed_manifest_sha256,omitempty"`
+	ObservedRestoreID         string     `json:"observed_restore_id,omitempty"`
+	ObservedRestoreSHA256     string     `json:"observed_restore_sha256,omitempty"`
+	ObservedRestoreRootSHA256 string     `json:"observed_restore_root_sha256,omitempty"`
+	FaithfulPreview           bool       `json:"faithful_preview"`
+	ConditionalCommit         bool       `json:"conditional_commit"`
+	ConditionalRestore        bool       `json:"conditional_restore"`
+	ObservedTreeSHA256        string     `json:"observed_tree_sha256,omitempty"`
+	DesiredTreeSHA256         string     `json:"desired_tree_sha256"`
+	DesiredManifestSHA256     string     `json:"desired_manifest_sha256,omitempty"`
+	ChangeID                  string     `json:"change_id"`
+	Action                    string     `json:"action"`
 }
 
 type InitOptions struct {
@@ -103,12 +132,20 @@ type InitOptions struct {
 }
 
 type SetupOptions struct {
-	Name          string
-	Format        string
-	Output        string
-	Suite         string
-	Component     string
-	Architectures []string
+	Name              string
+	Format            string
+	Output            string
+	HostType          string
+	Visibility        string
+	Bucket            string
+	Prefix            string
+	Region            string
+	Endpoint          string
+	CanonicalEndpoint string
+	UsePathStyle      bool
+	Suite             string
+	Component         string
+	Architectures     []string
 }
 
 type PlanOptions struct {

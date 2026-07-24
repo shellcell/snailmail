@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,12 +14,14 @@ import (
 	"strings"
 	"time"
 
+	localhost "github.com/shellcell/snailmail/adapters/host/local"
 	"github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/state"
 )
 
-const phase1EngineVersion = "phase1-v1"
+const phase1EngineVersion = "phase2-v1"
 
 type InitWorkspaceRequest struct {
 	Root string
@@ -25,13 +29,21 @@ type InitWorkspaceRequest struct {
 }
 
 type SetupRepositoryRequest struct {
-	Root          string
-	Name          string
-	Format        string
-	Output        string
-	Suite         string
-	Component     string
-	Architectures []string
+	Root              string
+	Name              string
+	Format            string
+	Output            string
+	HostType          string
+	Visibility        string
+	Bucket            string
+	Prefix            string
+	Region            string
+	Endpoint          string
+	CanonicalEndpoint string
+	UsePathStyle      bool
+	Suite             string
+	Component         string
+	Architectures     []string
 }
 
 type AddArtifactsRequest struct {
@@ -49,11 +61,13 @@ type AddArtifactsResult struct {
 }
 
 type PlanWorkspaceRequest struct {
-	Root        string
-	Output      string
-	GeneratedAt time.Time
-	CreatedAt   time.Time
-	ExpiresIn   time.Duration
+	Root             string
+	Output           string
+	GeneratedAt      time.Time
+	CreatedAt        time.Time
+	ExpiresIn        time.Duration
+	VerificationMode string
+	Hosts            host.Resolver
 }
 
 type PlanWorkspaceResult struct {
@@ -72,6 +86,7 @@ type ApplyWorkspaceRequest struct {
 	DebianImage       string
 	HelmImage         string
 	MaxWorkspaceBytes int64
+	Hosts             host.Resolver
 }
 
 type ApplyWorkspaceResult struct {
@@ -111,6 +126,9 @@ func SetupRepository(request SetupRepositoryRequest) error {
 	defer unlock()
 	return state.Setup(root, state.SetupOptions{
 		Name: request.Name, Format: request.Format, Output: request.Output,
+		HostType: request.HostType, Visibility: request.Visibility, Bucket: request.Bucket,
+		Prefix: request.Prefix, Region: request.Region, Endpoint: request.Endpoint,
+		CanonicalEndpoint: request.CanonicalEndpoint, UsePathStyle: request.UsePathStyle,
 		Suite: request.Suite, Component: request.Component, Architectures: request.Architectures,
 	})
 }
@@ -237,7 +255,18 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		GeneratedAt: generatedAt.UTC().Format(time.RFC3339), CreatedAt: createdAt.UTC().Format(time.RFC3339),
 		ExpiresAt: createdAt.Add(expiresIn).UTC().Format(time.RFC3339),
 	}
+	payload.VerificationMode = request.VerificationMode
+	if payload.VerificationMode == "" {
+		payload.VerificationMode = "structural"
+	}
+	if payload.VerificationMode != "structural" && payload.VerificationMode != "client" {
+		return PlanWorkspaceResult{}, errors.New("verification mode must be structural or client")
+	}
 	changes := 0
+	hosts := request.Hosts
+	if hosts == nil {
+		hosts = localHostResolver{}
+	}
 	for _, name := range state.RepositoryNames(manifest) {
 		repository := manifest.Repositories[name]
 		lock, err := state.LoadLock(root, repository)
@@ -266,21 +295,50 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
-		observed, err := observedTree(root, repository.Output)
+		hostRepository := toHostRepository(root, name, repository)
+		selectedHost, err := hosts.Resolve(ctx, hostRepository)
+		if err != nil {
+			return PlanWorkspaceResult{}, err
+		}
+		capabilities, err := selectedHost.Capabilities(ctx, hostRepository)
+		if err != nil {
+			return PlanWorkspaceResult{}, err
+		}
+		if !capabilities.FaithfulPreview || !capabilities.ConditionalCommit {
+			return PlanWorkspaceResult{}, fmt.Errorf("repository %q host cannot provide verified conditional publication", name)
+		}
+		observed, err := selectedHost.Observe(ctx, hostRepository)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
 		action := "noop"
-		if observed != desired.TreeSHA256 {
+		if observed.TreeSHA256 != desired.TreeSHA256 || (hostRepository.Type == "s3" && observed.ManifestSHA256 != desired.ManifestSHA256) {
 			action = "update"
-			if observed == "" {
+			if observed.NativeRevision == "" {
 				action = "create"
 			}
 			changes++
 		}
+		hostIdentity, err := repositoryHostIdentity(repository)
+		if err != nil {
+			return PlanWorkspaceResult{}, err
+		}
+		installDocDigest, err := repositoryInstallDocDigest(root, name, repository)
+		if err != nil {
+			return PlanWorkspaceResult{}, err
+		}
 		payload.Repositories = append(payload.Repositories, state.PlanRepository{
-			Name: name, Format: repository.Format, LockSHA256: lockDigest, Output: repository.Output,
-			ObservedTreeSHA256: observed, DesiredTreeSHA256: desired.TreeSHA256,
+			Name: name, Format: repository.Format, LockSHA256: lockDigest,
+			Host: repository.Host, Visibility: repository.Visibility, HostIdentitySHA256: hostIdentity,
+			CanonicalEndpoint: hostRepository.CanonicalEndpoint, ObservedRevision: observed.NativeRevision,
+			ObservedPlanID: observed.PlanID, ObservedChangeID: observed.ChangeID,
+			ObservedReleaseSHA256: observed.ReleaseSHA256, ObservedManifestSHA256: observed.ManifestSHA256,
+			ObservedRestoreID: observed.RestoreID, ObservedRestoreSHA256: observed.RestoreSHA256,
+			ObservedRestoreRootSHA256: observed.RestoreRootSHA256,
+			FaithfulPreview:           capabilities.FaithfulPreview, ConditionalCommit: capabilities.ConditionalCommit,
+			ConditionalRestore: capabilities.ConditionalRestore,
+			InstallDocSHA256:   installDocDigest,
+			ObservedTreeSHA256: observed.TreeSHA256, DesiredTreeSHA256: desired.TreeSHA256, DesiredManifestSHA256: desired.ManifestSHA256,
 			ChangeID: name + ":" + desired.TreeSHA256[:12], Action: action,
 		})
 	}
@@ -332,6 +390,10 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	if err := validateApplyPlan(plan); err != nil {
 		return ApplyWorkspaceResult{}, err
 	}
+	if request.StructuralOnly && plan.Payload.VerificationMode != "structural" {
+		return ApplyWorkspaceResult{}, errors.New("apply verification mode does not match the reviewed plan")
+	}
+	request.StructuralOnly = plan.Payload.VerificationMode == "structural"
 	plannedLedgerRepositories := make([]string, 0, len(plan.Payload.Repositories))
 	for _, repository := range plan.Payload.Repositories {
 		if repository.Action != "noop" {
@@ -362,14 +424,22 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		return ApplyWorkspaceResult{}, err
 	}
 	type applyRepository struct {
-		planned    state.PlanRepository
-		repository state.Repository
-		lock       state.RepositoryLock
-		stageRoot  string
-		stage      string
-		current    bool
+		planned        state.PlanRepository
+		repository     state.Repository
+		lock           state.RepositoryLock
+		host           host.Host
+		hostRepository host.Repository
+		observed       host.PublishedRevision
+		hostStage      host.StagedPublication
+		stageRoot      string
+		stage          string
+		current        bool
 	}
 	var prepared []applyRepository
+	hosts := request.Hosts
+	if hosts == nil {
+		hosts = localHostResolver{}
+	}
 	seenRepositories := make(map[string]bool)
 	for _, planned := range plan.Payload.Repositories {
 		if seenRepositories[planned.Name] {
@@ -377,8 +447,31 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		}
 		seenRepositories[planned.Name] = true
 		repository, exists := manifest.Repositories[planned.Name]
-		if !exists || repository.Format != planned.Format || repository.Output != planned.Output {
+		if !exists || repository.Format != planned.Format {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q configuration changed", planned.Name)
+		}
+		hostIdentity, err := repositoryHostIdentity(repository)
+		if err != nil || hostIdentity != planned.HostIdentitySHA256 || repository.Host != planned.Host || repository.Visibility != planned.Visibility {
+			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q host changed", planned.Name)
+		}
+		hostRepository := toHostRepository(root, planned.Name, repository)
+		if hostRepository.CanonicalEndpoint != planned.CanonicalEndpoint {
+			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q canonical endpoint changed", planned.Name)
+		}
+		installDocDigest, err := repositoryInstallDocDigest(root, planned.Name, repository)
+		if err != nil || installDocDigest != planned.InstallDocSHA256 {
+			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q install document changed", planned.Name)
+		}
+		selectedHost, err := hosts.Resolve(ctx, hostRepository)
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
+		capabilities, err := selectedHost.Capabilities(ctx, hostRepository)
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
+		if capabilities.FaithfulPreview != planned.FaithfulPreview || capabilities.ConditionalCommit != planned.ConditionalCommit || capabilities.ConditionalRestore != planned.ConditionalRestore {
+			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q host capabilities changed", planned.Name)
 		}
 		lockPath, err := state.WorkspacePath(root, repository.Lock)
 		if err != nil {
@@ -402,25 +495,38 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
-		observed, err := observedTree(root, repository.Output)
+		observed, err := selectedHost.Observe(ctx, hostRepository)
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
-		if observed != planned.ObservedTreeSHA256 && observed != planned.DesiredTreeSHA256 {
+		matchesObserved := revisionMatchesPlanObservation(observed, planned)
+		matchesApplied := planned.Action != "noop" && observed.TreeSHA256 == planned.DesiredTreeSHA256 &&
+			(repository.Host.Type != "s3" || (observed.PlanID == plan.PlanID && observed.ChangeID == planned.ChangeID && observed.ManifestSHA256 == planned.DesiredManifestSHA256))
+		if !matchesObserved && !matchesApplied {
+			if observed.TreeSHA256 == planned.ObservedTreeSHA256 {
+				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q native revision changed", planned.Name)
+			}
+			if observed.TreeSHA256 == planned.DesiredTreeSHA256 {
+				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q desired tree was published by another change", planned.Name)
+			}
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q target changed", planned.Name)
 		}
 		expectedAction := "noop"
-		if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 {
+		if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 || (repository.Host.Type == "s3" && planned.ObservedManifestSHA256 != planned.DesiredManifestSHA256) {
 			expectedAction = "update"
-			if planned.ObservedTreeSHA256 == "" {
+			if planned.ObservedRevision == "" {
 				expectedAction = "create"
 			}
 		}
 		if planned.Action != expectedAction || planned.ChangeID != planned.Name+":"+planned.DesiredTreeSHA256[:12] {
 			return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q has inconsistent action metadata", planned.Name)
 		}
-		item := applyRepository{planned: planned, repository: repository, lock: lock, current: observed == planned.DesiredTreeSHA256}
-		if observed == planned.DesiredTreeSHA256 {
+		current := observed.TreeSHA256 == planned.DesiredTreeSHA256 && (repository.Host.Type != "s3" || observed.ManifestSHA256 == planned.DesiredManifestSHA256)
+		item := applyRepository{
+			planned: planned, repository: repository, lock: lock, host: selectedHost,
+			hostRepository: hostRepository, observed: observed, current: current,
+		}
+		if item.current && (request.StructuralOnly || planned.Action == "noop") {
 			prepared = append(prepared, item)
 			continue
 		}
@@ -430,11 +536,13 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		}
 		stageOutput := filepath.Join(stage, "repository")
 		staged, buildErr := buildLockedRepository(ctx, root, planned.Name, repository, lock, generatedAt, stageOutput)
-		if buildErr == nil && staged.TreeSHA256 != planned.DesiredTreeSHA256 {
+		if buildErr == nil && (staged.TreeSHA256 != planned.DesiredTreeSHA256 || staged.ManifestSHA256 != planned.DesiredManifestSHA256) {
 			buildErr = errors.New("stale plan: rebuilt tree digest changed")
 		}
 		if buildErr == nil {
-			buildErr = verifyStaged(ctx, repository.Format, stageOutput, request)
+			structuralRequest := request
+			structuralRequest.StructuralOnly = true
+			buildErr = verifyStaged(ctx, repository.Format, stageOutput, structuralRequest)
 		}
 		if buildErr != nil {
 			_ = os.RemoveAll(stage)
@@ -451,6 +559,48 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			_ = os.RemoveAll(item.stageRoot)
 		}
 	}()
+	defer func() {
+		for _, item := range prepared {
+			if item.hostStage.ID != "" {
+				cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				_ = item.host.Abort(cleanupCtx, item.hostRepository, item.hostStage)
+				cancelCleanup()
+			}
+		}
+	}()
+	for index := range prepared {
+		item := &prepared[index]
+		if item.current {
+			continue
+		}
+		files, err := stagedHostFiles(item.stage)
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
+		item.hostStage, err = item.host.Stage(ctx, item.hostRepository, host.StageRequest{
+			PlanID: plan.PlanID, ChangeID: item.planned.ChangeID, Directory: item.stage,
+			TreeSHA256: item.planned.DesiredTreeSHA256, Files: files,
+			CommitPaths: repositoryCommitPaths(item.repository),
+		})
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
+		if request.StructuralOnly {
+			continue
+		}
+		if item.hostRepository.Type == "local" {
+			if err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
+				return ApplyWorkspaceResult{}, err
+			}
+			continue
+		}
+		if item.repository.Format != "pypi" {
+			return ApplyWorkspaceResult{}, fmt.Errorf("host preview verification is not implemented for format %q", item.repository.Format)
+		}
+		if _, _, err := app.VerifyPyPIClientEndpoint(ctx, item.stage, item.hostStage.PreviewEndpoint, request.Python); err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
+	}
 	ledgerRepositories := plannedLedgerRepositories
 	ledgerRevision := ""
 	if ledgerCommitted {
@@ -488,7 +638,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	if !ledgerCommitted && len(ledgerRepositories) != 0 {
 		ledgerRevision, err = state.CommitPublicationLedgers(root, plan.PlanID, plan.Payload.GitRevision, ledgerRepositories)
 		if err != nil {
-			return ApplyWorkspaceResult{}, err
+			return ApplyWorkspaceResult{}, fmt.Errorf("commit publication ledgers for %v: %w", ledgerRepositories, err)
 		}
 		if err := state.ValidatePublicationCommitPaths(root, ledgerRevision, ledgerRepositories); err != nil {
 			return ApplyWorkspaceResult{}, err
@@ -527,24 +677,86 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	for _, item := range prepared {
 		if item.current {
 			result.Current++
+			if !request.StructuralOnly && item.planned.Action != "noop" {
+				if err := verifyCanonicalClient(ctx, root, item.repository, item.stage, item.hostRepository.CanonicalEndpoint, request); err != nil {
+					if item.hostRepository.Type == "s3" && item.observed.RestoreID != "" {
+						restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+						_, restoreErr := item.host.Restore(restoreCtx, item.hostRepository, host.RestoreRef{
+							ID: item.observed.RestoreID, PlanID: item.observed.PlanID,
+							ChangeID: item.observed.ChangeID, FailedTree: item.observed.TreeSHA256,
+							DescriptorSHA256: item.observed.RestoreSHA256, RootSHA256: item.observed.RestoreRootSHA256,
+						}, expectedRevisionFromPublished(item.observed))
+						cancelRestore()
+						if restoreErr != nil {
+							return result, fmt.Errorf("canonical retry probe failed: %v; restore failed: %w", err, restoreErr)
+						}
+						result.Current--
+					}
+					return result, err
+				}
+			}
 			continue
 		}
 		if err := state.AssertGitRevision(root, ledgerRevision); err != nil {
 			return result, err
 		}
-		finalOutput, err := state.WorkspacePath(root, item.repository.Output)
+		committed, err := item.host.Commit(ctx, item.hostRepository, item.hostStage, expectedRevisionFromPlan(item.planned))
 		if err != nil {
 			return result, err
 		}
-		if err := app.PublishVerifiedDirectory(ctx, item.stage, finalOutput, item.planned.ObservedTreeSHA256, item.planned.DesiredTreeSHA256); err != nil {
-			return result, err
+		result.Applied++
+		canonical, observeErr := item.host.Observe(ctx, item.hostRepository)
+		if observeErr != nil || canonical.TreeSHA256 != item.planned.DesiredTreeSHA256 || canonical.NativeRevision != committed.Revision.NativeRevision ||
+			(item.hostRepository.Type == "s3" && canonical != committed.Revision) {
+			probeErr := observeErr
+			if probeErr == nil {
+				probeErr = errors.New("canonical host observation does not match committed tree")
+			}
+			if committed.RestoreRef != nil {
+				restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+				_, restoreErr := item.host.Restore(restoreCtx, item.hostRepository, *committed.RestoreRef, expectedRevisionFromPublished(committed.Revision))
+				cancelRestore()
+				if restoreErr != nil {
+					return result, fmt.Errorf("canonical probe failed: %v; restore failed: %w", probeErr, restoreErr)
+				}
+				result.Applied--
+			}
+			return result, fmt.Errorf("canonical probe failed: %w", probeErr)
+		}
+		if !request.StructuralOnly {
+			if probeErr := verifyCanonicalClient(ctx, root, item.repository, item.stage, committed.CanonicalEndpoint, request); probeErr != nil {
+				if committed.RestoreRef != nil {
+					restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+					_, restoreErr := item.host.Restore(restoreCtx, item.hostRepository, *committed.RestoreRef, expectedRevisionFromPublished(committed.Revision))
+					cancelRestore()
+					if restoreErr != nil {
+						return result, fmt.Errorf("canonical client probe failed: %v; restore failed: %w", probeErr, restoreErr)
+					}
+					result.Applied--
+				}
+				return result, fmt.Errorf("canonical client probe failed: %w", probeErr)
+			}
 		}
 		if err := state.AssertGitRevision(root, ledgerRevision); err != nil {
 			return result, err
 		}
-		result.Applied++
 	}
 	return result, nil
+}
+
+func verifyCanonicalClient(ctx context.Context, root string, repository state.Repository, staged, endpoint string, request ApplyWorkspaceRequest) error {
+	if repository.Host.Type == "local" {
+		output, err := state.WorkspacePath(root, repository.Host.Path)
+		if err != nil {
+			return err
+		}
+		return verifyStaged(ctx, repository.Format, output, request)
+	}
+	if repository.Format != "pypi" {
+		return fmt.Errorf("canonical client verification is not implemented for format %q", repository.Format)
+	}
+	_, _, err := app.VerifyPyPIClientEndpoint(ctx, staged, endpoint, request.Python)
+	return err
 }
 
 func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt time.Time, output string) (BuildResult, error) {
@@ -617,23 +829,6 @@ func activeLock(lock state.RepositoryLock) state.RepositoryLock {
 	return lock
 }
 
-func observedTree(root, output string) (string, error) {
-	name, err := state.WorkspacePath(root, output)
-	if err != nil {
-		return "", err
-	}
-	if _, err := os.Lstat(name); errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	} else if err != nil {
-		return "", err
-	}
-	info, err := InspectRepository(name)
-	if err != nil {
-		return "", fmt.Errorf("inspect target %q: %w", output, err)
-	}
-	return info.TreeSHA256, nil
-}
-
 func verifyStaged(ctx context.Context, format, repository string, request ApplyWorkspaceRequest) error {
 	switch format {
 	case "pypi":
@@ -696,9 +891,98 @@ func nativePackageName(format, name string) string {
 	return name
 }
 
+type localHostResolver struct{}
+
+func (localHostResolver) Resolve(_ context.Context, repository host.Repository) (host.Host, error) {
+	if repository.Type != "local" {
+		return nil, fmt.Errorf("host type %q requires a configured host resolver", repository.Type)
+	}
+	return localhost.New(), nil
+}
+
+func toHostRepository(root, name string, repository state.Repository) host.Repository {
+	canonicalEndpoint := repository.Host.CanonicalEndpoint
+	if repository.Host.Type == "local" {
+		canonicalEndpoint = repository.Host.Path
+	}
+	return host.Repository{
+		Name: name, Format: repository.Format, Type: repository.Host.Type,
+		Visibility: repository.Visibility, WorkspaceRoot: root, Path: repository.Host.Path,
+		Bucket: repository.Host.Bucket, Prefix: repository.Host.Prefix, Region: repository.Host.Region,
+		Endpoint: repository.Host.Endpoint, CanonicalEndpoint: canonicalEndpoint,
+		UsePathStyle: repository.Host.UsePathStyle,
+	}
+}
+
+func repositoryHostIdentity(repository state.Repository) (string, error) {
+	content, err := json.Marshal(struct {
+		Format     string           `json:"format"`
+		Visibility string           `json:"visibility"`
+		Host       state.HostConfig `json:"host"`
+	}{Format: repository.Format, Visibility: repository.Visibility, Host: repository.Host})
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func repositoryInstallDocDigest(root, name string, repository state.Repository) (string, error) {
+	if repository.Host.Type != "s3" || repository.Format != "pypi" {
+		return "", nil
+	}
+	if err := state.ValidateInstallDocument(root, name, repository); err != nil {
+		return "", err
+	}
+	filename, err := state.WorkspacePath(root, filepath.ToSlash(filepath.Join("docs", "install-"+name+".md")))
+	if err != nil {
+		return "", err
+	}
+	return state.HashFile(filename)
+}
+
+func stagedHostFiles(directory string) ([]host.File, error) {
+	manifest, err := app.VerifyRepository(directory)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]host.File, 0, len(manifest.Files)+1)
+	for _, file := range manifest.Files {
+		files = append(files, host.File{Path: file.Path, Size: file.Size, SHA256: file.SHA256})
+	}
+	management := filepath.Join(directory, "snailmail.repository.json")
+	info, err := os.Lstat(management)
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, errors.New("staged management manifest is not a regular file")
+	}
+	digest, err := state.HashFile(management)
+	if err != nil {
+		return nil, err
+	}
+	files = append(files, host.File{Path: "snailmail.repository.json", Size: info.Size(), SHA256: digest})
+	sort.Slice(files, func(left, right int) bool { return files[left].Path < files[right].Path })
+	return files, nil
+}
+
+func repositoryCommitPaths(repository state.Repository) []string {
+	switch repository.Format {
+	case "pypi":
+		return []string{"simple/index.html"}
+	case "helm":
+		return []string{"index.yaml"}
+	case "deb":
+		return []string{filepath.ToSlash(filepath.Join("dists", repository.Suite, "Release"))}
+	default:
+		return nil
+	}
+}
+
 func validateApplyPlan(plan state.Plan) error {
 	if !validSHA256(plan.Payload.ManifestSHA256) {
 		return errors.New("plan has an invalid manifest digest")
+	}
+	if plan.Payload.VerificationMode != "structural" && plan.Payload.VerificationMode != "client" {
+		return errors.New("plan has an invalid verification mode")
 	}
 	createdAt, err := time.Parse(time.RFC3339, plan.Payload.CreatedAt)
 	if err != nil {
@@ -724,8 +1008,38 @@ func validateApplyPlan(plan state.Plan) error {
 			return fmt.Errorf("plan repository %q has invalid action %q", repository.Name, repository.Action)
 		}
 		if !validSHA256(repository.LockSHA256) || !validSHA256(repository.DesiredTreeSHA256) ||
+			!validSHA256(repository.HostIdentitySHA256) ||
 			(repository.ObservedTreeSHA256 != "" && !validSHA256(repository.ObservedTreeSHA256)) {
 			return fmt.Errorf("plan repository %q has an invalid digest", repository.Name)
+		}
+		if repository.Host.Type != "local" && repository.Host.Type != "s3" {
+			return fmt.Errorf("plan repository %q has unsupported host type %q", repository.Name, repository.Host.Type)
+		}
+		if repository.CanonicalEndpoint == "" {
+			return fmt.Errorf("plan repository %q has no canonical endpoint", repository.Name)
+		}
+		if repository.Host.Type == "s3" && !validSHA256(repository.InstallDocSHA256) {
+			return fmt.Errorf("plan repository %q has an invalid install document digest", repository.Name)
+		}
+		if repository.Host.Type == "s3" && !validSHA256(repository.DesiredManifestSHA256) {
+			return fmt.Errorf("plan repository %q has an invalid desired manifest digest", repository.Name)
+		}
+		for _, digest := range []string{repository.ObservedReleaseSHA256, repository.ObservedManifestSHA256, repository.ObservedRestoreSHA256, repository.ObservedRestoreRootSHA256} {
+			if digest != "" && !validSHA256(digest) {
+				return fmt.Errorf("plan repository %q has an invalid observed publication digest", repository.Name)
+			}
+		}
+		if repository.Host.Type == "s3" {
+			if repository.ObservedTreeSHA256 == "" {
+				if repository.ObservedPlanID != "" || repository.ObservedChangeID != "" || repository.ObservedReleaseSHA256 != "" ||
+					repository.ObservedManifestSHA256 != "" || repository.ObservedRestoreID != "" || repository.ObservedRestoreSHA256 != "" || repository.ObservedRestoreRootSHA256 != "" {
+					return fmt.Errorf("plan repository %q has an incomplete observed publication", repository.Name)
+				}
+			} else if repository.ObservedRevision == "" || !validSHA256(repository.ObservedPlanID) || repository.ObservedChangeID != repository.Name+":"+repository.ObservedTreeSHA256[:12] ||
+				!validSHA256(repository.ObservedReleaseSHA256) || !validSHA256(repository.ObservedManifestSHA256) ||
+				!validSHA256(repository.ObservedRestoreID) || !validSHA256(repository.ObservedRestoreSHA256) {
+				return fmt.Errorf("plan repository %q has an invalid observed publication", repository.Name)
+			}
 		}
 		if repository.ChangeID != repository.Name+":"+repository.DesiredTreeSHA256[:12] {
 			return fmt.Errorf("plan repository %q has an invalid change ID", repository.Name)
@@ -737,6 +1051,32 @@ func validateApplyPlan(plan state.Plan) error {
 func validSHA256(value string) bool {
 	decoded, err := hex.DecodeString(value)
 	return err == nil && len(decoded) == 32 && value == strings.ToLower(value)
+}
+
+func revisionMatchesPlanObservation(revision host.PublishedRevision, planned state.PlanRepository) bool {
+	return revision.NativeRevision == planned.ObservedRevision && revision.TreeSHA256 == planned.ObservedTreeSHA256 &&
+		revision.PlanID == planned.ObservedPlanID && revision.ChangeID == planned.ObservedChangeID &&
+		revision.ReleaseSHA256 == planned.ObservedReleaseSHA256 && revision.ManifestSHA256 == planned.ObservedManifestSHA256 &&
+		revision.RestoreID == planned.ObservedRestoreID && revision.RestoreSHA256 == planned.ObservedRestoreSHA256 &&
+		revision.RestoreRootSHA256 == planned.ObservedRestoreRootSHA256
+}
+
+func expectedRevisionFromPlan(planned state.PlanRepository) host.ExpectedRevision {
+	return host.ExpectedRevision{
+		NativeRevision: planned.ObservedRevision, TreeSHA256: planned.ObservedTreeSHA256,
+		PlanID: planned.ObservedPlanID, ChangeID: planned.ObservedChangeID,
+		ReleaseSHA256: planned.ObservedReleaseSHA256, ManifestSHA256: planned.ObservedManifestSHA256,
+		RestoreID: planned.ObservedRestoreID, RestoreSHA256: planned.ObservedRestoreSHA256,
+		RestoreRootSHA256: planned.ObservedRestoreRootSHA256,
+	}
+}
+
+func expectedRevisionFromPublished(revision host.PublishedRevision) host.ExpectedRevision {
+	return host.ExpectedRevision{
+		NativeRevision: revision.NativeRevision, TreeSHA256: revision.TreeSHA256, PlanID: revision.PlanID, ChangeID: revision.ChangeID,
+		ReleaseSHA256: revision.ReleaseSHA256, ManifestSHA256: revision.ManifestSHA256, RestoreID: revision.RestoreID,
+		RestoreSHA256: revision.RestoreSHA256, RestoreRootSHA256: revision.RestoreRootSHA256,
+	}
 }
 
 func PlanSummary(plan state.Plan) string {

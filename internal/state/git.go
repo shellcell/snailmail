@@ -54,7 +54,7 @@ func RequireCleanGit(root string) (string, error) {
 	if err != nil {
 		return "", errors.New("workspace must be a Git repository with at least one commit")
 	}
-	status, err := gitOutput(root, "status", "--porcelain", "--untracked-files=all")
+	status, err := gitStatusOutput(root)
 	if err != nil {
 		return "", err
 	}
@@ -90,7 +90,7 @@ func ValidatePlanGit(root, baseRevision, planID string, repositories []string) (
 	}
 	if current == baseRevision {
 		allowedLedgers := publicationWorkspacePaths(repositories)
-		status, err := gitOutput(root, "status", "--porcelain", "--untracked-files=all")
+		status, err := gitStatusOutput(root)
 		if err != nil {
 			return false, err
 		}
@@ -170,7 +170,7 @@ func CommitPublicationLedgers(root, planID, baseRevision string, repositories []
 	if err != nil {
 		return "", err
 	}
-	status, err := gitOutput(root, "status", "--porcelain", "--untracked-files=all")
+	status, err := gitStatusOutput(root)
 	if err != nil {
 		return "", err
 	}
@@ -417,7 +417,7 @@ func validateGitStatus(status string, allowedChanges, authoritative map[string]b
 		if strings.HasPrefix(line, "?? ") && !authoritative[name] && !isAuthoritativePath(name) {
 			continue
 		}
-		return errors.New("workspace has uncommitted authoritative or tracked changes")
+		return fmt.Errorf("workspace has uncommitted authoritative or tracked changes at %q", name)
 	}
 	return nil
 }
@@ -431,7 +431,11 @@ func authoritativePaths(root string) (map[string]bool, error) {
 	for _, repository := range manifest.Repositories {
 		paths[filepath.ToSlash(repository.Lock)] = true
 	}
-	for _, pattern := range []string{filepath.Join(root, "repos", "*.lock.toml"), filepath.Join(root, "publications", "*.jsonl")} {
+	for _, pattern := range []string{
+		filepath.Join(root, "repos", "*.lock.toml"),
+		filepath.Join(root, "publications", "*.jsonl"),
+		filepath.Join(root, "docs", "install-*.md"),
+	} {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			return nil, err
@@ -448,7 +452,7 @@ func authoritativePaths(root string) (map[string]bool, error) {
 }
 
 func isAuthoritativePath(name string) bool {
-	return name == ManifestFilename || strings.HasPrefix(name, "repos/") || strings.HasPrefix(name, "publications/")
+	return name == ManifestFilename || strings.HasPrefix(name, "repos/") || strings.HasPrefix(name, "publications/") || strings.HasPrefix(name, "docs/install-")
 }
 
 func hasPlanTrailer(message, planID string) bool {
@@ -670,6 +674,14 @@ func gitOutput(root string, arguments ...string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func gitStatusOutput(root string) (string, error) {
+	output, err := gitCommand(root, "status", "--porcelain", "--untracked-files=all").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(string(output), "\r\n"), nil
 }
 
 func gitOutputEnv(root string, environment []string, arguments ...string) (string, error) {

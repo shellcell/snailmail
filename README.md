@@ -7,13 +7,18 @@ format — apt, dnf, apk, PyPI, npm, Helm, OCI, Cargo, Go, Maven, Nix, or plain
 artifacts — on hosting you choose, and to **publish into repositories you
 don't own** — AUR, Homebrew, nixpkgs, npmjs, PyPI, ghcr.
 
-**Status: Phase 1 local reconciliation.** The current implementation builds,
-structurally verifies, serves, and client-tests deterministic static PyPI,
-Debian, and Helm repositories. Git-backed workspaces also support local
+**Status: Phase 2 owned hosting, public S3 slice.** The current implementation
+builds, structurally verifies, serves, and client-tests deterministic static
+PyPI, Debian, and Helm repositories. Git-backed workspaces also support local
 `init`, `setup`, `add`, `plan`, and `apply` workflows with immutable blobs,
 reviewable plans, publication ledgers, and per-repository managed release
 switching. Replacement of an existing managed release is currently implemented
-only on Linux. Signing, remote hosts, and PR or approval gates remain future work. See
+only on Linux. Public PyPI repositories can additionally stage and publish to
+S3-compatible object storage with immutable releases, conditional root-index
+switching, checksum observation, and conditional restore. Private S3 reads,
+shared remote blob storage, GitHub Pages, PR or approval gates, the public
+status renderer, and containerized CI distribution are the remaining Phase 2
+work. Signing, operational commands, and format breadth follow in Phase 3. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the implementation contract and
 [PLAN.md](PLAN.md) for the broader product design.
 
@@ -32,7 +37,34 @@ go run ./cmd/snailmail apply --plan snailmail.snailmail-plan.json
 ledgers to be committed in a complete, non-shallow Git repository. `apply`
 executes the reviewed plan without replanning, verifies staged repository
 bytes, commits its exact publication ledger records with a compare-and-swap,
-and publishes those same bytes through a managed release switch.
+and publishes through the selected host's conditional release switch. S3 keeps
+the verified tree under an immutable digest prefix and conditionally updates a
+small root index that points clients at that tree.
+
+Public S3-compatible PyPI setup uses the standard AWS credential chain; no
+credential values are written to the manifest or plan:
+
+```sh
+go run ./cmd/snailmail setup pypi \
+  --name python \
+  --host s3 \
+  --bucket example-packages \
+  --prefix python \
+  --region us-east-1 \
+  --base-url https://packages.example.com/python
+git add snailmail.toml repos/python.lock.toml docs/install-python.md
+git commit -m "configure hosted Python repository"
+go run ./cmd/snailmail plan
+go run ./cmd/snailmail apply
+```
+
+The bucket or CDN must publicly serve the configured prefix, including
+`.snailmail/stages/` during pre-publication verification. Use `--endpoint` and
+`--use-path-style` for compatible object stores. `--visibility private` is
+rejected until scoped client read credentials are implemented. Configure a
+bucket lifecycle rule to expire abandoned `.snailmail/stages/` objects after a
+grace period; immutable `.snailmail/releases/`, `.snailmail/manifests/`, and
+`.snailmail/restores/` objects must not use that short-lived rule.
 
 ```sh
 go run ./cmd/snailmail build pypi --input ./dist --output ./repository
@@ -57,8 +89,8 @@ The short version:
   local slice implements `auto`, while `pr` and `approval` remain future work.
 - **Verified.** Apply verifies staged bytes structurally and, unless explicitly
   disabled, with the ecosystem client before switching the local target.
-- **Local first.** `snailmail setup` currently records deterministic local
-  repository configuration; hosting and key provisioning remain future work.
+- **Local and S3.** `snailmail setup` records deterministic local targets or
+  public S3-compatible PyPI targets. Key provisioning remains future work.
 
 ```
               apt      dnf      apk      aur      aur-bin  brew     nixpkgs

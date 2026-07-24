@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path"
@@ -165,13 +166,44 @@ func VerifyPyPIClient(ctx context.Context, root, python string) (buildgraph.Repo
 	if manifest.Format != pypi.FormatID {
 		return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("repository format is %q, not %q", manifest.Format, pypi.FormatID)
 	}
+	server := httptest.NewServer(http.FileServer(http.Dir(snapshot)))
+	defer server.Close()
+	installed, err := verifyPyPICases(ctx, manifest, blobs, server.URL, python)
+	return manifest, installed, err
+}
+
+// VerifyPyPIClientEndpoint verifies the local immutable tree but installs from
+// the host-served endpoint, proving staged or canonical HTTP behavior.
+func VerifyPyPIClientEndpoint(ctx context.Context, root, endpoint, python string) (buildgraph.RepositoryManifest, int, error) {
+	manifest, blobs, err := verifyRepository(root)
+	if err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
+	}
+	if manifest.Format != pypi.FormatID {
+		return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("repository format is %q, not %q", manifest.Format, pypi.FormatID)
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return buildgraph.RepositoryManifest{}, 0, errors.New("PyPI verification endpoint must be an HTTP(S) URL")
+	}
+	installed, err := verifyPyPICases(ctx, manifest, blobs, strings.TrimSuffix(endpoint, "/"), python)
+	return manifest, installed, err
+}
+
+func verifyPyPICases(ctx context.Context, manifest buildgraph.RepositoryManifest, blobs []domain.Blob, endpoint, python string) (int, error) {
+	parsedEndpoint, err := url.Parse(endpoint)
+	if err != nil || parsedEndpoint.Hostname() == "" {
+		return 0, errors.New("invalid PyPI verification endpoint")
+	}
+	noProxy := strings.Join([]string{parsedEndpoint.Hostname(), "127.0.0.1", "localhost"}, ",")
 	if python == "" {
 		python = "python3"
 	}
-	python, err = exec.LookPath(python)
+	resolvedPython, err := exec.LookPath(python)
 	if err != nil {
-		return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("find Python client: %w", err)
+		return 0, fmt.Errorf("find Python client: %w", err)
 	}
+	python = resolvedPython
 	wheels := make(map[string]bool)
 	for _, blob := range blobs {
 		if strings.HasSuffix(strings.ToLower(blob.Filename), ".whl") {
@@ -179,34 +211,30 @@ func VerifyPyPIClient(ctx context.Context, root, python string) (buildgraph.Repo
 		}
 		for _, requirement := range blob.Facts.Requirements {
 			if strings.Contains(requirement, "@") {
-				return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("host verification rejects direct URL requirement %q; use an isolated runner", requirement)
+				return 0, fmt.Errorf("host verification rejects direct URL requirement %q; use an isolated runner", requirement)
 			}
 		}
 	}
 	for _, verification := range manifest.VerificationCases {
 		if !wheels[verification.Project+"\x00"+verification.Version] {
-			return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("%s==%s has no wheel; source distribution verification requires an isolated runner", verification.Project, verification.Version)
+			return 0, fmt.Errorf("%s==%s has no wheel; source distribution verification requires an isolated runner", verification.Project, verification.Version)
 		}
 	}
-
-	server := httptest.NewServer(http.FileServer(http.Dir(snapshot)))
-	defer server.Close()
-
 	for _, verification := range manifest.VerificationCases {
 		sandbox, err := os.MkdirTemp("", ".snailmail-pip-*")
 		if err != nil {
-			return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("create pip sandbox: %w", err)
+			return 0, fmt.Errorf("create pip sandbox: %w", err)
 		}
 		target := filepath.Join(sandbox, "target")
 		home := filepath.Join(sandbox, "home")
 		temporary := filepath.Join(sandbox, "tmp")
 		if err := os.MkdirAll(home, 0o700); err != nil {
 			_ = os.RemoveAll(sandbox)
-			return buildgraph.RepositoryManifest{}, 0, err
+			return 0, err
 		}
 		if err := os.MkdirAll(temporary, 0o700); err != nil {
 			_ = os.RemoveAll(sandbox)
-			return buildgraph.RepositoryManifest{}, 0, err
+			return 0, err
 		}
 		arguments := []string{
 			"-I", "-m", "pip", "install",
@@ -215,7 +243,7 @@ func VerifyPyPIClient(ctx context.Context, root, python string) (buildgraph.Repo
 			"--no-build-isolation",
 			"--only-binary=:all:",
 			"--no-compile",
-			"--index-url", server.URL + "/" + manifest.Install.IndexPath,
+			"--index-url", endpoint + "/" + manifest.Install.IndexPath,
 			"--target", target,
 			"--", verification.Project + "==" + verification.Version,
 		}
@@ -233,19 +261,19 @@ func VerifyPyPIClient(ctx context.Context, root, python string) (buildgraph.Repo
 			"HTTPS_PROXY=http://127.0.0.1:9",
 			"http_proxy=http://127.0.0.1:9",
 			"https_proxy=http://127.0.0.1:9",
-			"NO_PROXY=127.0.0.1,localhost",
-			"no_proxy=127.0.0.1,localhost",
+			"NO_PROXY=" + noProxy,
+			"no_proxy=" + noProxy,
 		}
 		output, commandErr := command.CombinedOutput()
 		removeErr := os.RemoveAll(sandbox)
 		if commandErr != nil {
-			return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("pip install %s==%s: %w\n%s", verification.Project, verification.Version, commandErr, strings.TrimSpace(string(output)))
+			return 0, fmt.Errorf("pip install %s==%s: %w\n%s", verification.Project, verification.Version, commandErr, strings.TrimSpace(string(output)))
 		}
 		if removeErr != nil {
-			return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("remove pip target: %w", removeErr)
+			return 0, fmt.Errorf("remove pip target: %w", removeErr)
 		}
 	}
-	return manifest, len(manifest.VerificationCases), nil
+	return len(manifest.VerificationCases), nil
 }
 
 // VerifyDebClient resolves and extracts each planned package version in its own

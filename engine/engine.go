@@ -12,6 +12,7 @@ import (
 	"github.com/shellcell/snailmail/formats/pypi"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/buildgraph"
+	"github.com/shellcell/snailmail/internal/state"
 )
 
 var reproducibleEpoch = time.Unix(0, 0).UTC()
@@ -29,6 +30,7 @@ type BuildResult struct {
 	Format            string
 	Output            string
 	TreeSHA256        string
+	ManifestSHA256    string
 	ProjectCount      int
 	PackageCount      int
 	DistributionCount int
@@ -119,10 +121,15 @@ func BuildPyPI(ctx context.Context, request BuildPyPIRequest) (BuildResult, erro
 	if err := app.Materialize(ctx, output, artifact, snapshot.Sources); err != nil {
 		return BuildResult{}, err
 	}
+	manifestSHA256, err := state.HashFile(filepath.Join(output, buildgraph.ManifestFilename))
+	if err != nil {
+		return BuildResult{}, err
+	}
 	return BuildResult{
 		Format:            manifest.Format,
 		Output:            output,
 		TreeSHA256:        manifest.TreeSHA256,
+		ManifestSHA256:    manifestSHA256,
 		ProjectCount:      uniqueProjects(manifest),
 		DistributionCount: len(snapshot.Blobs),
 	}, nil
@@ -168,10 +175,15 @@ func BuildDeb(ctx context.Context, request BuildDebRequest) (BuildResult, error)
 	if err := app.Materialize(ctx, output, artifact, snapshot.Sources); err != nil {
 		return BuildResult{}, err
 	}
+	manifestSHA256, err := state.HashFile(filepath.Join(output, buildgraph.ManifestFilename))
+	if err != nil {
+		return BuildResult{}, err
+	}
 	return BuildResult{
 		Format:            manifest.Format,
 		Output:            output,
 		TreeSHA256:        manifest.TreeSHA256,
+		ManifestSHA256:    manifestSHA256,
 		PackageCount:      uniquePackages(manifest),
 		DistributionCount: len(snapshot.Blobs),
 	}, nil
@@ -212,10 +224,15 @@ func BuildHelm(ctx context.Context, request BuildHelmRequest) (BuildResult, erro
 	if err := app.Materialize(ctx, output, artifact, snapshot.Sources); err != nil {
 		return BuildResult{}, err
 	}
+	manifestSHA256, err := state.HashFile(filepath.Join(output, buildgraph.ManifestFilename))
+	if err != nil {
+		return BuildResult{}, err
+	}
 	return BuildResult{
 		Format:            manifest.Format,
 		Output:            output,
 		TreeSHA256:        manifest.TreeSHA256,
+		ManifestSHA256:    manifestSHA256,
 		PackageCount:      uniqueProjects(manifest),
 		DistributionCount: len(snapshot.Blobs),
 	}, nil

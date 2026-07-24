@@ -932,20 +932,29 @@ explicitly non-atomic; centralizing locks remains the default.
 Build the architecture in vertical slices rather than creating every interface
 up front:
 
-1. Implement the pure domain and build graph with PyPI, Debian, and Helm golden
-   trees, local `serve`, and official-client verification. No manifest, Git
-   state, or remote hosting is needed for this Phase 0 proof.
-2. Add the manifest, locks, local CAS, publication ledger, and desired-state
-   commands.
-3. Add exact plan/apply, staged publication, public GitHub Pages, private-capable
-   S3, setup, and generated install docs.
-4. Add the public status renderer and containerized CI distribution.
+The phase numbers below use the canonical roadmap in `PLAN.md` §14:
+
+1. **Phase 0:** implement the pure domain and build graph with PyPI, Debian, and
+   Helm golden trees, local `serve`, and official-client verification. No
+   manifest, Git state, or remote hosting is needed for this proof.
+2. **Phase 1:** add the manifest, locks, local CAS, publication ledger, exact
+   plan/apply, and local managed release switching.
+3. **Phase 2:** add the provider-neutral host port and owned remote hosting.
+   Public S3-compatible PyPI is the first slice; private-capable S3, public
+   GitHub Pages, shared remote blob storage, publication gates, the public
+   status renderer, and containerized CI distribution complete the phase.
+4. **Phase 3:** add explicit signing and key operations, operational status and
+   adoption commands, the knowledge bundle, and additional Tier 1 formats.
+5. **Phase 4:** add read-only foreign observation before irreversible remote
+   publication targets.
+6. **Phase 5:** add optional server, console, forge-app, attestation, and
+   process-plugin adapters only after the static workflow is established.
 
 Only extract a port when a use case needs an effect or a second implementation
 proves variation. The architectural boundaries above are firm; speculative
 provider methods are not.
 
-This deliberately corrects the Phase 1 phrase "private PyPI on GitHub Pages" in
+This deliberately corrects the old phrase "private PyPI on GitHub Pages" in
 `PLAN.md`: GitHub Pages can host a self-owned public index, but it is not a
 client-compatible private package host. The private five-minute target uses S3
 or another authenticated object-store/CDN implementation.
