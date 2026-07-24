@@ -7,8 +7,20 @@ format — apt, dnf, apk, PyPI, npm, Helm, OCI, Cargo, Go, Maven, Nix, or plain
 artifacts — on hosting you choose, and to **publish into repositories you
 don't own** — AUR, Homebrew, nixpkgs, npmjs, PyPI, ghcr.
 
-**Status: design.** Nothing is implemented yet. See [PLAN.md](PLAN.md) for the
-domain model, the architecture, the phasing, and the open questions.
+**Status: Phase 0 implementation.** The current slices build, structurally
+verify, serve, and client-test deterministic static PyPI, Debian, and Helm
+repositories. See [ARCHITECTURE.md](ARCHITECTURE.md) for the implementation
+contract and [PLAN.md](PLAN.md) for the broader product design.
+
+```sh
+go run ./cmd/snailmail build pypi --input ./dist --output ./repository
+go run ./cmd/snailmail verify pypi --repo ./repository
+go run ./cmd/snailmail build deb --input ./dist --output ./apt-repository
+go run ./cmd/snailmail verify deb --repo ./apt-repository
+go run ./cmd/snailmail build helm --input ./dist --output ./helm-repository
+go run ./cmd/snailmail verify helm --repo ./helm-repository
+go run ./cmd/snailmail serve --repo ./repository
+```
 
 The short version:
 
