@@ -35,6 +35,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 	switch args[0] {
+	case "init":
+		return runInit(args[1:], stdout, stderr)
+	case "setup":
+		return runSetup(args[1:], stdout, stderr)
+	case "add":
+		return runAdd(args[1:], stdout, stderr)
+	case "plan":
+		return runPlan(ctx, args[1:], stdout, stderr)
+	case "apply":
+		return runApply(ctx, args[1:], stdout, stderr)
 	case "build":
 		return runBuild(ctx, args[1:], stdout, stderr)
 	case "verify":
@@ -47,6 +57,149 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func runInit(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("init", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	name := flags.String("name", "", "workspace name")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: *workspace, Name: *name}); err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "✉️   initialized workspace %s\n", *name)
+	return nil
+}
+
+func runSetup(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: snailmail setup <pypi|deb|helm> --name NAME --output DIR")
+	}
+	format := args[0]
+	flags := flag.NewFlagSet("setup "+format, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	name := flags.String("name", "", "repository name")
+	output := flags.String("output", "", "workspace-relative published directory")
+	suite := flags.String("suite", "stable", "Debian suite")
+	component := flags.String("component", "main", "Debian component")
+	architectures := flags.String("architectures", "amd64", "comma-separated Debian architectures")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if err := engine.SetupRepository(engine.SetupRepositoryRequest{
+		Root: *workspace, Name: *name, Format: format, Output: *output,
+		Suite: *suite, Component: *component, Architectures: splitList(*architectures),
+	}); err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  configured %s repository %s\n", format, *name)
+	fmt.Fprintf(stdout, "✉️   desired state will publish to %s\n", *output)
+	return nil
+}
+
+func runAdd(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("add", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	track := flags.String("track", "stable", "placement track")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() < 2 {
+		return errors.New("usage: snailmail add [--track stable] REPOSITORY ARTIFACT...")
+	}
+	result, err := engine.AddArtifacts(engine.AddArtifactsRequest{
+		Root: *workspace, Repository: flags.Arg(0), Artifacts: flags.Args()[1:], Track: *track,
+	})
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  locked %d %s in %s", result.Added, plural(result.Added, "artifact", "artifacts"), result.Repository)
+	if result.Skipped != 0 {
+		fmt.Fprintf(stdout, " (%d already present)", result.Skipped)
+	}
+	fmt.Fprintln(stdout)
+	for _, packageVersion := range result.Packages {
+		fmt.Fprintf(stdout, "✉️   %s\n", packageVersion)
+	}
+	return nil
+}
+
+func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	output := flags.String("out", "snailmail.snailmail-plan.json", "plan output file")
+	generatedAtValue := flags.String("generated-at", "", "explicit RFC3339 repository generation time")
+	expires := flags.Duration("expires", 2*time.Hour, "plan lifetime")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	generatedAt, err := optionalTime(*generatedAtValue)
+	if err != nil {
+		return err
+	}
+	result, err := engine.PlanWorkspace(ctx, engine.PlanWorkspaceRequest{
+		Root: *workspace, Output: *output, GeneratedAt: generatedAt, ExpiresIn: *expires,
+	})
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  planned %d repository %s\n", result.Changes, plural(result.Changes, "change", "changes"))
+	fmt.Fprintf(stdout, "✉️   %s\n", result.Output)
+	fmt.Fprintf(stdout, "    plan sha256:%s\n", result.PlanID)
+	return nil
+}
+
+func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("apply", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	plan := flags.String("plan", "snailmail.snailmail-plan.json", "reviewed plan file")
+	structuralOnly := flags.Bool("structural-only", false, "skip ecosystem client verification")
+	python := flags.String("python", "python3", "Python executable for PyPI verification")
+	runner := flags.String("runner", "podman", "OCI runner for Debian and Helm verification")
+	debianImage := flags.String("debian-image", engine.DefaultDebianVerificationImage, "digest-pinned Debian image")
+	helmImage := flags.String("helm-image", engine.DefaultHelmVerificationImage, "digest-pinned Helm image")
+	maxWorkspaceMiB := flags.Int64("max-workspace-mib", 4096, "maximum Debian verification workspace in MiB")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	result, err := engine.ApplyWorkspace(ctx, engine.ApplyWorkspaceRequest{
+		Root: *workspace, Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
+		DebianImage: *debianImage, HelmImage: *helmImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
+	})
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  applied %d repository %s", result.Applied, plural(result.Applied, "change", "changes"))
+	if result.Current != 0 {
+		fmt.Fprintf(stdout, " (%d already current)", result.Current)
+	}
+	fmt.Fprintln(stdout)
+	fmt.Fprintf(stdout, "✉️   plan sha256:%s\n", result.PlanID)
+	return nil
 }
 
 func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -330,6 +483,11 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "relaxed package delivery")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Usage:")
+	fmt.Fprintln(output, "  snailmail init --name NAME")
+	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm> --name NAME --output DIR")
+	fmt.Fprintln(output, "  snailmail add REPOSITORY ARTIFACT...")
+	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
+	fmt.Fprintln(output, "  snailmail apply [--plan snailmail.snailmail-plan.json]")
 	fmt.Fprintln(output, "  snailmail build pypi --input DIR --output DIR")
 	fmt.Fprintln(output, "  snailmail build deb --input DIR --output DIR [--suite stable --architectures amd64]")
 	fmt.Fprintln(output, "  snailmail build helm --input DIR --output DIR")
@@ -348,6 +506,17 @@ func splitList(value string) []string {
 		}
 	}
 	return result
+}
+
+func optionalTime(value string) (time.Time, error) {
+	if value == "" {
+		return time.Time{}, nil
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("parse time: %w", err)
+	}
+	return parsed, nil
 }
 
 func printBrand(output io.Writer) {
