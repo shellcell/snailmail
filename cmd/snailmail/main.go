@@ -190,6 +190,14 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		DebianImage: *debianImage, HelmImage: *helmImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
 	})
 	if err != nil {
+		if result.Applied != 0 || result.Current != 0 {
+			printBrand(stderr)
+			fmt.Fprintf(stderr, "📦  applied %d repository %s before failure", result.Applied, plural(result.Applied, "change", "changes"))
+			if result.Current != 0 {
+				fmt.Fprintf(stderr, " (%d already current)", result.Current)
+			}
+			fmt.Fprintln(stderr)
+		}
 		return err
 	}
 	printBrand(stdout)

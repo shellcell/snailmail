@@ -7,10 +7,32 @@ format — apt, dnf, apk, PyPI, npm, Helm, OCI, Cargo, Go, Maven, Nix, or plain
 artifacts — on hosting you choose, and to **publish into repositories you
 don't own** — AUR, Homebrew, nixpkgs, npmjs, PyPI, ghcr.
 
-**Status: Phase 0 implementation.** The current slices build, structurally
-verify, serve, and client-test deterministic static PyPI, Debian, and Helm
-repositories. See [ARCHITECTURE.md](ARCHITECTURE.md) for the implementation
-contract and [PLAN.md](PLAN.md) for the broader product design.
+**Status: Phase 1 local reconciliation.** The current implementation builds,
+structurally verifies, serves, and client-tests deterministic static PyPI,
+Debian, and Helm repositories. Git-backed workspaces also support local
+`init`, `setup`, `add`, `plan`, and `apply` workflows with immutable blobs,
+reviewable plans, publication ledgers, and per-repository managed release
+switching. Replacement of an existing managed release is currently implemented
+only on Linux. Signing, remote hosts, and PR or approval gates remain future work. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the implementation contract and
+[PLAN.md](PLAN.md) for the broader product design.
+
+```sh
+git init
+go run ./cmd/snailmail init --name example
+go run ./cmd/snailmail setup pypi --name python --output public/python
+go run ./cmd/snailmail add python ./dist/*.whl
+git add .gitignore snailmail.toml repos/python.lock.toml
+git commit -m "configure Python repository"
+go run ./cmd/snailmail plan
+go run ./cmd/snailmail apply --plan snailmail.snailmail-plan.json
+```
+
+`plan` requires the manifest, configured locks, and existing publication
+ledgers to be committed in a complete, non-shallow Git repository. `apply`
+executes the reviewed plan without replanning, verifies staged repository
+bytes, commits its exact publication ledger records with a compare-and-swap,
+and publishes those same bytes through a managed release switch.
 
 ```sh
 go run ./cmd/snailmail build pypi --input ./dist --output ./repository
@@ -31,12 +53,12 @@ The short version:
   served index is a build artifact. Rollback is `git revert`.
 - **Declarative.** One manifest says what should be published where; `plan` and
   `apply` reconcile against it.
-- **Gated per repository.** `auto`, `pr`, or `approval` is a field, not the
-  shape of a workflow file.
-- **Verified.** Nothing is done until a container has installed from it.
-- **Five minutes to a working repo.** `snailmail setup deb` provisions the
-  hosting, generates a format-appropriate key, writes the CI, and emits install
-  instructions that cannot drift from what was built.
+- **Gated per repository.** The manifest carries the gate policy; the current
+  local slice implements `auto`, while `pr` and `approval` remain future work.
+- **Verified.** Apply verifies staged bytes structurally and, unless explicitly
+  disabled, with the ecosystem client before switching the local target.
+- **Local first.** `snailmail setup` currently records deterministic local
+  repository configuration; hosting and key provisioning remain future work.
 
 ```
               apt      dnf      apk      aur      aur-bin  brew     nixpkgs

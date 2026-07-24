@@ -14,5 +14,8 @@ func commitReleaseLink(temporary, output, expectedLink string) (bool, error) {
 	if err := os.Link(temporary, output); err != nil {
 		return false, err
 	}
+	if err := os.Remove(temporary); err != nil {
+		return true, err
+	}
 	return true, nil
 }
