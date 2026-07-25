@@ -473,11 +473,17 @@ func authoritativePaths(root string) (map[string]bool, error) {
 	for _, repository := range manifest.Repositories {
 		paths[filepath.ToSlash(repository.Lock)] = true
 	}
+	for _, key := range manifest.Keys {
+		paths[filepath.ToSlash(key.PublicKeyPath)] = true
+		paths[filepath.ToSlash(key.PublicArmorPath)] = true
+	}
 	for _, pattern := range []string{
 		filepath.Join(root, "repos", "*.lock.toml"),
 		filepath.Join(root, "publications", "*.jsonl"),
 		filepath.Join(root, "deployments", "*.json"),
 		filepath.Join(root, "docs", "install-*.md"),
+		filepath.Join(root, "keys", "*.gpg"),
+		filepath.Join(root, "keys", "*.asc"),
 	} {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
@@ -495,7 +501,7 @@ func authoritativePaths(root string) (map[string]bool, error) {
 }
 
 func isAuthoritativePath(name string) bool {
-	return name == ManifestFilename || strings.HasPrefix(name, "repos/") || strings.HasPrefix(name, "publications/") || strings.HasPrefix(name, "deployments/") || strings.HasPrefix(name, "docs/install-")
+	return name == ManifestFilename || strings.HasPrefix(name, "repos/") || strings.HasPrefix(name, "publications/") || strings.HasPrefix(name, "deployments/") || strings.HasPrefix(name, "docs/install-") || strings.HasPrefix(name, "keys/")
 }
 
 func hasPlanTrailer(message, planID string) bool {

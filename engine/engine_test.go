@@ -80,6 +80,37 @@ func TestBuildPyPIIsByteDeterministic(t *testing.T) {
 	}
 }
 
+func TestVerifyAcceptsPhaseTwoRepositoryManifest(t *testing.T) {
+	input := t.TempDir()
+	if _, err := testutil.WriteWheel(input, "Demo-Pkg", "1.2.3", ""); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(t.TempDir(), "repository")
+	if _, err := BuildPyPI(context.Background(), BuildPyPIRequest{Input: input, Output: output}); err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Join(output, buildgraph.ManifestFilename)
+	content, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest buildgraph.RepositoryManifest
+	if err := json.Unmarshal(content, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.SchemaVersion = 1
+	content, err = json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(name, append(content, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InspectRepository(output); err != nil {
+		t.Fatalf("phase-two repository could not be observed after upgrade: %v", err)
+	}
+}
+
 func TestVerifyPyPIInstallsWithPip(t *testing.T) {
 	python, err := exec.LookPath("python3")
 	if err != nil {

@@ -44,20 +44,37 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
       - run: docker build --tag snailmail-ci:${GITHUB_SHA} .
+      - name: Prepare repository signing key
+        if: vars.SNAILMAIL_SIGNING_KEY_REF != ''
+        env:
+          SIGNING_KEY_REF: ${{ vars.SNAILMAIL_SIGNING_KEY_REF }}
+          SIGNING_PRIVATE_KEY: ${{ secrets.SNAILMAIL_SIGNING_PRIVATE_KEY }}
+        run: |
+          test -n "$SIGNING_PRIVATE_KEY"
+          case "$SIGNING_KEY_REF" in
+            *..*|/*|*\\*) exit 1 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/snailmail-private-keys/$(dirname "$SIGNING_KEY_REF")"
+          printf '%s' "$SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/snailmail-private-keys/$SIGNING_KEY_REF.asc"
+          chmod 600 "$RUNNER_TEMP/snailmail-private-keys/$SIGNING_KEY_REF.asc"
+          sudo chown -R 0:0 "$RUNNER_TEMP/snailmail-private-keys"
       - name: Plan
         run: >-
           docker run --rm
           -v "$PWD:/workspace"
+          -v "$RUNNER_TEMP/snailmail-private-keys:/root/.local/share/snailmail/private-keys"
           -w /workspace
           -e GH_TOKEN
           -e AWS_ACCESS_KEY_ID
           -e AWS_SECRET_ACCESS_KEY
           -e AWS_SESSION_TOKEN
           -e AWS_REGION
+          -e SNAILMAIL_KEY_PASSPHRASE
           snailmail-ci:${GITHUB_SHA}
           plan --out snailmail.snailmail-plan.json
         env:
           GH_TOKEN: ${{ secrets.SNAILMAIL_GITHUB_TOKEN || github.token }}
+          SNAILMAIL_KEY_PASSPHRASE: ${{ secrets.SNAILMAIL_KEY_PASSPHRASE }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: snailmail-plan-${{ github.sha }}

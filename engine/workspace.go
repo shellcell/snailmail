@@ -21,11 +21,14 @@ import (
 	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
+	"github.com/shellcell/snailmail/internal/domain"
+	"github.com/shellcell/snailmail/internal/knowledge"
 	"github.com/shellcell/snailmail/internal/state"
 	statusrenderer "github.com/shellcell/snailmail/internal/status"
+	"github.com/shellcell/snailmail/signer"
 )
 
-const phase1EngineVersion = "phase2-v1"
+const phase1EngineVersion = "phase3-v1"
 
 type InitWorkspaceRequest struct {
 	Root            string
@@ -41,6 +44,8 @@ type SetupRepositoryRequest struct {
 	HostType          string
 	Gate              string
 	ApprovalKeys      []string
+	SigningKey        string
+	AllowUnsigned     bool
 	Visibility        string
 	Bucket            string
 	Prefix            string
@@ -92,11 +97,12 @@ type PlanWorkspaceRequest struct {
 	Root             string
 	Output           string
 	GeneratedAt      time.Time
-	CreatedAt        time.Time
+	createdAt        time.Time
 	ExpiresIn        time.Duration
 	VerificationMode string
 	Hosts            host.Resolver
 	Blobs            blob.Resolver
+	Signers          signer.Resolver
 }
 
 type PlanWorkspaceResult struct {
@@ -187,7 +193,7 @@ func SetupRepository(request SetupRepositoryRequest) error {
 	return state.Setup(root, state.SetupOptions{
 		Name: request.Name, Format: request.Format, Output: request.Output,
 		HostType: request.HostType, Visibility: request.Visibility, Bucket: request.Bucket,
-		Gate: request.Gate, ApprovalKeys: append([]string(nil), request.ApprovalKeys...),
+		Gate: request.Gate, ApprovalKeys: append([]string(nil), request.ApprovalKeys...), SigningKeys: optionalSigningKeys(request.SigningKey), AllowUnsigned: request.AllowUnsigned,
 		Prefix: request.Prefix, Region: request.Region, Endpoint: request.Endpoint,
 		CanonicalEndpoint: request.CanonicalEndpoint, UsePathStyle: request.UsePathStyle,
 		ReadAuth: request.ReadAuth, CredentialBroker: request.CredentialBroker,
@@ -420,14 +426,16 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 	if err != nil {
 		return PlanWorkspaceResult{}, err
 	}
-	createdAt := request.CreatedAt
+	createdAt := request.createdAt
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
+	createdAt = createdAt.UTC().Truncate(time.Second)
 	generatedAt := request.GeneratedAt
 	if generatedAt.IsZero() {
 		generatedAt = createdAt
 	}
+	generatedAt = generatedAt.UTC().Truncate(time.Second)
 	expiresIn := request.ExpiresIn
 	if expiresIn == 0 {
 		expiresIn = 2 * time.Hour
@@ -438,7 +446,7 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 	payload := state.PlanPayload{
 		EngineVersion: phase1EngineVersion, GitRevision: gitRevision, ManifestSHA256: manifestDigest,
 		WorkspaceID: manifest.Workspace.ID, ForgeRepository: manifest.Workspace.ForgeRepository,
-		BlobStore: manifest.BlobStore, BlobStoreIdentitySHA256: blobStoreIdentity,
+		BlobStore: manifest.BlobStore, BlobStoreIdentitySHA256: blobStoreIdentity, KnowledgeSHA256: knowledge.SigningDigest(),
 		GeneratedAt: generatedAt.UTC().Format(time.RFC3339), CreatedAt: createdAt.UTC().Format(time.RFC3339),
 		ExpiresAt: createdAt.Add(expiresIn).UTC().Format(time.RFC3339),
 	}
@@ -482,9 +490,15 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
-		desired, err := buildLockedRepository(ctx, root, name, repository, lock, generatedAt, "", blobStore)
+		desired, err := buildLockedRepository(ctx, root, name, repository, lock, generatedAt, createdAt, "", blobStore, manifest.Keys, nil, request.Signers)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
+		}
+		if len(desired.Signing) != 0 {
+			keyExpiresAt, err := time.Parse(time.RFC3339, manifest.Keys[repository.SigningKeys[0]].ExpiresAt)
+			if err != nil || createdAt.Add(expiresIn).After(keyExpiresAt) {
+				return PlanWorkspaceResult{}, fmt.Errorf("repository %q plan expires after its signing key", name)
+			}
 		}
 		hostIdentity, err := repositoryHostIdentity(repository)
 		if err != nil {
@@ -527,6 +541,7 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 			ObservedRestoreID: observed.RestoreID, ObservedRestoreSHA256: observed.RestoreSHA256,
 			ObservedRestoreRootSHA256: observed.RestoreRootSHA256,
 			ObservedDeployment:        deployment,
+			Signing:                   desired.Signing,
 			FaithfulPreview:           capabilities.FaithfulPreview, ConditionalCommit: capabilities.ConditionalCommit,
 			ConditionalRestore:       capabilities.ConditionalRestore,
 			PrivateRead:              capabilities.PrivateRead,
@@ -622,6 +637,10 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	if err != nil {
 		return ApplyWorkspaceResult{}, err
 	}
+	signatureTime, err := time.Parse(time.RFC3339, plan.Payload.CreatedAt)
+	if err != nil {
+		return ApplyWorkspaceResult{}, err
+	}
 	type applyRepository struct {
 		planned        state.PlanRepository
 		repository     state.Repository
@@ -646,8 +665,24 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		}
 		seenRepositories[planned.Name] = true
 		repository, exists := manifest.Repositories[planned.Name]
-		if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) {
+		if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) || len(planned.Signing) != len(repository.SigningKeys) {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q configuration changed", planned.Name)
+		}
+		for index, signing := range planned.Signing {
+			if signing.KeyName != repository.SigningKeys[index] {
+				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q signing key changed", planned.Name)
+			}
+			key, exists := manifest.Keys[signing.KeyName]
+			if !exists {
+				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q signing key is missing", planned.Name)
+			}
+			keyExpiresAt, err := time.Parse(time.RFC3339, key.ExpiresAt)
+			if err != nil || expiresAt.After(keyExpiresAt) {
+				return ApplyWorkspaceResult{}, fmt.Errorf("repository %q plan expires after its signing key", planned.Name)
+			}
+			if err := validateSigningRecipeMetadata(signing, repository.Suite); err != nil {
+				return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q: %w", planned.Name, err)
+			}
 		}
 		hostIdentity, err := repositoryHostIdentity(repository)
 		if err != nil || hostIdentity != planned.HostIdentitySHA256 || repository.Host != planned.Host || repository.Visibility != planned.Visibility {
@@ -738,7 +773,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			planned: planned, repository: repository, lock: lock, host: selectedHost,
 			hostRepository: hostRepository, observed: observed, current: current,
 		}
-		if item.current && (request.StructuralOnly || planned.Action == "noop") {
+		if item.current && (request.StructuralOnly || planned.Action == "noop") && !(planned.Action != "noop" && len(planned.Signing) != 0) {
 			prepared = append(prepared, item)
 			continue
 		}
@@ -747,9 +782,12 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return ApplyWorkspaceResult{}, err
 		}
 		stageOutput := filepath.Join(stage, "repository")
-		staged, buildErr := buildLockedRepository(ctx, root, planned.Name, repository, lock, generatedAt, stageOutput, blobStore)
+		staged, buildErr := buildLockedRepository(ctx, root, planned.Name, repository, lock, generatedAt, signatureTime, stageOutput, blobStore, manifest.Keys, planned.Signing, nil)
 		if buildErr == nil && (staged.TreeSHA256 != planned.DesiredTreeSHA256 || staged.ManifestSHA256 != planned.DesiredManifestSHA256) {
 			buildErr = errors.New("stale plan: rebuilt tree digest changed")
+		}
+		if buildErr == nil && !signingContentsEqual(staged.Signing, planned.Signing) {
+			buildErr = errors.New("stale plan: signing recipe changed")
 		}
 		if buildErr == nil {
 			structuralRequest := request
@@ -1304,7 +1342,7 @@ func verifyCanonicalClient(ctx context.Context, root string, repository state.Re
 	return err
 }
 
-func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt time.Time, output string, blobStore blob.Store) (BuildResult, error) {
+func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt, signatureTime time.Time, output string, blobStore blob.Store, keys map[string]state.SigningKey, plannedSigning []state.PlanSigning, signers signer.Resolver) (BuildResult, error) {
 	input, err := os.MkdirTemp("", ".snailmail-locked-input-*")
 	if err != nil {
 		return BuildResult{}, err
@@ -1345,10 +1383,23 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	}
 	switch repository.Format {
 	case "pypi":
+		if len(plannedSigning) != 0 || len(repository.SigningKeys) != 0 {
+			return BuildResult{}, errors.New("PyPI repository cannot contain repository signing effects")
+		}
 		return BuildPyPI(ctx, BuildPyPIRequest{Input: input, Output: output, GeneratedAt: generatedAt})
 	case "deb":
-		return BuildDeb(ctx, BuildDebRequest{Input: input, Output: output, Suite: repository.Suite, Component: repository.Component, Architectures: repository.Architectures, GeneratedAt: generatedAt})
+		var resolved []state.PlanSigning
+		result, err := buildDeb(ctx, BuildDebRequest{Input: input, Output: output, Suite: repository.Suite, Component: repository.Component, Architectures: repository.Architectures, GeneratedAt: generatedAt}, func(artifact domain.RepositoryArtifact) (domain.RepositoryArtifact, error) {
+			signed, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers)
+			resolved = signing
+			return signed, err
+		})
+		result.Signing = resolved
+		return result, err
 	case "helm":
+		if len(plannedSigning) != 0 || len(repository.SigningKeys) != 0 {
+			return BuildResult{}, errors.New("Helm repository signing is not implemented")
+		}
 		return BuildHelm(ctx, BuildHelmRequest{Input: input, Output: output, GeneratedAt: generatedAt})
 	default:
 		return BuildResult{}, fmt.Errorf("unsupported repository format %q", repository.Format)
@@ -1456,6 +1507,13 @@ func nativePackageName(format, name string) string {
 	return name
 }
 
+func optionalSigningKeys(name string) []string {
+	if name == "" {
+		return nil
+	}
+	return []string{name}
+}
+
 type localHostResolver struct{}
 
 func (localHostResolver) Resolve(_ context.Context, repository host.Repository) (host.Host, error) {
@@ -1540,6 +1598,13 @@ func repositoryCommitPaths(repository state.Repository) []string {
 	case "helm":
 		return []string{"index.yaml"}
 	case "deb":
+		if len(repository.SigningKeys) != 0 {
+			return []string{
+				filepath.ToSlash(filepath.Join("dists", repository.Suite, "InRelease")),
+				filepath.ToSlash(filepath.Join("dists", repository.Suite, "Release")),
+				filepath.ToSlash(filepath.Join("dists", repository.Suite, "Release.gpg")),
+			}
+		}
 		return []string{filepath.ToSlash(filepath.Join("dists", repository.Suite, "Release"))}
 	default:
 		return nil
@@ -1549,6 +1614,9 @@ func repositoryCommitPaths(repository state.Repository) []string {
 func validateApplyPlan(plan state.Plan) error {
 	if !validSHA256(plan.Payload.ManifestSHA256) {
 		return errors.New("plan has an invalid manifest digest")
+	}
+	if plan.Payload.KnowledgeSHA256 != knowledge.SigningDigest() {
+		return errors.New("plan signing compatibility knowledge is incompatible")
 	}
 	if !validSHA256(plan.Payload.WorkspaceID) || !validSHA256(plan.Payload.BlobStoreIdentitySHA256) || state.ValidateBlobStore(plan.Payload.BlobStore) != nil {
 		return errors.New("plan has an invalid blob store binding")
@@ -1596,6 +1664,28 @@ func validateApplyPlan(plan state.Plan) error {
 			(repository.ObservedTreeSHA256 != "" && !validSHA256(repository.ObservedTreeSHA256)) {
 			return fmt.Errorf("plan repository %q has an invalid digest", repository.Name)
 		}
+		if len(repository.Signing) > 1 {
+			return fmt.Errorf("plan repository %q has unsupported dual signing", repository.Name)
+		}
+		for _, signing := range repository.Signing {
+			if repository.Format != "deb" || signing.KeyName == "" || signing.Algorithm != signer.AlgorithmOpenPGPRSA4096 || !validFingerprint(signing.Fingerprint) ||
+				!validSHA256(signing.PublicKeySHA256) || !validSHA256(signing.PublicArmorSHA256) || !validSHA256(signing.RecipeSHA256) || signing.PublicKeyPath == "" || signing.PublicArmorPath == "" || len(signing.Nodes) != 2 {
+				return fmt.Errorf("plan repository %q has invalid signing metadata", repository.Name)
+			}
+			if _, err := time.Parse(time.RFC3339, signing.SignatureTime); err != nil {
+				return fmt.Errorf("plan repository %q has invalid signature time", repository.Name)
+			}
+			if err := validateSigningRecipeMetadata(signing, ""); err != nil {
+				return fmt.Errorf("plan repository %q: %w", repository.Name, err)
+			}
+			ids := []string{"deb-inrelease", "deb-release-gpg"}
+			for index, scheme := range []string{signer.SchemeOpenPGPCleartext, signer.SchemeOpenPGPDetached} {
+				node := signing.Nodes[index]
+				if node.ID != ids[index] || node.Kind != "sign" || len(node.DependsOn) == 0 || node.Scheme != scheme || !validSHA256(node.PayloadSHA256) || !validSHA256(node.ContentSHA256) || node.OutputPath == "" || len(node.Content) == 0 || len(node.Content) > 8<<20 {
+					return fmt.Errorf("plan repository %q has invalid signing response", repository.Name)
+				}
+			}
+		}
 		if repository.Host.Type != "local" && repository.Host.Type != "s3" && repository.Host.Type != "github-pages" {
 			return fmt.Errorf("plan repository %q has unsupported host type %q", repository.Name, repository.Host.Type)
 		}
@@ -1641,6 +1731,11 @@ func validateApplyPlan(plan state.Plan) error {
 func validSHA256(value string) bool {
 	decoded, err := hex.DecodeString(value)
 	return err == nil && len(decoded) == 32 && value == strings.ToLower(value)
+}
+
+func validFingerprint(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 20 && value == strings.ToLower(value)
 }
 
 func resolveBlobStore(ctx context.Context, manifest state.Manifest, resolver blob.Resolver) (blob.Store, error) {

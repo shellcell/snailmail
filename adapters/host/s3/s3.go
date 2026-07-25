@@ -1101,7 +1101,7 @@ func publicationDigestBindings(publication publicationDescriptor) (string, strin
 }
 
 func validatePublishedManifest(content []byte, manifest buildgraph.RepositoryManifest, descriptor releaseDescriptor) error {
-	if manifest.SchemaVersion != buildgraph.ManifestSchema || manifest.Format != pypi.FormatID || manifest.TreeSHA256 != descriptor.TreeSHA256 {
+	if !buildgraph.SupportedManifestSchema(manifest.SchemaVersion) || manifest.Format != pypi.FormatID || manifest.TreeSHA256 != descriptor.TreeSHA256 {
 		return errors.New("manifest identity does not match release")
 	}
 	generatedAt, err := time.Parse(time.RFC3339, manifest.GeneratedAt)

@@ -17,8 +17,12 @@ import (
 
 const (
 	ManifestFilename = "snailmail.repository.json"
-	ManifestSchema   = 1
+	ManifestSchema   = 2
 )
+
+func SupportedManifestSchema(schema int) bool {
+	return schema == 1 || schema == ManifestSchema
+}
 
 type ManifestFile struct {
 	Path   string `json:"path"`
@@ -34,6 +38,7 @@ type RepositoryManifest struct {
 	Files             []ManifestFile            `json:"files"`
 	Install           domain.InstallSpec        `json:"install"`
 	VerificationCases []domain.VerificationCase `json:"verification_cases"`
+	Signatures        []domain.Signature        `json:"signatures,omitempty"`
 }
 
 // Finalize validates and hashes a format artifact, then adds the management
@@ -71,6 +76,7 @@ func Finalize(artifact domain.RepositoryArtifact, generatedAt time.Time) (domain
 		Files:             manifestFiles,
 		Install:           artifact.Install,
 		VerificationCases: append([]domain.VerificationCase(nil), artifact.VerificationCases...),
+		Signatures:        append([]domain.Signature(nil), artifact.Signatures...),
 	}
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

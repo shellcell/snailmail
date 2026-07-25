@@ -1178,6 +1178,15 @@ and apk first, followed by nix cache, cargo, go, and maven. Name mapping and
 dependency translation arrive only with formats that prove those abstractions
 are needed.
 
+The first Phase 3 slice is implemented: encrypted file-backed RSA4096 OpenPGP
+identities, committed binary and armored public forms, the versioned signing
+compatibility table, `keys new|publish|audit`, deterministic plan-resolved
+signature responses, and Debian `InRelease` plus `Release.gpg` verified through
+apt `signed-by`. The persisted key and signing-effect collections are
+rotation-ready, although overlap execution and `keys rotate` remain deferred.
+Additional backends, operational commands, and format expansion remain
+subsequent Phase 3 slices.
+
 **Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
 drift detection, then irreversible `target` operations for AUR, Homebrew,
 nixpkgs, ghcr, and npmjs/PyPI uploads. Every target uses explicit gates,

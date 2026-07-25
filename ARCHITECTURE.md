@@ -963,7 +963,15 @@ The phase numbers below use the canonical roadmap in `PLAN.md` §14:
    implemented slice includes all of these components for the current PyPI
    remote-host scope.
 4. **Phase 3:** add explicit signing and key operations, operational status and
-   adoption commands, the knowledge bundle, and additional Tier 1 formats.
+   adoption commands, the knowledge bundle, and additional Tier 1 formats. The
+   implemented first slice provides encrypted file-backed RSA4096 OpenPGP keys,
+   committed public forms, compatibility audit data, plan-resolved deterministic
+   signer responses, and signed Debian `InRelease`/`Release.gpg` assembly. Each
+   signing node records its ID, dependencies, scheme, payload digest, allowed
+   output path, response digest, and a content-addressed recipe digest. Signing
+   identity and plan state are list-shaped for future overlap rotation, while
+   the first backend currently permits one active key. Apply replays those
+   public responses and never resolves private key references.
 5. **Phase 4:** add read-only foreign observation before irreversible remote
    publication targets.
 6. **Phase 5:** add optional server, console, forge-app, attestation, and

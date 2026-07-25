@@ -12,6 +12,7 @@ import (
 	"github.com/shellcell/snailmail/formats/pypi"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/buildgraph"
+	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/state"
 )
 
@@ -34,6 +35,7 @@ type BuildResult struct {
 	ProjectCount      int
 	PackageCount      int
 	DistributionCount int
+	Signing           []state.PlanSigning
 }
 
 type BuildDebRequest struct {
@@ -136,6 +138,10 @@ func BuildPyPI(ctx context.Context, request BuildPyPIRequest) (BuildResult, erro
 }
 
 func BuildDeb(ctx context.Context, request BuildDebRequest) (BuildResult, error) {
+	return buildDeb(ctx, request, nil)
+}
+
+func buildDeb(ctx context.Context, request BuildDebRequest, transform func(domain.RepositoryArtifact) (domain.RepositoryArtifact, error)) (BuildResult, error) {
 	if request.Input == "" || request.Output == "" {
 		return BuildResult{}, fmt.Errorf("input and output directories are required")
 	}
@@ -167,6 +173,12 @@ func BuildDeb(ctx context.Context, request BuildDebRequest) (BuildResult, error)
 	})
 	if err != nil {
 		return BuildResult{}, err
+	}
+	if transform != nil {
+		artifact, err = transform(artifact)
+		if err != nil {
+			return BuildResult{}, err
+		}
 	}
 	artifact, manifest, err := buildgraph.Finalize(artifact, generatedAt)
 	if err != nil {

@@ -5,9 +5,16 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/snailmail ./cmd/snailmail
+RUN CGO_ENABLED=0 go test -c -o /out/openpgp.test ./signer/openpgp
+
+FROM debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS signing-test
+COPY --from=build /out/openpgp.test /usr/local/bin/openpgp.test
+RUN openpgp.test -test.run TestGenerateLoadAndDeterministicallySign
+RUN touch /signed-debian-passed
 
 FROM build AS test
-RUN apk add --no-cache git python3 py3-pip
+COPY --from=signing-test /signed-debian-passed /tmp/signed-debian-passed
+RUN apk add --no-cache git gnupg python3 py3-pip
 RUN go test ./...
 
 FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce

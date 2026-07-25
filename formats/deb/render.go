@@ -47,8 +47,8 @@ type releaseFile struct {
 	sha256 string
 }
 
-// Build renders a deterministic unsigned apt repository. Signing is a later
-// build-graph effect; Phase 0 verification uses apt's explicit trusted mode.
+// Build renders deterministic unsigned apt metadata. The workspace engine may
+// resolve and assemble repository-signing effects before finalization.
 func Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
 	if len(blobs) == 0 {
 		return domain.RepositoryArtifact{}, fmt.Errorf("at least one Debian package is required")

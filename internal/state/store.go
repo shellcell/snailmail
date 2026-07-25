@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/shellcell/snailmail/blob"
@@ -25,6 +26,7 @@ import (
 const ManifestFilename = "snailmail.toml"
 
 var identifierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+var fingerprintPattern = regexp.MustCompile(`^[a-f0-9]{40}$`)
 
 func ValidateRepositoryName(name string) error {
 	if !identifierPattern.MatchString(name) {
@@ -59,7 +61,7 @@ func Init(root string, options InitOptions) error {
 	}
 	manifest := Manifest{
 		SchemaVersion: ManifestSchema, Workspace: Workspace{Name: options.Name, ID: workspaceID, ForgeRepository: options.ForgeRepository},
-		BlobStore: BlobStoreConfig{Type: "local"}, Repositories: map[string]Repository{},
+		BlobStore: BlobStoreConfig{Type: "local"}, Keys: map[string]SigningKey{}, Repositories: map[string]Repository{},
 	}
 	if err := WriteManifest(root, manifest); err != nil {
 		return err
@@ -93,12 +95,15 @@ func Setup(root string, options SetupOptions) error {
 	if err != nil {
 		return err
 	}
+	if options.Format == "deb" && len(options.SigningKeys) == 0 && !options.AllowUnsigned {
+		return errors.New("new Debian repository requires a signing key or explicit unsigned opt-out")
+	}
 	if _, exists := manifest.Repositories[options.Name]; exists {
 		return fmt.Errorf("repository %q already exists", options.Name)
 	}
 	lockPath := filepath.ToSlash(filepath.Join("repos", options.Name+".lock.toml"))
 	repository := Repository{
-		Format: options.Format, Lock: lockPath, Gate: gatePolicy, ApprovalKeys: append([]string(nil), options.ApprovalKeys...), Visibility: visibility,
+		Format: options.Format, Lock: lockPath, Gate: gatePolicy, ApprovalKeys: append([]string(nil), options.ApprovalKeys...), SigningKeys: append([]string(nil), options.SigningKeys...), Visibility: visibility,
 		Host: HostConfig{
 			Type: hostType, Path: filepath.ToSlash(options.Output), Bucket: options.Bucket,
 			Prefix: options.Prefix, Region: options.Region, Endpoint: options.Endpoint,
@@ -120,6 +125,9 @@ func Setup(root string, options SetupOptions) error {
 		return err
 	}
 	if err := validateGateConfiguration(options.Name, repository, manifest.Workspace.ForgeRepository); err != nil {
+		return err
+	}
+	if err := validateRepositorySigning(options.Name, repository, manifest.Keys); err != nil {
 		return err
 	}
 	if options.Format == "deb" {
@@ -235,7 +243,7 @@ func LoadManifest(root string) (Manifest, error) {
 		if err := decoder.Decode(&manifest); err != nil {
 			return Manifest{}, fmt.Errorf("decode %q: %w", name, err)
 		}
-		if header.SchemaVersion == 2 || header.SchemaVersion == 3 {
+		if header.SchemaVersion == 2 || header.SchemaVersion == 3 || header.SchemaVersion == 4 {
 			manifest.SchemaVersion = ManifestSchema
 			if header.SchemaVersion == 2 {
 				manifest.Workspace.ID = legacyWorkspaceID(manifest.Workspace.Name)
@@ -255,6 +263,12 @@ func LoadManifest(root string) (Manifest, error) {
 	if manifest.Repositories == nil {
 		manifest.Repositories = make(map[string]Repository)
 	}
+	if manifest.Keys == nil {
+		manifest.Keys = make(map[string]SigningKey)
+	}
+	if err := validateSigningKeys(manifest); err != nil {
+		return Manifest{}, err
+	}
 	for name, repository := range manifest.Repositories {
 		if !identifierPattern.MatchString(name) {
 			return Manifest{}, fmt.Errorf("invalid repository name %q", name)
@@ -272,6 +286,9 @@ func LoadManifest(root string) (Manifest, error) {
 			return Manifest{}, fmt.Errorf("repository %q lock path: %w", name, err)
 		}
 		if err := validateRepositoryHost(name, repository); err != nil {
+			return Manifest{}, err
+		}
+		if err := validateRepositorySigning(name, repository, manifest.Keys); err != nil {
 			return Manifest{}, err
 		}
 	}
@@ -298,7 +315,7 @@ func migrateLegacyManifest(legacy legacyManifest) Manifest {
 	workspace := legacy.Workspace
 	workspace.ID = legacyWorkspaceID(workspace.Name)
 	manifest := Manifest{
-		SchemaVersion: ManifestSchema, Workspace: workspace, BlobStore: BlobStoreConfig{Type: "local"},
+		SchemaVersion: ManifestSchema, Workspace: workspace, BlobStore: BlobStoreConfig{Type: "local"}, Keys: map[string]SigningKey{},
 		Repositories: make(map[string]Repository, len(legacy.Repositories)),
 	}
 	for name, repository := range legacy.Repositories {
@@ -486,6 +503,105 @@ func ValidateGateConfiguration(policy string, approvalKeys []string, forgeReposi
 	return nil
 }
 
+func validateSigningKeys(manifest Manifest) error {
+	for name, key := range manifest.Keys {
+		if !identifierPattern.MatchString(name) || key.Algorithm != "openpgp-rsa4096" || key.Usage != "sign" || !fingerprintPattern.MatchString(key.Fingerprint) ||
+			!validSHA256(key.PublicKeySHA256) || !validSHA256(key.PublicArmorSHA256) || key.PublicKeyPath != filepath.ToSlash(filepath.Join("keys", name+".gpg")) ||
+			key.PublicArmorPath != filepath.ToSlash(filepath.Join("keys", name+".asc")) || key.Ref.Backend != "file" || key.Ref.ID != manifest.Workspace.ID+"/"+name {
+			return fmt.Errorf("signing key %q has invalid identity or public forms", name)
+		}
+		createdAt, createdErr := time.Parse(time.RFC3339, key.CreatedAt)
+		expiresAt, expiresErr := time.Parse(time.RFC3339, key.ExpiresAt)
+		if createdErr != nil || expiresErr != nil || !expiresAt.After(createdAt) {
+			return fmt.Errorf("signing key %q has invalid validity", name)
+		}
+	}
+	return nil
+}
+
+func validateRepositorySigning(name string, repository Repository, keys map[string]SigningKey) error {
+	if len(repository.SigningKeys) == 0 {
+		return nil
+	}
+	if repository.Format != "deb" {
+		return fmt.Errorf("repository %q: repository signing is currently implemented for Debian only", name)
+	}
+	if len(repository.SigningKeys) > 1 {
+		return fmt.Errorf("repository %q: dual-sign rotation is not implemented yet", name)
+	}
+	previous := ""
+	for _, signingKey := range repository.SigningKeys {
+		if _, exists := keys[signingKey]; !exists {
+			return fmt.Errorf("repository %q references unknown signing key %q", name, signingKey)
+		}
+		if signingKey <= previous {
+			return fmt.Errorf("repository %q signing keys must be unique and sorted", name)
+		}
+		previous = signingKey
+	}
+	return nil
+}
+
+func LoadSigningPublic(root string, key SigningKey) ([]byte, []byte, error) {
+	binary, err := loadSigningPublicFile(root, key.PublicKeyPath, key.PublicKeySHA256)
+	if err != nil {
+		return nil, nil, err
+	}
+	armored, err := loadSigningPublicFile(root, key.PublicArmorPath, key.PublicArmorSHA256)
+	if err != nil {
+		return nil, nil, err
+	}
+	return binary, armored, nil
+}
+
+func WriteSigningPublic(root string, key SigningKey, binary, armored []byte) error {
+	for _, file := range []struct {
+		path, digest string
+		content      []byte
+	}{{key.PublicKeyPath, key.PublicKeySHA256, binary}, {key.PublicArmorPath, key.PublicArmorSHA256, armored}} {
+		digest := sha256.Sum256(file.content)
+		if hex.EncodeToString(digest[:]) != file.digest {
+			return errors.New("public signing key bytes do not match configured digest")
+		}
+		name, err := WorkspacePath(root, file.path)
+		if err != nil {
+			return err
+		}
+		if existing, err := os.ReadFile(name); err == nil {
+			if !bytes.Equal(existing, file.content) {
+				return fmt.Errorf("refusing to overwrite public signing key %q", file.path)
+			}
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := atomicWrite(name, file.content, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func loadSigningPublicFile(root, relative, expectedSHA256 string) ([]byte, error) {
+	name, err := WorkspacePath(root, relative)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > 1<<20 {
+		return nil, fmt.Errorf("public signing key %q is not a bounded regular file", relative)
+	}
+	content, err := os.ReadFile(name)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256(content)
+	if hex.EncodeToString(digest[:]) != expectedSHA256 {
+		return nil, fmt.Errorf("public signing key %q differs from its manifest digest", relative)
+	}
+	return content, nil
+}
+
 func WriteManifest(root string, manifest Manifest) error {
 	manifest.SchemaVersion = ManifestSchema
 	if manifest.Workspace.ID == "" {
@@ -503,6 +619,12 @@ func WriteManifest(root string, manifest Manifest) error {
 	if err := ValidateBlobStore(manifest.BlobStore); err != nil {
 		return err
 	}
+	if manifest.Keys == nil {
+		manifest.Keys = make(map[string]SigningKey)
+	}
+	if err := validateSigningKeys(manifest); err != nil {
+		return err
+	}
 	for name, repository := range manifest.Repositories {
 		if !identifierPattern.MatchString(name) || !validGate(repository.Gate) {
 			return fmt.Errorf("repository %q has invalid name or gate", name)
@@ -511,6 +633,9 @@ func WriteManifest(root string, manifest Manifest) error {
 			return err
 		}
 		if err := validateGateConfiguration(name, repository, manifest.Workspace.ForgeRepository); err != nil {
+			return err
+		}
+		if err := validateRepositorySigning(name, repository, manifest.Keys); err != nil {
 			return err
 		}
 	}

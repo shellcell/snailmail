@@ -16,12 +16,14 @@ import (
 	"testing"
 	"time"
 
+	filesigner "github.com/shellcell/snailmail/adapters/signer/file"
 	"github.com/shellcell/snailmail/blob"
 	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/internal/testutil"
+	"github.com/shellcell/snailmail/signer"
 )
 
 func TestWorkspacePlanApplyAllFormats(t *testing.T) {
@@ -41,7 +43,7 @@ func TestWorkspacePlanApplyAllFormats(t *testing.T) {
 			createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 			planName := filepath.Join(root, "reviewed.json")
 			planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-				Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
+				Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -89,6 +91,216 @@ func TestWorkspacePlanApplyAllFormats(t *testing.T) {
 	}
 }
 
+func TestSignedDebianPlanEmbedsResponsesAndApplyNeedsNoSigner(t *testing.T) {
+	root := t.TempDir()
+	command := exec.Command("git", "init", "-b", "main")
+	command.Dir = root
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := InitWorkspace(InitWorkspaceRequest{Root: root, Name: "signed-debian"}); err != nil {
+		t.Fatal(err)
+	}
+	passphrase := []byte("phase-three-test-passphrase")
+	privateRoot := t.TempDir()
+	store, err := filesigner.New(privateRoot, func() ([]byte, error) { return append([]byte(nil), passphrase...), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
+	initialManifest, err := state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Generate(context.Background(), signer.Ref{Backend: "file", ID: initialManifest.Workspace.ID + "/archive"}, "archive", createdAt, 365*24*time.Hour); err != nil {
+		t.Fatalf("create interrupted key fixture: %v", err)
+	}
+	key, err := NewKey(context.Background(), NewKeyRequest{
+		Root: root, Name: "archive", Algorithm: "openpgp-rsa4096", CreatedAt: createdAt, ExpiresIn: 365 * 24 * time.Hour, Keys: store,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateInfo, err := os.Stat(filepath.Join(privateRoot, filepath.FromSlash(manifest.Keys["archive"].Ref.ID+".asc")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if privateInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("private key mode=%v", privateInfo.Mode().Perm())
+	}
+	privateName := filepath.Join(privateRoot, filepath.FromSlash(manifest.Keys["archive"].Ref.ID+".asc"))
+	if err := os.Chmod(privateName, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Public(context.Background(), signer.Ref{Backend: "file", ID: manifest.Keys["archive"].Ref.ID}); err == nil {
+		t.Fatal("file signer accepted group/world-readable private key")
+	}
+	if err := os.Chmod(privateName, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, filepath.FromSlash(manifest.Keys["archive"].PublicArmorPath))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishKey(context.Background(), PublishKeyRequest{Root: root, Name: "archive", Keys: store}); err != nil {
+		t.Fatalf("republish public key: %v", err)
+	}
+	if err := SetupRepository(SetupRepositoryRequest{
+		Root: root, Name: "debian", Format: "deb", HostType: "local", Output: "public/debian", Visibility: "public",
+		SigningKey: "archive", Suite: "stable", Component: "main", Architectures: []string{"amd64"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if audit, err := AuditKeys(PublishKeyRequest{Root: root}, createdAt.Add(time.Hour)); err != nil || len(audit.Findings) != 0 {
+		t.Fatalf("key audit=%#v err=%v", audit, err)
+	}
+	artifact := workspaceArtifact(t, root, "deb", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "debian", Artifacts: []string{artifact}}); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "configure signed Debian repository")
+	planName := filepath.Join(root, "signed.json")
+	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: planName, createdAt: createdAt.Add(time.Hour), GeneratedAt: createdAt.Add(time.Hour),
+		ExpiresIn: time.Hour, VerificationMode: "structural", Signers: store,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := state.LoadPlan(planName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Payload.Repositories[0].Signing) != 1 {
+		t.Fatalf("plan signing effects = %#v", plan.Payload.Repositories[0].Signing)
+	}
+	signing := plan.Payload.Repositories[0].Signing[0]
+	if signing.Fingerprint != key.Fingerprint || len(signing.Nodes) != 2 || signing.RecipeSHA256 == "" {
+		t.Fatalf("plan signing nodes = %#v", signing)
+	}
+	planBytes, err := os.ReadFile(planName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(planBytes, passphrase) || bytes.Contains(planBytes, []byte(plan.Payload.WorkspaceID+"/archive")) {
+		t.Fatal("plan contains private signing configuration")
+	}
+	extendedPayload := plan.Payload
+	keyExpiresAt, err := time.Parse(time.RFC3339, key.ExpiresAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extendedPayload.ExpiresAt = keyExpiresAt.Add(time.Hour).Format(time.RFC3339)
+	extended, err := state.FinalizePlan(extendedPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extendedName := filepath.Join(root, "extended-expiry.json")
+	if err := state.WritePlan(extendedName, extended); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: extendedName, now: createdAt.Add(90 * time.Minute), StructuralOnly: true}); err == nil || !strings.Contains(err.Error(), "expires after its signing key") {
+		t.Fatalf("apply accepted plan extending beyond signing key: %v", err)
+	}
+	tamperedPayload := plan.Payload
+	tamperedPayload.Repositories = append([]state.PlanRepository(nil), plan.Payload.Repositories...)
+	tamperedSigning := signing
+	tamperedSigning.Nodes = append([]state.SigningNode(nil), signing.Nodes...)
+	tamperedSigning.Nodes[0].Content = append([]byte(nil), signing.Nodes[0].Content...)
+	tamperedSigning.Nodes[0].Content[len(tamperedSigning.Nodes[0].Content)-1] ^= 1
+	tamperedDigest := sha256.Sum256(tamperedSigning.Nodes[0].Content)
+	tamperedSigning.Nodes[0].ContentSHA256 = hex.EncodeToString(tamperedDigest[:])
+	tamperedSigning.RecipeSHA256 = signingRecipeDigest(tamperedSigning)
+	tamperedPayload.Repositories[0].Signing = []state.PlanSigning{tamperedSigning}
+	tampered, err := state.FinalizePlan(tamperedPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperedName := filepath.Join(root, "tampered-signature.json")
+	if err := state.WritePlan(tamperedName, tampered); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: tamperedName, now: createdAt.Add(90 * time.Minute), StructuralOnly: true}); err == nil {
+		t.Fatal("apply accepted rehashed plan with invalid signature bytes")
+	}
+	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, now: createdAt.Add(90 * time.Minute), StructuralOnly: true,
+	})
+	if err != nil || result.Applied != 1 || result.PlanID != planned.PlanID {
+		t.Fatalf("signed apply result=%#v err=%v", result, err)
+	}
+	malformedPayload := plan.Payload
+	malformedPayload.Repositories = append([]state.PlanRepository(nil), plan.Payload.Repositories...)
+	malformedSigning := signing
+	malformedSigning.Nodes = append([]state.SigningNode(nil), signing.Nodes...)
+	malformedSigning.Nodes[0].DependsOn = []string{"unreviewed-input"}
+	malformedSigning.RecipeSHA256 = signingRecipeDigest(malformedSigning)
+	malformedPayload.Repositories[0].Signing = []state.PlanSigning{malformedSigning}
+	malformed, err := state.FinalizePlan(malformedPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	malformedName := filepath.Join(root, "malformed-recipe.json")
+	if err := state.WritePlan(malformedName, malformed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: malformedName, now: createdAt.Add(90 * time.Minute), StructuralOnly: true}); err == nil || !strings.Contains(err.Error(), "dependencies") {
+		t.Fatalf("current signed target accepted malformed recipe: %v", err)
+	}
+	release := filepath.Join(root, "public", "debian")
+	repositoryManifest, err := app.VerifyRepository(release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repositoryManifest.Install.SigningFingerprint != key.Fingerprint || len(repositoryManifest.Signatures) != 2 {
+		t.Fatalf("signed repository manifest = %#v", repositoryManifest)
+	}
+	for _, name := range []string{"InRelease", "Release.gpg"} {
+		if _, err := os.Lstat(filepath.Join(release, "dists", "stable", name)); err != nil {
+			t.Fatalf("missing %s: %v", name, err)
+		}
+	}
+	if runner, err := exec.LookPath("podman"); err == nil && exec.Command(runner, "image", "exists", DefaultDebianVerificationImage).Run() == nil {
+		verified, err := VerifyDeb(context.Background(), VerifyDebRequest{Repository: release, Runner: runner, Image: DefaultDebianVerificationImage, MaxWorkspaceBytes: 4 << 30})
+		if err != nil || verified.InstalledCases == 0 {
+			t.Fatalf("apt signed-by verification=%#v err=%v", verified, err)
+		}
+	}
+	defaultPlan := filepath.Join(root, "default-time.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: defaultPlan, ExpiresIn: time.Hour, Signers: store}); err != nil {
+		t.Fatalf("default wall-clock signed plan: %v", err)
+	}
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: filepath.Join(root, "past-key-expiry.json"), ExpiresIn: 2 * 365 * 24 * time.Hour, Signers: store}); err == nil {
+		t.Fatal("plan lifetime exceeded signing key validity")
+	}
+}
+
+func TestNewDebianRepositoryRequiresSigningOrExplicitOptOut(t *testing.T) {
+	root := t.TempDir()
+	command := exec.Command("git", "init", "-b", "main")
+	command.Dir = root
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := InitWorkspace(InitWorkspaceRequest{Root: root, Name: "debian-policy"}); err != nil {
+		t.Fatal(err)
+	}
+	request := SetupRepositoryRequest{
+		Root: root, Name: "debian", Format: "deb", HostType: "local", Output: "public/debian",
+		Suite: "stable", Component: "main", Architectures: []string{"amd64"},
+	}
+	if err := SetupRepository(request); err == nil {
+		t.Fatal("new unsigned Debian repository was accepted without explicit opt-out")
+	}
+	request.AllowUnsigned = true
+	if err := SetupRepository(request); err != nil {
+		t.Fatalf("explicit unsigned Debian repository: %v", err)
+	}
+}
+
 func TestWorkspacePlanApplyRemoteHost(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", "phase2-test-access-key")
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "phase2-test-secret-key")
@@ -116,7 +328,7 @@ func TestWorkspacePlanApplyRemoteHost(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "remote.json")
 	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt,
+		Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt,
 		ExpiresIn: time.Hour, Hosts: resolver,
 	})
 	if err != nil {
@@ -178,7 +390,7 @@ func TestWorkspacePlanApplyRemoteHost(t *testing.T) {
 	remote.revision.ManifestSHA256 = plan.Payload.Repositories[0].DesiredManifestSHA256
 	secondPlanName := filepath.Join(root, "remote-second.json")
 	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: secondPlanName, CreatedAt: createdAt.Add(10 * time.Minute), GeneratedAt: createdAt.Add(10 * time.Minute),
+		Root: root, Output: secondPlanName, createdAt: createdAt.Add(10 * time.Minute), GeneratedAt: createdAt.Add(10 * time.Minute),
 		ExpiresIn: time.Hour, Hosts: resolver,
 	}); err != nil {
 		t.Fatal(err)
@@ -225,7 +437,7 @@ func TestWorkspacePlanApplyGitHubPagesHost(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "pages.json")
 	planResult, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour, Hosts: resolver,
+		Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour, Hosts: resolver,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -238,7 +450,7 @@ func TestWorkspacePlanApplyGitHubPagesHost(t *testing.T) {
 	}
 	secondPlanName := filepath.Join(root, "pages-second.json")
 	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: secondPlanName, CreatedAt: createdAt.Add(10 * time.Minute), GeneratedAt: createdAt.Add(10 * time.Minute), ExpiresIn: time.Hour, Hosts: resolver,
+		Root: root, Output: secondPlanName, createdAt: createdAt.Add(10 * time.Minute), GeneratedAt: createdAt.Add(10 * time.Minute), ExpiresIn: time.Hour, Hosts: resolver,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +479,7 @@ func TestAutoGateRechecksExpiryBeforePublicationEffects(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "expiring.json")
 	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Minute,
+		Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Minute,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +524,7 @@ func TestApprovalGateBlocksBeforeStageAndAcceptsBoundEvidence(t *testing.T) {
 	commitWorkspace(t, root, "request approval")
 	now := time.Now().UTC().Truncate(time.Second)
 	planName := filepath.Join(root, "approval.json")
-	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: now, GeneratedAt: now, ExpiresIn: time.Hour}); err != nil {
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, createdAt: now, GeneratedAt: now, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, now: now.Add(time.Minute), StructuralOnly: true}); err == nil || !strings.Contains(err.Error(), "requires approval gate evidence") {
@@ -353,7 +565,7 @@ func TestRenderStatusWritesDeterministicManagedSite(t *testing.T) {
 	commitWorkspace(t, root, "publish status fixture")
 	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "render-plan.json")
-	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: now, GeneratedAt: now, ExpiresIn: time.Hour}); err != nil {
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, createdAt: now, GeneratedAt: now, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, now: now.Add(time.Minute), StructuralOnly: true}); err != nil {
@@ -389,7 +601,7 @@ func TestMissingDeploymentReceiptForcesRecoverableReconciliation(t *testing.T) {
 	commitWorkspace(t, root, "publish recovery fixture")
 	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
 	firstPlan := filepath.Join(root, "first-recovery.json")
-	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: firstPlan, CreatedAt: now, GeneratedAt: now, ExpiresIn: time.Hour}); err != nil {
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: firstPlan, createdAt: now, GeneratedAt: now, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: firstPlan, now: now.Add(time.Minute), StructuralOnly: true}); err != nil {
@@ -407,7 +619,7 @@ func TestMissingDeploymentReceiptForcesRecoverableReconciliation(t *testing.T) {
 		t.Fatalf("commit missing receipt: %v: %s", err, output)
 	}
 	secondPlan := filepath.Join(root, "second-recovery.json")
-	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: secondPlan, CreatedAt: now.Add(2 * time.Hour), GeneratedAt: now.Add(2 * time.Hour), ExpiresIn: time.Hour}); err != nil {
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: secondPlan, createdAt: now.Add(2 * time.Hour), GeneratedAt: now.Add(2 * time.Hour), ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	planned, err := state.LoadPlan(secondPlan)
@@ -494,7 +706,7 @@ func TestWorkspaceFetchesMissingBlobFromSharedStore(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "shared.json")
 	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour, Blobs: resolver,
+		Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour, Blobs: resolver,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +759,7 @@ func TestApplyRejectsLockChangedAfterPlan(t *testing.T) {
 	commitWorkspace(t, root, "add first chart")
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "reviewed.json")
-	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	second := workspaceArtifact(t, root, "helm", "2.0.0")
@@ -633,7 +845,7 @@ func TestPublishedChartCannotChangeBytes(t *testing.T) {
 	commitWorkspace(t, root, "add chart")
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "reviewed.json")
-	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true}); err != nil {
@@ -724,7 +936,7 @@ func TestWorkspaceSupportsNestedGitDirectory(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "reviewed.json")
 	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
+		Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -790,7 +1002,7 @@ func TestWorkspaceUsesConfiguredGitIndex(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "reviewed.json")
 	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
+		Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -814,7 +1026,7 @@ func TestNoopPlanDoesNotWritePublicationLedger(t *testing.T) {
 	commitWorkspace(t, root, "add wheel")
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	firstPlan := filepath.Join(root, "first.json")
-	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: firstPlan, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: firstPlan, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: firstPlan, now: createdAt.Add(time.Minute), StructuralOnly: true}); err != nil {
@@ -831,7 +1043,7 @@ func TestNoopPlanDoesNotWritePublicationLedger(t *testing.T) {
 	}
 	secondPlan := filepath.Join(root, "second.json")
 	secondCreatedAt := createdAt.Add(5 * time.Minute)
-	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: secondPlan, CreatedAt: secondCreatedAt, GeneratedAt: createdAt, ExpiresIn: time.Hour})
+	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: secondPlan, createdAt: secondCreatedAt, GeneratedAt: createdAt, ExpiresIn: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -889,7 +1101,7 @@ func TestApplyRejectsForgedLedgerRetryCommit(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "reviewed.json")
 	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
+		Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -959,7 +1171,7 @@ func TestLedgerCommitRejectsChangedIndex(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "reviewed.json")
 	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
+		Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1018,7 +1230,7 @@ func TestApplyResumesAfterLedgerCommitBeforePublication(t *testing.T) {
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "reviewed.json")
 	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
-		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
+		Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1084,7 +1296,7 @@ func TestApplyRecoversReceiptForExactRemoteEffectWithoutRestaging(t *testing.T) 
 	resolver := staticHostResolver{host: remote}
 	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "receipt-retry.json")
-	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: now, GeneratedAt: now, ExpiresIn: time.Hour, Hosts: resolver})
+	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, createdAt: now, GeneratedAt: now, ExpiresIn: time.Hour, Hosts: resolver})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1127,7 +1339,7 @@ func TestLedgerCommitStagesAssumeUnchangedLedger(t *testing.T) {
 	commitWorkspace(t, root, "add first wheel")
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	firstPlan := filepath.Join(root, "first.json")
-	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: firstPlan, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: firstPlan, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: firstPlan, now: createdAt.Add(time.Minute), StructuralOnly: true}); err != nil {
@@ -1140,7 +1352,7 @@ func TestLedgerCommitStagesAssumeUnchangedLedger(t *testing.T) {
 	commitWorkspace(t, root, "add second wheel")
 	secondCreatedAt := createdAt.Add(5 * time.Minute)
 	secondPlan := filepath.Join(root, "second.json")
-	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: secondPlan, CreatedAt: secondCreatedAt, GeneratedAt: secondCreatedAt, ExpiresIn: time.Hour}); err != nil {
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: secondPlan, createdAt: secondCreatedAt, GeneratedAt: secondCreatedAt, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if output, err := exec.Command("git", "-C", root, "update-index", "--assume-unchanged", "publications/pypi.jsonl").CombinedOutput(); err != nil {
@@ -1168,7 +1380,7 @@ func TestLedgerCommitRestoresIndexWhenRefTransactionFails(t *testing.T) {
 	commitWorkspace(t, root, "add chart")
 	createdAt := time.Date(2026, time.July, 23, 1, 2, 3, 0, time.UTC)
 	planName := filepath.Join(root, "reviewed.json")
-	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour})
+	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, createdAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1279,7 +1491,7 @@ func initializeRepository(t *testing.T, root, format string) {
 	}
 	request := SetupRepositoryRequest{Root: root, Name: format, Format: format, Output: filepath.ToSlash(filepath.Join("public", format))}
 	if format == "deb" {
-		request.Suite, request.Component, request.Architectures = "stable", "main", []string{"amd64"}
+		request.Suite, request.Component, request.Architectures, request.AllowUnsigned = "stable", "main", []string{"amd64"}, true
 	}
 	if err := SetupRepository(request); err != nil {
 		t.Fatal(err)
@@ -1291,6 +1503,9 @@ func commitWorkspace(t *testing.T, root, message string) {
 	paths := []string{".gitignore", "snailmail.toml", "repos"}
 	if info, err := os.Lstat(filepath.Join(root, "docs")); err == nil && info.IsDir() {
 		paths = append(paths, "docs")
+	}
+	if info, err := os.Lstat(filepath.Join(root, "keys")); err == nil && info.IsDir() {
+		paths = append(paths, "keys")
 	}
 	arguments := append([]string{"-C", root, "add", "--"}, paths...)
 	if output, err := exec.Command("git", arguments...).CombinedOutput(); err != nil {

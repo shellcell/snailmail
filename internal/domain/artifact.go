@@ -45,11 +45,22 @@ type VerificationCase struct {
 // InstallSpec captures ecosystem operations independently of a deployment
 // endpoint. Phase 0 only needs the PyPI simple-index path.
 type InstallSpec struct {
-	Kind          string   `json:"kind"`
-	IndexPath     string   `json:"index_path,omitempty"`
-	Suite         string   `json:"suite,omitempty"`
-	Component     string   `json:"component,omitempty"`
-	Architectures []string `json:"architectures,omitempty"`
+	Kind               string   `json:"kind"`
+	IndexPath          string   `json:"index_path,omitempty"`
+	Suite              string   `json:"suite,omitempty"`
+	Component          string   `json:"component,omitempty"`
+	Architectures      []string `json:"architectures,omitempty"`
+	SigningKeyPath     string   `json:"signing_key_path,omitempty"`
+	SigningFingerprint string   `json:"signing_fingerprint,omitempty"`
+}
+
+type Signature struct {
+	Path          string `json:"path"`
+	Scheme        string `json:"scheme"`
+	Fingerprint   string `json:"fingerprint"`
+	PayloadSHA256 string `json:"payload_sha256"`
+	SHA256        string `json:"sha256"`
+	CreatedAt     string `json:"created_at"`
 }
 
 // RepositoryArtifact is deterministic format output before it is written to a
@@ -59,4 +70,5 @@ type RepositoryArtifact struct {
 	Files             []File
 	Install           InstallSpec
 	VerificationCases []VerificationCase
+	Signatures        []Signature
 }

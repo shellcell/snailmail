@@ -3,9 +3,9 @@ package state
 import "time"
 
 const (
-	ManifestSchema   = 4
+	ManifestSchema   = 5
 	LockSchema       = 1
-	PlanSchema       = 6
+	PlanSchema       = 7
 	LedgerSchema     = 1
 	DeploymentSchema = 1
 )
@@ -14,6 +14,7 @@ type Manifest struct {
 	SchemaVersion int                   `toml:"schema_version"`
 	Workspace     Workspace             `toml:"workspace"`
 	BlobStore     BlobStoreConfig       `toml:"blob_store"`
+	Keys          map[string]SigningKey `toml:"key,omitempty"`
 	Repositories  map[string]Repository `toml:"repo"`
 }
 
@@ -39,9 +40,28 @@ type Repository struct {
 	Visibility    string     `toml:"visibility"`
 	Gate          string     `toml:"gate"`
 	ApprovalKeys  []string   `toml:"approval_keys,omitempty"`
+	SigningKeys   []string   `toml:"signing_keys,omitempty"`
 	Suite         string     `toml:"suite,omitempty"`
 	Component     string     `toml:"component,omitempty"`
 	Architectures []string   `toml:"architectures,omitempty"`
+}
+
+type SigningKey struct {
+	Algorithm         string `toml:"algorithm"`
+	Usage             string `toml:"usage"`
+	Fingerprint       string `toml:"fingerprint"`
+	CreatedAt         string `toml:"created_at"`
+	ExpiresAt         string `toml:"expires_at"`
+	PublicKeyPath     string `toml:"public_key"`
+	PublicKeySHA256   string `toml:"public_key_sha256"`
+	PublicArmorPath   string `toml:"public_armor"`
+	PublicArmorSHA256 string `toml:"public_armor_sha256"`
+	Ref               KeyRef `toml:"ref"`
+}
+
+type KeyRef struct {
+	Backend string `toml:"backend"`
+	ID      string `toml:"id"`
 }
 
 type HostConfig struct {
@@ -133,6 +153,7 @@ type PlanPayload struct {
 	VerificationMode        string           `json:"verification_mode"`
 	BlobStore               BlobStoreConfig  `json:"blob_store"`
 	BlobStoreIdentitySHA256 string           `json:"blob_store_identity_sha256"`
+	KnowledgeSHA256         string           `json:"knowledge_sha256"`
 	Repositories            []PlanRepository `json:"repositories"`
 }
 
@@ -161,11 +182,36 @@ type PlanRepository struct {
 	ConditionalRestore        bool             `json:"conditional_restore"`
 	PrivateRead               bool             `json:"private_read"`
 	CredentialBrokerIdentity  string           `json:"credential_broker_identity,omitempty"`
+	Signing                   []PlanSigning    `json:"signing,omitempty"`
 	ObservedTreeSHA256        string           `json:"observed_tree_sha256,omitempty"`
 	DesiredTreeSHA256         string           `json:"desired_tree_sha256"`
 	DesiredManifestSHA256     string           `json:"desired_manifest_sha256,omitempty"`
 	ChangeID                  string           `json:"change_id"`
 	Action                    string           `json:"action"`
+}
+
+type PlanSigning struct {
+	KeyName           string        `json:"key_name"`
+	Algorithm         string        `json:"algorithm"`
+	Fingerprint       string        `json:"fingerprint"`
+	PublicKeyPath     string        `json:"public_key_path"`
+	PublicKeySHA256   string        `json:"public_key_sha256"`
+	PublicArmorPath   string        `json:"public_armor_path"`
+	PublicArmorSHA256 string        `json:"public_armor_sha256"`
+	SignatureTime     string        `json:"signature_time"`
+	RecipeSHA256      string        `json:"recipe_sha256"`
+	Nodes             []SigningNode `json:"nodes"`
+}
+
+type SigningNode struct {
+	ID            string   `json:"id"`
+	Kind          string   `json:"kind"`
+	DependsOn     []string `json:"depends_on"`
+	Scheme        string   `json:"scheme"`
+	PayloadSHA256 string   `json:"payload_sha256"`
+	OutputPath    string   `json:"output_path"`
+	ContentSHA256 string   `json:"content_sha256"`
+	Content       []byte   `json:"content"`
 }
 
 type InitOptions struct {
@@ -189,6 +235,8 @@ type SetupOptions struct {
 	HostType          string
 	Gate              string
 	ApprovalKeys      []string
+	SigningKeys       []string
+	AllowUnsigned     bool
 	Visibility        string
 	Bucket            string
 	Prefix            string

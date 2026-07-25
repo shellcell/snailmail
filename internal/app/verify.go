@@ -79,7 +79,7 @@ func verifyRepository(root string) (buildgraph.RepositoryManifest, []domain.Blob
 	if err := requireJSONEOF(decoder); err != nil {
 		return buildgraph.RepositoryManifest{}, nil, err
 	}
-	if manifest.SchemaVersion != buildgraph.ManifestSchema {
+	if !buildgraph.SupportedManifestSchema(manifest.SchemaVersion) {
 		return buildgraph.RepositoryManifest{}, nil, fmt.Errorf("unsupported repository schema %d", manifest.SchemaVersion)
 	}
 	if manifest.Format == "" {
@@ -515,6 +515,7 @@ func verifyDebCase(ctx context.Context, runner, image, snapshot string, workspac
 		"--env", "SNAILMAIL_ARCHITECTURE=" + verification.Architecture,
 		"--env", "SNAILMAIL_PACKAGE=" + verification.Package,
 		"--env", "SNAILMAIL_VERSION=" + verification.Version,
+		"--env", "SNAILMAIL_SIGNING_KEY=" + manifest.Install.SigningKeyPath,
 		"--tmpfs", "/tmp:rw,size=64m,mode=1777",
 		"--tmpfs", "/target:rw,size=" + strconv.FormatInt(workspaceBytes, 10) + ",mode=0755",
 		image,
@@ -527,7 +528,11 @@ chmod 1777 /target/tmp
 : >/target/dev/null
 rm -rf /target/etc/apt/sources.list.d/* /target/etc/apt/sources.list
 mkdir -p /target/var/lib/apt/lists/partial /target/var/cache/apt/archives/partial
-printf 'deb [trusted=yes arch=%s] file:/repo %s %s\n' "$SNAILMAIL_ARCHITECTURE" "$SNAILMAIL_SUITE" "$SNAILMAIL_COMPONENT" >/target/etc/apt/sources.list
+if test -n "$SNAILMAIL_SIGNING_KEY"; then
+    printf 'deb [signed-by=/repo/%s arch=%s] file:/repo %s %s\n' "$SNAILMAIL_SIGNING_KEY" "$SNAILMAIL_ARCHITECTURE" "$SNAILMAIL_SUITE" "$SNAILMAIL_COMPONENT" >/target/etc/apt/sources.list
+else
+    printf 'deb [trusted=yes arch=%s] file:/repo %s %s\n' "$SNAILMAIL_ARCHITECTURE" "$SNAILMAIL_SUITE" "$SNAILMAIL_COMPONENT" >/target/etc/apt/sources.list
+fi
 chroot /target apt-get -o APT::Sandbox::User=root -o Acquire::Languages=none update
 chroot /target apt-get -o APT::Sandbox::User=root install -y --reinstall --no-install-recommends "$SNAILMAIL_PACKAGE=$SNAILMAIL_VERSION"
 status=$(chroot /target dpkg-query -W -f='${Status} ${Version}' "$SNAILMAIL_PACKAGE")
@@ -854,6 +859,7 @@ func verifyPyPIStructure(root string, manifest buildgraph.RepositoryManifest) ([
 	if err != nil {
 		return nil, fmt.Errorf("finalize expected PyPI structure: %w", err)
 	}
+	expectedManifest.SchemaVersion = manifest.SchemaVersion
 	if !reflect.DeepEqual(expectedManifest, manifest) {
 		return nil, errors.New("PyPI indexes or verification metadata do not match package bytes")
 	}
@@ -863,7 +869,7 @@ func verifyPyPIStructure(root string, manifest buildgraph.RepositoryManifest) ([
 func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]domain.Blob, error) {
 	var blobs []domain.Blob
 	for _, file := range manifest.Files {
-		if strings.HasPrefix(file.Path, "dists/") {
+		if strings.HasPrefix(file.Path, "dists/") || (manifest.Install.SigningKeyPath != "" && file.Path == manifest.Install.SigningKeyPath) {
 			continue
 		}
 		if !strings.HasPrefix(file.Path, "pool/") || !deb.IsPackageFilename(path.Base(file.Path)) {
@@ -908,10 +914,43 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 	if err != nil {
 		return nil, fmt.Errorf("rebuild Debian structure: %w", err)
 	}
+	if manifest.Install.SigningKeyPath != "" {
+		if len(manifest.Signatures) != 2 || manifest.Install.SigningFingerprint == "" || path.IsAbs(manifest.Install.SigningKeyPath) ||
+			path.Clean(manifest.Install.SigningKeyPath) != manifest.Install.SigningKeyPath || !strings.HasPrefix(manifest.Install.SigningKeyPath, "keys/") {
+			return nil, errors.New("signed Debian repository has incomplete signature metadata")
+		}
+		keyContent, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(manifest.Install.SigningKeyPath)))
+		if err != nil {
+			return nil, fmt.Errorf("read Debian public signing key: %w", err)
+		}
+		inRelease, err := os.ReadFile(filepath.Join(root, "dists", manifest.Install.Suite, "InRelease"))
+		if err != nil {
+			return nil, fmt.Errorf("read Debian InRelease: %w", err)
+		}
+		releaseGPG, err := os.ReadFile(filepath.Join(root, "dists", manifest.Install.Suite, "Release.gpg"))
+		if err != nil {
+			return nil, fmt.Errorf("read Debian Release.gpg: %w", err)
+		}
+		signatureTime, err := time.Parse(time.RFC3339, manifest.Signatures[0].CreatedAt)
+		if err != nil || manifest.Signatures[1].CreatedAt != manifest.Signatures[0].CreatedAt {
+			return nil, errors.New("Debian signature metadata has inconsistent creation times")
+		}
+		keyName := strings.TrimSuffix(path.Base(manifest.Install.SigningKeyPath), ".gpg")
+		expectedArtifact, err = deb.ApplySigning(expectedArtifact, manifest.Install.Suite, deb.SigningMaterial{
+			KeyName: keyName, Fingerprint: manifest.Install.SigningFingerprint, PublicKey: keyContent,
+			SignatureTime: signatureTime, InRelease: inRelease, ReleaseGPG: releaseGPG,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("verify Debian signatures: %w", err)
+		}
+	} else if len(manifest.Signatures) != 0 {
+		return nil, errors.New("unsigned Debian repository contains signature metadata")
+	}
 	_, expectedManifest, err := buildgraph.Finalize(expectedArtifact, generatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("finalize expected Debian structure: %w", err)
 	}
+	expectedManifest.SchemaVersion = manifest.SchemaVersion
 	if !reflect.DeepEqual(expectedManifest, manifest) {
 		return nil, errors.New("Debian indexes or verification metadata do not match package bytes")
 	}
@@ -955,6 +994,7 @@ func verifyHelmStructure(root string, manifest buildgraph.RepositoryManifest) ([
 	if err != nil {
 		return nil, fmt.Errorf("finalize expected Helm structure: %w", err)
 	}
+	expectedManifest.SchemaVersion = manifest.SchemaVersion
 	if !reflect.DeepEqual(expectedManifest, manifest) {
 		return nil, errors.New("Helm index or verification metadata does not match chart bytes")
 	}

@@ -52,6 +52,29 @@ name = "legacy-workspace"
 	}
 }
 
+func TestLoadManifestMigratesSchemaFourWithoutSigningKeys(t *testing.T) {
+	root := t.TempDir()
+	content := []byte(`schema_version = 4
+
+[workspace]
+name = "phase-two"
+id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[blob_store]
+type = "local"
+`)
+	if err := os.WriteFile(filepath.Join(root, ManifestFilename), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.SchemaVersion != ManifestSchema || manifest.Keys == nil || len(manifest.Keys) != 0 {
+		t.Fatalf("unexpected schema-four migration %#v", manifest)
+	}
+}
+
 func TestValidateBlobStoreRejectsSecretsAndUnsafeConfiguration(t *testing.T) {
 	for _, configuration := range []BlobStoreConfig{
 		{Type: "local", Bucket: "unexpected"},

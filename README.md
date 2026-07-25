@@ -7,7 +7,7 @@ format — apt, dnf, apk, PyPI, npm, Helm, OCI, Cargo, Go, Maven, Nix, or plain
 artifacts — on hosting you choose, and to **publish into repositories you
 don't own** — AUR, Homebrew, nixpkgs, npmjs, PyPI, ghcr.
 
-**Status: Phase 2 owned hosting complete.** The current implementation
+**Status: Phase 2 complete; Phase 3 signing foundation implemented.** The current implementation
 builds, structurally verifies, serves, and client-tests deterministic static
 PyPI, Debian, and Helm repositories. Git-backed workspaces also support local
 `init`, `setup`, `add`, `plan`, and `apply` workflows with immutable blobs,
@@ -19,7 +19,10 @@ switching, checksum observation, conditional restore, and optional scoped
 private reads. Shared S3 blob storage, public GitHub Pages with a companion
 preview site, `auto`/`pr`/signed-`approval` gates, deterministic public status
 artifacts, and a containerized GitHub Actions workflow complete Phase 2.
-Signing, operational commands, and format breadth follow in Phase 3. See
+Phase 3 now includes encrypted local RSA4096 OpenPGP keys, a versioned signing
+compatibility table, `keys new|publish|audit`, explicit plan-resolved signer
+effects, and authenticated Debian `InRelease`/`Release.gpg` output. Rotation,
+operational commands, and format breadth remain Phase 3 work. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the implementation contract and
 [PLAN.md](PLAN.md) for the broader product design.
 
@@ -33,6 +36,40 @@ git commit -m "configure Python repository"
 go run ./cmd/snailmail plan
 go run ./cmd/snailmail apply --plan snailmail.snailmail-plan.json
 ```
+
+Signed Debian repositories use an encrypted private key outside the workspace
+and commit only canonical public forms. Set a passphrase through the environment
+(never an argument), generate the key, and reference it during setup:
+
+```sh
+export SNAILMAIL_KEY_PASSPHRASE='use-a-secret-manager-value'
+go run ./cmd/snailmail keys new archive-signing --expires-in 17520h
+go run ./cmd/snailmail setup deb \
+  --name debian \
+  --output public/debian \
+  --suite stable \
+  --architectures amd64 \
+  --signing-key archive-signing
+go run ./cmd/snailmail keys audit
+git add snailmail.toml keys/ repos/debian.lock.toml
+git commit -m "configure signed Debian repository"
+go run ./cmd/snailmail plan
+go run ./cmd/snailmail apply
+```
+
+The file backend stores encrypted private keys under
+`$XDG_DATA_HOME/snailmail/private-keys` (or
+`~/.local/share/snailmail/private-keys`) with mode `0600`. Passphrases must
+contain at least 24 bytes and should come from a secret manager. `keys publish`
+recreates missing public forms after validating the private identity. Planning
+compiles content-addressed `InRelease` and `Release.gpg` signing nodes over the
+exact Debian `Release` bytes, signs each node twice to prove deterministic
+backend behavior, verifies both signatures, and embeds only public node
+responses in the reviewed plan. Apply does not load the private key. Signed
+client verification uses apt's `signed-by`; migrated unsigned Debian
+repositories remain readable but `keys audit` reports them as errors. New
+unsigned Debian setup requires the explicit `--allow-unsigned` compatibility
+opt-out.
 
 `plan` requires the manifest, configured locks, publication ledgers, and
 deployment receipts to be committed in a complete, non-shallow Git repository. `apply`
@@ -146,6 +183,11 @@ S3 access. Cross-repository Pages writes need `SNAILMAIL_GITHUB_TOKEN`. Approval
 jobs need `SNAILMAIL_APPROVAL_REPOSITORIES` and the
 `SNAILMAIL_APPROVAL_PRIVATE_KEY` secret. Private S3 requires an organization
 image containing its compiled broker plus the corresponding runtime variables.
+Signed Debian planning additionally uses `SNAILMAIL_SIGNING_KEY_REF` as the
+non-secret `<workspace-id>/<key-name>` repository variable and the
+`SNAILMAIL_SIGNING_PRIVATE_KEY` and `SNAILMAIL_KEY_PASSPHRASE` secrets. The
+workflow materializes that encrypted key only in runner temporary storage and
+does not pass it to apply.
 
 ```sh
 go run ./cmd/snailmail build pypi --input ./dist --output ./repository
@@ -172,7 +214,10 @@ The short version:
   disabled, with the ecosystem client before switching the local target.
 - **Local, S3, and Pages.** `snailmail setup` records deterministic local
   targets, public/private S3-compatible PyPI, or public GitHub Pages PyPI with a
-  separate preview site. Repository-signing key provisioning remains Phase 3.
+  separate preview site.
+- **Plan-resolved signing.** Debian signing keys remain outside Git; exact
+  verified `InRelease` and `Release.gpg` responses are reviewed in the plan and
+  replayed without signer access during apply.
 
 ```
               apt      dnf      apk      aur      aur-bin  brew     nixpkgs

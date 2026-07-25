@@ -54,6 +54,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runApprove(args[1:], stdout, stderr)
 	case "approval-key":
 		return runApprovalKey(args[1:], stdout, stderr)
+	case "keys":
+		return runKeys(ctx, args[1:], stdout, stderr)
 	case "render":
 		return runRender(args[1:], stdout, stderr)
 	case "build":
@@ -104,6 +106,8 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	visibility := flags.String("visibility", "public", "repository visibility")
 	gatePolicy := flags.String("gate", "auto", "publication gate: auto, pr, or approval")
 	approvalKeys := flags.String("approval-keys", "", "comma-separated allowed Ed25519 public keys")
+	signingKey := flags.String("signing-key", "", "repository signing key name")
+	allowUnsigned := flags.Bool("allow-unsigned", false, "explicitly allow a new unsigned Debian repository")
 	bucket := flags.String("bucket", "", "S3 bucket")
 	prefix := flags.String("prefix", "", "S3 object prefix")
 	region := flags.String("region", "", "AWS region")
@@ -130,7 +134,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	sort.Strings(resolvedApprovalKeys)
 	if err := engine.SetupRepository(engine.SetupRepositoryRequest{
 		Root: *workspace, Name: *name, Format: format, Output: *output,
-		HostType: *hostType, Visibility: *visibility, Gate: *gatePolicy, ApprovalKeys: resolvedApprovalKeys, Bucket: *bucket, Prefix: *prefix,
+		HostType: *hostType, Visibility: *visibility, Gate: *gatePolicy, ApprovalKeys: resolvedApprovalKeys, SigningKey: *signingKey, AllowUnsigned: *allowUnsigned, Bucket: *bucket, Prefix: *prefix,
 		Region: *region, Endpoint: *endpoint, CanonicalEndpoint: *canonicalEndpoint,
 		UsePathStyle: *usePathStyle,
 		ReadAuth:     *readAuth, CredentialBroker: *credentialBroker,
@@ -148,6 +152,99 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "✉️   desired state will publish to %s\n", target)
 	return nil
+}
+
+func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: snailmail keys <new|publish|audit> [options]")
+	}
+	switch args[0] {
+	case "new":
+		if len(args) < 2 {
+			return errors.New("usage: snailmail keys new NAME [--algo openpgp-rsa4096] [--expires-in 17520h]")
+		}
+		name := args[1]
+		flags := flag.NewFlagSet("keys new", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		workspace := flags.String("workspace", ".", "workspace root")
+		algorithm := flags.String("algo", "openpgp-rsa4096", "signing algorithm")
+		expiresIn := flags.Duration("expires-in", 2*365*24*time.Hour, "key validity duration")
+		if err := flags.Parse(args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		store, err := wire.NewSignerStore()
+		if err != nil {
+			return err
+		}
+		result, err := engine.NewKey(ctx, engine.NewKeyRequest{Root: *workspace, Name: name, Algorithm: *algorithm, ExpiresIn: *expiresIn, Keys: store})
+		if err != nil {
+			return err
+		}
+		printBrand(stdout)
+		fmt.Fprintf(stdout, "📦  generated signing key %s\n", result.Name)
+		fmt.Fprintf(stdout, "✉️   fingerprint %s; expires %s\n", result.Fingerprint, result.ExpiresAt)
+		fmt.Fprintf(stdout, "    key reference %s\n", result.Reference)
+		return nil
+	case "publish":
+		if len(args) < 2 {
+			return errors.New("usage: snailmail keys publish NAME")
+		}
+		name := args[1]
+		flags := flag.NewFlagSet("keys publish", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		workspace := flags.String("workspace", ".", "workspace root")
+		if err := flags.Parse(args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		store, err := wire.NewSignerStore()
+		if err != nil {
+			return err
+		}
+		result, err := engine.PublishKey(ctx, engine.PublishKeyRequest{Root: *workspace, Name: name, Keys: store})
+		if err != nil {
+			return err
+		}
+		printBrand(stdout)
+		fmt.Fprintf(stdout, "📦  published public forms for %s\n", result.Name)
+		fmt.Fprintf(stdout, "✉️   fingerprint %s\n", result.Fingerprint)
+		return nil
+	case "audit":
+		flags := flag.NewFlagSet("keys audit", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		workspace := flags.String("workspace", ".", "workspace root")
+		if err := flags.Parse(args[1:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		result, err := engine.AuditKeys(engine.PublishKeyRequest{Root: *workspace}, time.Time{})
+		if err != nil {
+			return err
+		}
+		printBrand(stdout)
+		if len(result.Findings) == 0 {
+			fmt.Fprintln(stdout, "📦  signing keys and repository compatibility are valid")
+			return nil
+		}
+		hasErrors := false
+		for _, finding := range result.Findings {
+			fmt.Fprintf(stdout, "✉️   %s %s: %s\n", finding.Severity, finding.Subject, finding.Message)
+			hasErrors = hasErrors || finding.Severity == "error"
+		}
+		if hasErrors {
+			return errors.New("signing key audit found errors")
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown keys command %q", args[0])
+	}
 }
 
 func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -231,9 +328,13 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	}
 	hosts := wire.NewHostResolver()
 	defer hosts.Close()
+	signers, err := wire.NewSignerStore()
+	if err != nil {
+		return err
+	}
 	result, err := engine.PlanWorkspace(ctx, engine.PlanWorkspaceRequest{
 		Root: *workspace, Output: *output, GeneratedAt: generatedAt, ExpiresIn: *expires,
-		Hosts: hosts, Blobs: wire.NewBlobResolver(), VerificationMode: verificationMode(*structuralOnly),
+		Hosts: hosts, Blobs: wire.NewBlobResolver(), Signers: signers, VerificationMode: verificationMode(*structuralOnly),
 	})
 	if err != nil {
 		return err
@@ -663,6 +764,9 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail blob-store s3 --bucket BUCKET [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
 	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")
+	fmt.Fprintln(output, "  snailmail keys new NAME [--algo openpgp-rsa4096]")
+	fmt.Fprintln(output, "  snailmail keys publish NAME")
+	fmt.Fprintln(output, "  snailmail keys audit")
 	fmt.Fprintln(output, "  snailmail approve --plan PLAN --repository NAME --key FILE --yes")
 	fmt.Fprintln(output, "  snailmail render [--output site]")
 	fmt.Fprintln(output, "  snailmail apply [--plan snailmail.snailmail-plan.json]")
