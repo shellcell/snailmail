@@ -61,6 +61,9 @@ func Render(workspace, gitRevision string, repositories []InputRepository) (Outp
 		}
 		active := make(map[string]bool)
 		for _, placement := range input.Lock.Placement {
+			if placement.Track != input.Config.Track || (input.Config.Format == "deb" && placement.Distro != input.Config.Suite) || (input.Config.Format != "deb" && placement.Distro != "") {
+				continue
+			}
 			active[placement.Package+"\x00"+placement.Version] = true
 		}
 		published := make(map[string]state.PublicationRecord)

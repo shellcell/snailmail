@@ -20,9 +20,10 @@ private reads. Shared S3 blob storage, public GitHub Pages with a companion
 preview site, `auto`/`pr`/signed-`approval` gates, deterministic public status
 artifacts, and a containerized GitHub Actions workflow complete Phase 2.
 Phase 3 now includes encrypted local RSA4096 OpenPGP keys, a versioned signing
-compatibility table, `keys new|publish|audit`, explicit plan-resolved signer
-effects, and authenticated Debian `InRelease`/`Release.gpg` output. Rotation,
-operational commands, and format breadth remain Phase 3 work. See
+compatibility table, `keys new|publish|audit|rotate`, explicit plan-resolved signer
+effects, authenticated Debian `InRelease`/`Release.gpg` output, receipt-backed
+Debian key rotation, and placement-level `promote`/`yank`. Additional key
+backends, operational commands, and format breadth remain Phase 3 work. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the implementation contract and
 [PLAN.md](PLAN.md) for the broader product design.
 
@@ -36,6 +37,31 @@ git commit -m "configure Python repository"
 go run ./cmd/snailmail plan
 go run ./cmd/snailmail apply --plan snailmail.snailmail-plan.json
 ```
+
+Promotions and yanks edit only placement records. Package versions, blob
+bindings, and publication history remain available for later re-promotion:
+
+```sh
+go run ./cmd/snailmail promote --track testing python snail-demo 1.2.3
+go run ./cmd/snailmail yank --track stable python snail-demo 1.2.3
+# Or remove every placement for the exact version:
+go run ./cmd/snailmail yank --all python snail-demo 1.2.3
+
+git diff -- repos/python.lock.toml
+git add repos/python.lock.toml
+git commit -m "update Python package placements"
+go run ./cmd/snailmail plan
+go run ./cmd/snailmail apply
+```
+
+The repository and package version are exact; promotion does not copy package
+versions between repositories. Each repository renders only its configured
+`--track` (default `stable`), and Debian additionally renders only placements for
+its configured suite. Other placements remain recorded but are not exposed in
+that view. Removing the final visible placement publishes a valid empty index
+while retaining immutable package and blob records in Git. Debian defaults a
+new placement's distro to the configured suite; `--distro DISTRO` selects another
+distro coordinate explicitly.
 
 Signed Debian repositories use an encrypted private key outside the workspace
 and commit only canonical public forms. Set a passphrase through the environment
@@ -70,6 +96,39 @@ client verification uses apt's `signed-by`; migrated unsigned Debian
 repositories remain readable but `keys audit` reports them as errors. New
 unsigned Debian setup requires the explicit `--allow-unsigned` compatibility
 opt-out.
+
+Debian rotation keeps one active `InRelease` signer and a stable binary keyring.
+Introduction publishes both identities while the old key continues signing;
+activation switches to the successor only after the introducing deployment
+receipt has aged through the minimum refresh window; retirement removes old
+trust only after a second deployed overlap window:
+
+```sh
+go run ./cmd/snailmail keys rotate debian \
+  --successor archive-signing-2027 \
+  --minimum-refresh 720h
+git add snailmail.toml keys/
+git commit -m "introduce successor archive key"
+go run ./cmd/snailmail plan && go run ./cmd/snailmail apply
+
+# After `keys audit` reports the introducing state ready:
+go run ./cmd/snailmail keys rotate debian --advance --yes
+git add snailmail.toml && git commit -m "activate successor archive key"
+go run ./cmd/snailmail plan && go run ./cmd/snailmail apply
+
+# After the activated overlap is ready:
+go run ./cmd/snailmail keys rotate debian --advance --yes
+git add snailmail.toml && git commit -m "retire old archive key"
+go run ./cmd/snailmail plan && go run ./cmd/snailmail apply
+```
+
+The minimum window is seven days. Its clock starts from the canonical
+post-verification deployment receipt, not from the manifest edit or plan time.
+Repository-hosted keyrings do not update clients automatically: refresh the
+local `/usr/share/keyrings` file through configuration management or a keyring
+package before activation. In CI, replace `SNAILMAIL_SIGNING_KEY_REF` and its
+encrypted private-key secret with the successor before planning the activated
+state; apply still receives no private key.
 
 `plan` requires the manifest, configured locks, publication ledgers, and
 deployment receipts to be committed in a complete, non-shallow Git repository. `apply`

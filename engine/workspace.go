@@ -17,10 +17,13 @@ import (
 
 	localhost "github.com/shellcell/snailmail/adapters/host/local"
 	"github.com/shellcell/snailmail/blob"
+	debformat "github.com/shellcell/snailmail/formats/deb"
+	helmformat "github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
 	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
+	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/knowledge"
 	"github.com/shellcell/snailmail/internal/state"
@@ -60,6 +63,7 @@ type SetupRepositoryRequest struct {
 	PreviewRepository string
 	PreviewBranch     string
 	PreviewEndpoint   string
+	Track             string
 	Suite             string
 	Component         string
 	Architectures     []string
@@ -140,19 +144,20 @@ type RenderStatusResult struct {
 }
 
 type ApplyWorkspaceRequest struct {
-	Root              string
-	Plan              string
-	now               time.Time
-	clock             func() time.Time
-	StructuralOnly    bool
-	Python            string
-	Runner            string
-	DebianImage       string
-	HelmImage         string
-	MaxWorkspaceBytes int64
-	Hosts             host.Resolver
-	Blobs             blob.Resolver
-	Gates             gate.Evaluator
+	Root                   string
+	Plan                   string
+	now                    time.Time
+	clock                  func() time.Time
+	StructuralOnly         bool
+	Python                 string
+	Runner                 string
+	DebianImage            string
+	HelmImage              string
+	MaxWorkspaceBytes      int64
+	Hosts                  host.Resolver
+	Blobs                  blob.Resolver
+	Gates                  gate.Evaluator
+	beforeDeploymentCommit func() error
 }
 
 type ApplyWorkspaceResult struct {
@@ -199,7 +204,7 @@ func SetupRepository(request SetupRepositoryRequest) error {
 		ReadAuth: request.ReadAuth, CredentialBroker: request.CredentialBroker,
 		Repository: request.RemoteRepository, Branch: request.Branch, PreviewRepository: request.PreviewRepository,
 		PreviewBranch: request.PreviewBranch, PreviewEndpoint: request.PreviewEndpoint,
-		Suite: request.Suite, Component: request.Component, Architectures: request.Architectures,
+		Track: request.Track, Suite: request.Suite, Component: request.Component, Architectures: request.Architectures,
 	})
 }
 
@@ -478,6 +483,9 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
 			return PlanWorkspaceResult{}, err
 		}
+		if err := validateRotationKeyValidity(repository, manifest.Keys, createdAt); err != nil {
+			return PlanWorkspaceResult{}, fmt.Errorf("repository %q: %w", name, err)
+		}
 		deployment, err := state.LoadDeployment(root, name)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
@@ -495,8 +503,9 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 			return PlanWorkspaceResult{}, err
 		}
 		if len(desired.Signing) != 0 {
-			keyExpiresAt, err := time.Parse(time.RFC3339, manifest.Keys[repository.SigningKeys[0]].ExpiresAt)
-			if err != nil || createdAt.Add(expiresIn).After(keyExpiresAt) {
+			activeKey, _, _, _, signingErr := repositorySigningState(repository)
+			keyExpiresAt, err := time.Parse(time.RFC3339, manifest.Keys[activeKey].ExpiresAt)
+			if signingErr != nil || err != nil || createdAt.Add(expiresIn).After(keyExpiresAt) {
 				return PlanWorkspaceResult{}, fmt.Errorf("repository %q plan expires after its signing key", name)
 			}
 		}
@@ -520,8 +529,21 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
+		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, observed, createdAt); err != nil {
+			return PlanWorkspaceResult{}, fmt.Errorf("repository %q: %w", name, err)
+		}
+		desiredSigningState, err := repositoryDeploymentSigningState(repository, manifest.Keys)
+		if err != nil {
+			return PlanWorkspaceResult{}, err
+		}
+		missingBindings := missingPublicationBindings(lock, repository, ledger)
+		publicationBindings := []state.PlanPublicationBinding(nil)
+		if len(missingBindings) != 0 {
+			publicationBindings = publicationBindingsForVersions(visiblePackageVersions(lock, repository))
+		}
+		publicationRecords := len(publicationBindings) != 0
 		action := "noop"
-		if observed.TreeSHA256 != desired.TreeSHA256 || ((hostRepository.Type == "s3" || hostRepository.Type == "github-pages") && observed.ManifestSHA256 != desired.ManifestSHA256) || !publicationBindingsComplete(lock, ledger) || !deploymentMatchesDesired(deployment, observed, desired.TreeSHA256, desired.ManifestSHA256, ledger) {
+		if observed.TreeSHA256 != desired.TreeSHA256 || ((hostRepository.Type == "s3" || hostRepository.Type == "github-pages") && observed.ManifestSHA256 != desired.ManifestSHA256) || publicationRecords || !deploymentMatchesDesired(deployment, observed, desired.TreeSHA256, desired.ManifestSHA256, desiredSigningState) {
 			action = "update"
 			if observed.NativeRevision == "" {
 				action = "create"
@@ -542,6 +564,8 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 			ObservedRestoreRootSHA256: observed.RestoreRootSHA256,
 			ObservedDeployment:        deployment,
 			Signing:                   desired.Signing,
+			PublicationRecords:        publicationRecords,
+			PublicationBindings:       publicationBindings,
 			FaithfulPreview:           capabilities.FaithfulPreview, ConditionalCommit: capabilities.ConditionalCommit,
 			ConditionalRestore:       capabilities.ConditionalRestore,
 			PrivateRead:              capabilities.PrivateRead,
@@ -601,12 +625,16 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	}
 	request.StructuralOnly = plan.Payload.VerificationMode == "structural"
 	plannedLedgerRepositories := make([]string, 0, len(plan.Payload.Repositories))
+	plannedDeploymentRepositories := make([]string, 0, len(plan.Payload.Repositories))
 	for _, repository := range plan.Payload.Repositories {
-		if repository.Action != "noop" {
+		if repository.PublicationRecords {
 			plannedLedgerRepositories = append(plannedLedgerRepositories, repository.Name)
 		}
+		if repository.Action != "noop" {
+			plannedDeploymentRepositories = append(plannedDeploymentRepositories, repository.Name)
+		}
 	}
-	ledgerCommitted, err := state.ValidatePlanGit(root, plan.Payload.GitRevision, plan.PlanID, plannedLedgerRepositories)
+	ledgerCommitted, err := state.ValidatePlanGit(root, plan.Payload.GitRevision, plan.PlanID, plannedLedgerRepositories, plannedDeploymentRepositories)
 	if err != nil {
 		return ApplyWorkspaceResult{}, err
 	}
@@ -652,6 +680,8 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		stageRoot      string
 		stage          string
 		current        bool
+		deployment     state.DeploymentRecord
+		signingState   deploymentSigningState
 	}
 	var prepared []applyRepository
 	hosts := request.Hosts
@@ -665,11 +695,15 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		}
 		seenRepositories[planned.Name] = true
 		repository, exists := manifest.Repositories[planned.Name]
-		if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) || len(planned.Signing) != len(repository.SigningKeys) {
+		if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) || len(planned.Signing) > 1 || (len(planned.Signing) == 0) != (len(repository.SigningKeys) == 0) {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q configuration changed", planned.Name)
 		}
+		activeSigningKey, _, _, _, signingStateErr := repositorySigningState(repository)
+		if signingStateErr != nil {
+			return ApplyWorkspaceResult{}, signingStateErr
+		}
 		for index, signing := range planned.Signing {
-			if signing.KeyName != repository.SigningKeys[index] {
+			if index != 0 || signing.KeyName != activeSigningKey {
 				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q signing key changed", planned.Name)
 			}
 			key, exists := manifest.Keys[signing.KeyName]
@@ -730,7 +764,22 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
+		missingBindings := missingPublicationBindings(lock, repository, ledger)
+		expectedBindings := []state.PlanPublicationBinding(nil)
+		if planned.PublicationRecords {
+			expectedBindings = publicationBindingsForVersions(visiblePackageVersions(lock, repository))
+		}
+		if planned.PublicationRecords != (len(planned.PublicationBindings) != 0) ||
+			!reflect.DeepEqual(planned.PublicationBindings, expectedBindings) ||
+			(!ledgerCommitted && planned.PublicationRecords != (len(missingBindings) != 0)) ||
+			(ledgerCommitted && !planned.PublicationRecords && len(missingBindings) != 0) {
+			return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q has inconsistent publication-record effects", planned.Name)
+		}
 		deployment, err := state.LoadDeployment(root, planned.Name)
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
+		desiredSigningState, err := repositoryDeploymentSigningState(repository, manifest.Keys)
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
@@ -738,13 +787,17 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
+		plannedObserved := publishedFromPlanObservation(planned)
+		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, plannedObserved, now); err != nil {
+			return ApplyWorkspaceResult{}, fmt.Errorf("repository %q: %w", planned.Name, err)
+		}
 		matchesObserved := revisionMatchesPlanObservation(observed, planned)
 		managedRemote := repository.Host.Type == "s3" || repository.Host.Type == "github-pages"
 		matchesApplied := planned.Action != "noop" && observed.TreeSHA256 == planned.DesiredTreeSHA256 &&
 			(!managedRemote || (observed.PlanID == plan.PlanID && observed.ChangeID == planned.ChangeID && observed.ManifestSHA256 == planned.DesiredManifestSHA256))
-		deploymentApplied := deployment.PlanID == plan.PlanID && deployment.ChangeID == planned.ChangeID && deployment.TreeSHA256 == planned.DesiredTreeSHA256 && deployment.ManifestSHA256 == planned.DesiredManifestSHA256 && deployment.NativeRevision == observed.NativeRevision
-		deploymentCurrent := deploymentMatchesDesired(deployment, observed, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, ledger)
-		if deployment != planned.ObservedDeployment && !deploymentApplied {
+		deploymentApplied := deployment.PlanID == plan.PlanID && deployment.ChangeID == planned.ChangeID && deployment.TreeSHA256 == planned.DesiredTreeSHA256 && deployment.ManifestSHA256 == planned.DesiredManifestSHA256 && deployment.NativeRevision == observed.NativeRevision && deploymentSigningMatches(deployment, desiredSigningState)
+		deploymentCurrent := deploymentMatchesDesired(deployment, observed, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, desiredSigningState)
+		if !reflect.DeepEqual(deployment, planned.ObservedDeployment) && !deploymentApplied {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q deployment receipt changed", planned.Name)
 		}
 		if !matchesObserved && !matchesApplied {
@@ -757,8 +810,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q target changed", planned.Name)
 		}
 		expectedAction := "noop"
-		plannedObserved := publishedFromPlanObservation(planned)
-		if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 || (managedRemote && planned.ObservedManifestSHA256 != planned.DesiredManifestSHA256) || !publicationBindingsComplete(lock, ledger) || !deploymentMatchesDesired(planned.ObservedDeployment, plannedObserved, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, ledger) {
+		if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 || (managedRemote && planned.ObservedManifestSHA256 != planned.DesiredManifestSHA256) || !publicationBindingsComplete(lock, repository, ledger) || !deploymentMatchesDesired(planned.ObservedDeployment, plannedObserved, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, desiredSigningState) {
 			expectedAction = "update"
 			if planned.ObservedRevision == "" {
 				expectedAction = "create"
@@ -767,11 +819,11 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if planned.Action != expectedAction || planned.ChangeID != planned.Name+":"+planned.DesiredTreeSHA256[:12] {
 			return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q has inconsistent action metadata", planned.Name)
 		}
-		receiptRecovery := matchesApplied && deployment == planned.ObservedDeployment
+		receiptRecovery := matchesApplied && reflect.DeepEqual(deployment, planned.ObservedDeployment)
 		current := observed.TreeSHA256 == planned.DesiredTreeSHA256 && (!managedRemote || observed.ManifestSHA256 == planned.DesiredManifestSHA256) && (deploymentApplied || (planned.Action == "noop" && deploymentCurrent) || receiptRecovery)
 		item := applyRepository{
 			planned: planned, repository: repository, lock: lock, host: selectedHost,
-			hostRepository: hostRepository, observed: observed, current: current,
+			hostRepository: hostRepository, observed: observed, current: current, deployment: deployment, signingState: desiredSigningState,
 		}
 		if item.current && (request.StructuralOnly || planned.Action == "noop") && !(planned.Action != "noop" && len(planned.Signing) != 0) {
 			prepared = append(prepared, item)
@@ -886,6 +938,15 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return ApplyWorkspaceResult{}, err
 		}
 	}
+	if !ledgerCommitted {
+		for _, item := range prepared {
+			if item.planned.PublicationRecords {
+				if err := authorize(item); err != nil {
+					return ApplyWorkspaceResult{}, err
+				}
+			}
+		}
+	}
 	ledgerRepositories := plannedLedgerRepositories
 	ledgerRevision := ""
 	applyGitRevision := ""
@@ -894,30 +955,34 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err != nil {
 			return ApplyWorkspaceResult{}, errors.New("committed publication ledgers do not match the plan")
 		}
-		ledgerRevision, err = state.PlanLedgerRevision(root, plan.PlanID)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		if err := state.ValidatePublicationCommitPaths(root, ledgerRevision, ledgerRepositories); err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		for _, item := range prepared {
-			if item.planned.Action == "noop" {
-				continue
-			}
-			if err := state.ValidateCommittedPublicationLedger(
-				root, plan.Payload.GitRevision, ledgerRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
-				item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, activeLock(item.lock),
-			); err != nil {
+		if len(ledgerRepositories) == 0 {
+			ledgerRevision = plan.Payload.GitRevision
+		} else {
+			ledgerRevision, err = state.PlanLedgerRevision(root, plan.PlanID)
+			if err != nil {
 				return ApplyWorkspaceResult{}, err
+			}
+			if err := state.ValidatePublicationCommitPaths(root, ledgerRevision, ledgerRepositories); err != nil {
+				return ApplyWorkspaceResult{}, err
+			}
+			for _, item := range prepared {
+				if !item.planned.PublicationRecords {
+					continue
+				}
+				if err := state.ValidateCommittedPublicationLedger(
+					root, plan.Payload.GitRevision, ledgerRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
+					item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, activeRepositoryLock(item.lock, item.repository),
+				); err != nil {
+					return ApplyWorkspaceResult{}, err
+				}
 			}
 		}
 	}
 	for _, item := range prepared {
-		if item.planned.Action == "noop" {
+		if !item.planned.PublicationRecords {
 			continue
 		}
-		publishedLock := activeLock(item.lock)
+		publishedLock := activeRepositoryLock(item.lock, item.repository)
 		if err := state.PreparePublicationRecords(
 			root, plan.Payload.GitRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
 			item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, publishedLock,
@@ -935,12 +1000,12 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return ApplyWorkspaceResult{}, err
 		}
 		for _, item := range prepared {
-			if item.planned.Action == "noop" {
+			if !item.planned.PublicationRecords {
 				continue
 			}
 			if err := state.ValidateCommittedPublicationLedger(
 				root, plan.Payload.GitRevision, ledgerRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
-				item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, activeLock(item.lock),
+				item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, activeRepositoryLock(item.lock, item.repository),
 			); err != nil {
 				return ApplyWorkspaceResult{}, err
 			}
@@ -1001,11 +1066,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 				}
 			}
 			if item.planned.Action != "noop" {
-				deployments = append(deployments, state.DeploymentRecord{
-					Repository: item.planned.Name, PlanID: plan.PlanID, ChangeID: item.planned.ChangeID,
-					TreeSHA256: item.planned.DesiredTreeSHA256, ManifestSHA256: item.planned.DesiredManifestSHA256,
-					NativeRevision: item.observed.NativeRevision, DeployedAt: plan.Payload.CreatedAt,
-				})
+				deployments = append(deployments, deploymentRecordFor(item.planned, item.deployment, item.observed, item.signingState, item.observed.NativeRevision, plan.PlanID, plan.Payload.CreatedAt, request.currentTime()))
 			}
 			continue
 		}
@@ -1068,15 +1129,16 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
 			return result, err
 		}
-		deployments = append(deployments, state.DeploymentRecord{
-			Repository: item.planned.Name, PlanID: plan.PlanID, ChangeID: item.planned.ChangeID,
-			TreeSHA256: item.planned.DesiredTreeSHA256, ManifestSHA256: item.planned.DesiredManifestSHA256,
-			NativeRevision: committed.Revision.NativeRevision, DeployedAt: plan.Payload.CreatedAt,
-		})
+		deployments = append(deployments, deploymentRecordFor(item.planned, item.deployment, item.observed, item.signingState, committed.Revision.NativeRevision, plan.PlanID, plan.Payload.CreatedAt, request.currentTime()))
 	}
 	if unlockGit != nil {
 		unlockGit()
 		unlockGit = nil
+	}
+	if request.beforeDeploymentCommit != nil {
+		if err := request.beforeDeploymentCommit(); err != nil {
+			return result, fmt.Errorf("before deployment receipt commit: %w", err)
+		}
 	}
 	if _, err := state.CommitDeployments(root, plan.PlanID, applyGitRevision, deployments); err != nil {
 		return result, fmt.Errorf("record successful deployments: %w", err)
@@ -1348,7 +1410,7 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		return BuildResult{}, err
 	}
 	defer os.RemoveAll(input)
-	active := activePackageVersions(lock)
+	active := visiblePackageVersions(lock, repository)
 	for _, packageVersion := range active {
 		for _, locked := range packageVersion.Blobs {
 			blob, source, err := state.EnsureBlob(ctx, root, repository.Format, locked, blobStore)
@@ -1370,9 +1432,6 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 			}
 		}
 	}
-	if len(active) == 0 {
-		return BuildResult{}, fmt.Errorf("repository %q has no active placements", name)
-	}
 	if output == "" {
 		temporary, err := os.MkdirTemp("", ".snailmail-plan-build-*")
 		if err != nil {
@@ -1380,6 +1439,40 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		}
 		defer os.RemoveAll(temporary)
 		output = filepath.Join(temporary, "repository")
+	}
+	if len(active) == 0 {
+		var artifact domain.RepositoryArtifact
+		switch repository.Format {
+		case "pypi":
+			if len(plannedSigning) != 0 || len(repository.SigningKeys) != 0 {
+				return BuildResult{}, errors.New("PyPI repository cannot contain repository signing effects")
+			}
+			artifact, err = pypi.Build(nil)
+		case "deb":
+			artifact, err = debformat.Build(nil, debformat.BuildOptions{
+				Suite: repository.Suite, Component: repository.Component, Architectures: repository.Architectures, GeneratedAt: generatedAt,
+			})
+			if err == nil {
+				var signing []state.PlanSigning
+				artifact, signing, err = applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers)
+				if err == nil {
+					result, materializeErr := materializeLockedArtifact(ctx, output, generatedAt, artifact)
+					result.Signing = signing
+					return result, materializeErr
+				}
+			}
+		case "helm":
+			if len(plannedSigning) != 0 || len(repository.SigningKeys) != 0 {
+				return BuildResult{}, errors.New("Helm repository signing is not implemented")
+			}
+			artifact, err = helmformat.Build(nil, helmformat.BuildOptions{GeneratedAt: generatedAt})
+		default:
+			return BuildResult{}, fmt.Errorf("unsupported repository format %q", repository.Format)
+		}
+		if err != nil {
+			return BuildResult{}, err
+		}
+		return materializeLockedArtifact(ctx, output, generatedAt, artifact)
 	}
 	switch repository.Format {
 	case "pypi":
@@ -1406,6 +1499,21 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	}
 }
 
+func materializeLockedArtifact(ctx context.Context, output string, generatedAt time.Time, artifact domain.RepositoryArtifact) (BuildResult, error) {
+	artifact, manifest, err := buildgraph.Finalize(artifact, generatedAt)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	if err := app.Materialize(ctx, output, artifact, nil); err != nil {
+		return BuildResult{}, err
+	}
+	manifestSHA256, err := state.HashFile(filepath.Join(output, buildgraph.ManifestFilename))
+	if err != nil {
+		return BuildResult{}, err
+	}
+	return BuildResult{Format: manifest.Format, Output: output, TreeSHA256: manifest.TreeSHA256, ManifestSHA256: manifestSHA256}, nil
+}
+
 func activePackageVersions(lock state.RepositoryLock) []state.PackageVersion {
 	active := make(map[string]bool)
 	for _, placement := range lock.Placement {
@@ -1425,24 +1533,71 @@ func activeLock(lock state.RepositoryLock) state.RepositoryLock {
 	return lock
 }
 
-func publicationBindingsComplete(lock state.RepositoryLock, records []state.PublicationRecord) bool {
+func visiblePackageVersions(lock state.RepositoryLock, repository state.Repository) []state.PackageVersion {
+	active := make(map[string]bool)
+	for _, placement := range lock.Placement {
+		if placement.Track != repository.Track {
+			continue
+		}
+		if repository.Format == "deb" {
+			if placement.Distro != repository.Suite {
+				continue
+			}
+		} else if placement.Distro != "" {
+			continue
+		}
+		active[placement.Package+"\x00"+placement.Version] = true
+	}
+	var result []state.PackageVersion
+	for _, packageVersion := range lock.PackageVersion {
+		if active[packageVersion.Package+"\x00"+packageVersion.Version] {
+			result = append(result, packageVersion)
+		}
+	}
+	return result
+}
+
+func activeRepositoryLock(lock state.RepositoryLock, repository state.Repository) state.RepositoryLock {
+	lock.PackageVersion = visiblePackageVersions(lock, repository)
+	return lock
+}
+
+func publicationBindingsComplete(lock state.RepositoryLock, repository state.Repository, records []state.PublicationRecord) bool {
+	return len(missingPublicationBindings(lock, repository, records)) == 0
+}
+
+func missingPublicationBindings(lock state.RepositoryLock, repository state.Repository, records []state.PublicationRecord) []state.PlanPublicationBinding {
 	published := make(map[string][]string)
 	for _, record := range records {
 		digests := append([]string(nil), record.BlobSHA256...)
 		sort.Strings(digests)
 		published[record.Package+"\x00"+record.Version] = digests
 	}
-	for _, version := range activePackageVersions(lock) {
+	var missing []state.PlanPublicationBinding
+	for _, version := range visiblePackageVersions(lock, repository) {
 		digests := make([]string, 0, len(version.Blobs))
 		for _, artifact := range version.Blobs {
 			digests = append(digests, artifact.SHA256)
 		}
 		sort.Strings(digests)
 		if !reflect.DeepEqual(published[version.Package+"\x00"+version.Version], digests) {
-			return false
+			missing = append(missing, state.PlanPublicationBinding{Package: version.Package, Version: version.Version, BlobSHA256: digests})
 		}
 	}
-	return true
+	return missing
+}
+
+func publicationBindingsForVersions(versions []state.PackageVersion) []state.PlanPublicationBinding {
+	bindings := make([]state.PlanPublicationBinding, 0, len(versions))
+	for _, version := range versions {
+		digests := make([]string, 0, len(version.Blobs))
+		for _, artifact := range version.Blobs {
+			digests = append(digests, artifact.SHA256)
+		}
+		sort.Strings(digests)
+		bindings = append(bindings, state.PlanPublicationBinding{Package: version.Package, Version: version.Version, BlobSHA256: digests})
+	}
+	return bindings
 }
 
 func verifyStaged(ctx context.Context, format, repository string, request ApplyWorkspaceRequest) error {
@@ -1651,12 +1806,34 @@ func validateApplyPlan(plan state.Plan) error {
 		if repository.Action != "create" && repository.Action != "update" && repository.Action != "noop" {
 			return fmt.Errorf("plan repository %q has invalid action %q", repository.Name, repository.Action)
 		}
+		if repository.PublicationRecords && repository.Action == "noop" {
+			return fmt.Errorf("plan repository %q cannot record publications for a noop", repository.Name)
+		}
+		if repository.PublicationRecords != (len(repository.PublicationBindings) != 0) {
+			return fmt.Errorf("plan repository %q has inconsistent publication bindings", repository.Name)
+		}
+		previousBinding := ""
+		for _, binding := range repository.PublicationBindings {
+			if binding.Package == "" || binding.Version == "" || len(binding.BlobSHA256) == 0 {
+				return fmt.Errorf("plan repository %q has invalid publication binding", repository.Name)
+			}
+			identity := binding.Package + "\x00" + binding.Version
+			if identity <= previousBinding {
+				return fmt.Errorf("plan repository %q has unsorted publication bindings", repository.Name)
+			}
+			previousBinding = identity
+			previous := ""
+			for _, digest := range binding.BlobSHA256 {
+				if !validSHA256(digest) || digest <= previous {
+					return fmt.Errorf("plan repository %q has invalid publication binding digests", repository.Name)
+				}
+				previous = digest
+			}
+		}
 		if err := state.ValidateGateConfiguration(repository.Gate, repository.ApprovalKeys, plan.Payload.ForgeRepository); err != nil {
 			return fmt.Errorf("plan repository %q gate: %w", repository.Name, err)
 		}
-		if deployment := repository.ObservedDeployment; deployment.NativeRevision != "" &&
-			(deployment.SchemaVersion != state.DeploymentSchema || deployment.Repository != repository.Name || !validSHA256(deployment.PlanID) || !validSHA256(deployment.TreeSHA256) ||
-				(deployment.ManifestSHA256 != "" && !validSHA256(deployment.ManifestSHA256)) || deployment.ChangeID != deployment.Repository+":"+deployment.TreeSHA256[:12] || deployment.DeployedAt == "") {
+		if err := state.ValidateDeploymentRecord(repository.ObservedDeployment, repository.Name); err != nil {
 			return fmt.Errorf("plan repository %q has invalid deployment observation", repository.Name)
 		}
 		if !validSHA256(repository.LockSHA256) || !validSHA256(repository.DesiredTreeSHA256) ||
@@ -1769,18 +1946,18 @@ func blobref(locked state.LockedBlob) blob.Ref {
 	return blob.Ref{SHA256: locked.SHA256, Size: locked.Size}
 }
 
-func deploymentMatchesDesired(deployment state.DeploymentRecord, observed host.PublishedRevision, treeSHA256, manifestSHA256 string, ledger []state.PublicationRecord) bool {
+func deploymentMatchesDesired(deployment state.DeploymentRecord, observed host.PublishedRevision, treeSHA256, manifestSHA256 string, signing deploymentSigningState) bool {
 	if !validSHA256(treeSHA256) || deployment.TreeSHA256 != treeSHA256 || deployment.ManifestSHA256 != manifestSHA256 ||
 		deployment.NativeRevision == "" || deployment.NativeRevision != observed.NativeRevision ||
-		deployment.ChangeID != deployment.Repository+":"+treeSHA256[:12] {
+		deployment.ChangeID != deployment.Repository+":"+treeSHA256[:12] || !deploymentSigningMatches(deployment, signing) {
 		return false
 	}
-	for _, record := range ledger {
-		if record.Repository == deployment.Repository && record.PlanID == deployment.PlanID && record.ChangeID == deployment.ChangeID && record.TreeSHA256 == treeSHA256 {
-			return true
-		}
-	}
-	return false
+	return true
+}
+
+func deploymentSigningMatches(deployment state.DeploymentRecord, signing deploymentSigningState) bool {
+	return deployment.ActiveSigningFingerprint == signing.active && reflect.DeepEqual(deployment.TrustedSigningFingerprints, signing.trusted) && deployment.SigningRotationPhase == signing.phase &&
+		deployment.SigningKeyringPath == signing.keyring && deployment.SigningMinimumRefreshSeconds == signing.minimumRefresh && (signing.active == "" || deployment.TrustSince != "")
 }
 
 func publishedFromPlanObservation(planned state.PlanRepository) host.PublishedRevision {

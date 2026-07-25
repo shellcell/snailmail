@@ -3,11 +3,11 @@ package state
 import "time"
 
 const (
-	ManifestSchema   = 5
+	ManifestSchema   = 7
 	LockSchema       = 1
-	PlanSchema       = 7
+	PlanSchema       = 9
 	LedgerSchema     = 1
-	DeploymentSchema = 1
+	DeploymentSchema = 2
 )
 
 type Manifest struct {
@@ -34,16 +34,25 @@ type BlobStoreConfig struct {
 }
 
 type Repository struct {
-	Format        string     `toml:"format"`
-	Lock          string     `toml:"lock"`
-	Host          HostConfig `toml:"host"`
-	Visibility    string     `toml:"visibility"`
-	Gate          string     `toml:"gate"`
-	ApprovalKeys  []string   `toml:"approval_keys,omitempty"`
-	SigningKeys   []string   `toml:"signing_keys,omitempty"`
-	Suite         string     `toml:"suite,omitempty"`
-	Component     string     `toml:"component,omitempty"`
-	Architectures []string   `toml:"architectures,omitempty"`
+	Format          string           `toml:"format"`
+	Lock            string           `toml:"lock"`
+	Host            HostConfig       `toml:"host"`
+	Visibility      string           `toml:"visibility"`
+	Gate            string           `toml:"gate"`
+	ApprovalKeys    []string         `toml:"approval_keys,omitempty"`
+	SigningKeys     []string         `toml:"signing_keys,omitempty"`
+	SigningKeyring  string           `toml:"signing_keyring,omitempty"`
+	SigningRotation *SigningRotation `toml:"signing_rotation,omitempty"`
+	Track           string           `toml:"track"`
+	Suite           string           `toml:"suite,omitempty"`
+	Component       string           `toml:"component,omitempty"`
+	Architectures   []string         `toml:"architectures,omitempty"`
+}
+
+type SigningRotation struct {
+	SuccessorKey          string `toml:"successor_key"`
+	Phase                 string `toml:"phase"`
+	MinimumRefreshSeconds int64  `toml:"minimum_refresh_seconds"`
 }
 
 type SigningKey struct {
@@ -125,14 +134,20 @@ type PublicationRecord struct {
 }
 
 type DeploymentRecord struct {
-	SchemaVersion  int    `json:"schema_version"`
-	Repository     string `json:"repository"`
-	PlanID         string `json:"plan_id"`
-	ChangeID       string `json:"change_id"`
-	TreeSHA256     string `json:"tree_sha256"`
-	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
-	NativeRevision string `json:"native_revision"`
-	DeployedAt     string `json:"deployed_at"`
+	SchemaVersion                int      `json:"schema_version"`
+	Repository                   string   `json:"repository"`
+	PlanID                       string   `json:"plan_id"`
+	ChangeID                     string   `json:"change_id"`
+	TreeSHA256                   string   `json:"tree_sha256"`
+	ManifestSHA256               string   `json:"manifest_sha256,omitempty"`
+	NativeRevision               string   `json:"native_revision"`
+	DeployedAt                   string   `json:"deployed_at"`
+	ActiveSigningFingerprint     string   `json:"active_signing_fingerprint,omitempty"`
+	TrustedSigningFingerprints   []string `json:"trusted_signing_fingerprints,omitempty"`
+	SigningKeyringPath           string   `json:"signing_keyring_path,omitempty"`
+	SigningRotationPhase         string   `json:"signing_rotation_phase,omitempty"`
+	SigningMinimumRefreshSeconds int64    `json:"signing_minimum_refresh_seconds,omitempty"`
+	TrustSince                   string   `json:"trust_since,omitempty"`
 }
 
 type Plan struct {
@@ -158,49 +173,69 @@ type PlanPayload struct {
 }
 
 type PlanRepository struct {
-	Name                      string           `json:"name"`
-	Gate                      string           `json:"gate"`
-	ApprovalKeys              []string         `json:"approval_keys,omitempty"`
-	Format                    string           `json:"format"`
-	LockSHA256                string           `json:"lock_sha256"`
-	Host                      HostConfig       `json:"host"`
-	Visibility                string           `json:"visibility"`
-	HostIdentitySHA256        string           `json:"host_identity_sha256"`
-	CanonicalEndpoint         string           `json:"canonical_endpoint"`
-	InstallDocSHA256          string           `json:"install_doc_sha256,omitempty"`
-	ObservedRevision          string           `json:"observed_revision,omitempty"`
-	ObservedPlanID            string           `json:"observed_plan_id,omitempty"`
-	ObservedChangeID          string           `json:"observed_change_id,omitempty"`
-	ObservedReleaseSHA256     string           `json:"observed_release_sha256,omitempty"`
-	ObservedManifestSHA256    string           `json:"observed_manifest_sha256,omitempty"`
-	ObservedRestoreID         string           `json:"observed_restore_id,omitempty"`
-	ObservedRestoreSHA256     string           `json:"observed_restore_sha256,omitempty"`
-	ObservedRestoreRootSHA256 string           `json:"observed_restore_root_sha256,omitempty"`
-	ObservedDeployment        DeploymentRecord `json:"observed_deployment"`
-	FaithfulPreview           bool             `json:"faithful_preview"`
-	ConditionalCommit         bool             `json:"conditional_commit"`
-	ConditionalRestore        bool             `json:"conditional_restore"`
-	PrivateRead               bool             `json:"private_read"`
-	CredentialBrokerIdentity  string           `json:"credential_broker_identity,omitempty"`
-	Signing                   []PlanSigning    `json:"signing,omitempty"`
-	ObservedTreeSHA256        string           `json:"observed_tree_sha256,omitempty"`
-	DesiredTreeSHA256         string           `json:"desired_tree_sha256"`
-	DesiredManifestSHA256     string           `json:"desired_manifest_sha256,omitempty"`
-	ChangeID                  string           `json:"change_id"`
-	Action                    string           `json:"action"`
+	Name                      string                   `json:"name"`
+	Gate                      string                   `json:"gate"`
+	ApprovalKeys              []string                 `json:"approval_keys,omitempty"`
+	Format                    string                   `json:"format"`
+	LockSHA256                string                   `json:"lock_sha256"`
+	Host                      HostConfig               `json:"host"`
+	Visibility                string                   `json:"visibility"`
+	HostIdentitySHA256        string                   `json:"host_identity_sha256"`
+	CanonicalEndpoint         string                   `json:"canonical_endpoint"`
+	InstallDocSHA256          string                   `json:"install_doc_sha256,omitempty"`
+	ObservedRevision          string                   `json:"observed_revision,omitempty"`
+	ObservedPlanID            string                   `json:"observed_plan_id,omitempty"`
+	ObservedChangeID          string                   `json:"observed_change_id,omitempty"`
+	ObservedReleaseSHA256     string                   `json:"observed_release_sha256,omitempty"`
+	ObservedManifestSHA256    string                   `json:"observed_manifest_sha256,omitempty"`
+	ObservedRestoreID         string                   `json:"observed_restore_id,omitempty"`
+	ObservedRestoreSHA256     string                   `json:"observed_restore_sha256,omitempty"`
+	ObservedRestoreRootSHA256 string                   `json:"observed_restore_root_sha256,omitempty"`
+	ObservedDeployment        DeploymentRecord         `json:"observed_deployment"`
+	FaithfulPreview           bool                     `json:"faithful_preview"`
+	ConditionalCommit         bool                     `json:"conditional_commit"`
+	ConditionalRestore        bool                     `json:"conditional_restore"`
+	PrivateRead               bool                     `json:"private_read"`
+	CredentialBrokerIdentity  string                   `json:"credential_broker_identity,omitempty"`
+	Signing                   []PlanSigning            `json:"signing,omitempty"`
+	PublicationRecords        bool                     `json:"publication_records"`
+	PublicationBindings       []PlanPublicationBinding `json:"publication_bindings,omitempty"`
+	ObservedTreeSHA256        string                   `json:"observed_tree_sha256,omitempty"`
+	DesiredTreeSHA256         string                   `json:"desired_tree_sha256"`
+	DesiredManifestSHA256     string                   `json:"desired_manifest_sha256,omitempty"`
+	ChangeID                  string                   `json:"change_id"`
+	Action                    string                   `json:"action"`
+}
+
+type PlanPublicationBinding struct {
+	Package    string   `json:"package"`
+	Version    string   `json:"version"`
+	BlobSHA256 []string `json:"blob_sha256"`
 }
 
 type PlanSigning struct {
-	KeyName           string        `json:"key_name"`
-	Algorithm         string        `json:"algorithm"`
-	Fingerprint       string        `json:"fingerprint"`
-	PublicKeyPath     string        `json:"public_key_path"`
-	PublicKeySHA256   string        `json:"public_key_sha256"`
-	PublicArmorPath   string        `json:"public_armor_path"`
-	PublicArmorSHA256 string        `json:"public_armor_sha256"`
-	SignatureTime     string        `json:"signature_time"`
-	RecipeSHA256      string        `json:"recipe_sha256"`
-	Nodes             []SigningNode `json:"nodes"`
+	KeyName               string          `json:"key_name"`
+	Algorithm             string          `json:"algorithm"`
+	Fingerprint           string          `json:"fingerprint"`
+	PublicKeyPath         string          `json:"public_key_path"`
+	PublicKeySHA256       string          `json:"public_key_sha256"`
+	PublicArmorPath       string          `json:"public_armor_path"`
+	PublicArmorSHA256     string          `json:"public_armor_sha256"`
+	SignatureTime         string          `json:"signature_time"`
+	RecipeSHA256          string          `json:"recipe_sha256"`
+	KeyringPath           string          `json:"keyring_path"`
+	KeyringSHA256         string          `json:"keyring_sha256"`
+	TrustedKeys           []PlanPublicKey `json:"trusted_keys"`
+	RotationPhase         string          `json:"rotation_phase,omitempty"`
+	MinimumRefreshSeconds int64           `json:"minimum_refresh_seconds,omitempty"`
+	Nodes                 []SigningNode   `json:"nodes"`
+}
+
+type PlanPublicKey struct {
+	KeyName         string `json:"key_name"`
+	Fingerprint     string `json:"fingerprint"`
+	PublicKeyPath   string `json:"public_key_path"`
+	PublicKeySHA256 string `json:"public_key_sha256"`
 }
 
 type SigningNode struct {
@@ -237,6 +272,7 @@ type SetupOptions struct {
 	ApprovalKeys      []string
 	SigningKeys       []string
 	AllowUnsigned     bool
+	Track             string
 	Visibility        string
 	Bucket            string
 	Prefix            string

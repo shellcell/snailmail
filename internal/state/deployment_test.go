@@ -1,12 +1,38 @@
 package state
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestLoadDeploymentAcceptsSchemaOneWithoutRotationProof(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "deployments"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	record := DeploymentRecord{
+		SchemaVersion: 1, Repository: "debian", PlanID: strings.Repeat("a", 64), ChangeID: "debian:" + strings.Repeat("b", 12),
+		TreeSHA256: strings.Repeat("b", 64), NativeRevision: "native", DeployedAt: "2026-07-25T00:00:00Z",
+	}
+	content, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "deployments", "debian.json"), append(content, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadDeployment(root, "debian")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.SchemaVersion != 1 || loaded.TrustSince != "" || len(loaded.TrustedSigningFingerprints) != 0 {
+		t.Fatalf("schema-one receipt gained rotation authority: %#v", loaded)
+	}
+}
 
 func TestCommitDeploymentsRestoresWorktreeOnGitFailure(t *testing.T) {
 	root := t.TempDir()
@@ -29,6 +55,14 @@ func TestCommitDeploymentsRestoresWorktreeOnGitFailure(t *testing.T) {
 	base, err := gitOutput(root, "rev-parse", "HEAD")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := CommitDeployments(root, strings.Repeat("a", 64), base, []DeploymentRecord{{
+		Repository: "python", PlanID: strings.Repeat("a", 64), ChangeID: "python:bbbbbbbbbbbb",
+		TreeSHA256: strings.Repeat("b", 64), NativeRevision: "native", DeployedAt: "2026-07-25T00:00:00Z",
+		ActiveSigningFingerprint: strings.Repeat("c", 40), TrustedSigningFingerprints: []string{strings.Repeat("c", 40), strings.Repeat("c", 40)},
+		SigningRotationPhase: "introducing", SigningMinimumRefreshSeconds: MinimumSigningRefreshSeconds, TrustSince: "2026-07-25T00:00:00Z",
+	}}); err == nil {
+		t.Fatal("deployment commit accepted malformed signing trust")
 	}
 	indexPath, err := resolveGitPath(root, "index")
 	if err != nil {

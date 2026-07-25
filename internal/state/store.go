@@ -24,9 +24,11 @@ import (
 )
 
 const ManifestFilename = "snailmail.toml"
+const MinimumSigningRefreshSeconds = int64(7 * 24 * 60 * 60)
 
 var identifierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 var fingerprintPattern = regexp.MustCompile(`^[a-f0-9]{40}$`)
+var placementCoordinatePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 
 func ValidateRepositoryName(name string) error {
 	if !identifierPattern.MatchString(name) {
@@ -104,6 +106,7 @@ func Setup(root string, options SetupOptions) error {
 	lockPath := filepath.ToSlash(filepath.Join("repos", options.Name+".lock.toml"))
 	repository := Repository{
 		Format: options.Format, Lock: lockPath, Gate: gatePolicy, ApprovalKeys: append([]string(nil), options.ApprovalKeys...), SigningKeys: append([]string(nil), options.SigningKeys...), Visibility: visibility,
+		Track: options.Track,
 		Host: HostConfig{
 			Type: hostType, Path: filepath.ToSlash(options.Output), Bucket: options.Bucket,
 			Prefix: options.Prefix, Region: options.Region, Endpoint: options.Endpoint,
@@ -112,6 +115,9 @@ func Setup(root string, options SetupOptions) error {
 			Repository: options.Repository, Branch: options.Branch, PreviewRepository: options.PreviewRepository,
 			PreviewBranch: options.PreviewBranch, PreviewEndpoint: options.PreviewEndpoint,
 		},
+	}
+	if repository.Track == "" {
+		repository.Track = "stable"
 	}
 	if hostType == "github-pages" {
 		if repository.Host.Branch == "" {
@@ -127,9 +133,6 @@ func Setup(root string, options SetupOptions) error {
 	if err := validateGateConfiguration(options.Name, repository, manifest.Workspace.ForgeRepository); err != nil {
 		return err
 	}
-	if err := validateRepositorySigning(options.Name, repository, manifest.Keys); err != nil {
-		return err
-	}
 	if options.Format == "deb" {
 		repository.Suite = options.Suite
 		repository.Component = options.Component
@@ -143,6 +146,12 @@ func Setup(root string, options SetupOptions) error {
 		if len(repository.Architectures) == 0 {
 			repository.Architectures = []string{"amd64"}
 		}
+		if len(repository.SigningKeys) == 1 {
+			repository.SigningKeyring = filepath.ToSlash(filepath.Join("keys", options.Name+"-archive-keyring.gpg"))
+		}
+	}
+	if err := validateRepositorySigning(options.Name, repository, manifest.Keys); err != nil {
+		return err
 	}
 	manifest.Repositories[options.Name] = repository
 	resolvedLock, err := WorkspacePath(root, repository.Lock)
@@ -243,11 +252,27 @@ func LoadManifest(root string) (Manifest, error) {
 		if err := decoder.Decode(&manifest); err != nil {
 			return Manifest{}, fmt.Errorf("decode %q: %w", name, err)
 		}
-		if header.SchemaVersion == 2 || header.SchemaVersion == 3 || header.SchemaVersion == 4 {
+		if header.SchemaVersion == 2 || header.SchemaVersion == 3 || header.SchemaVersion == 4 || header.SchemaVersion == 5 || header.SchemaVersion == 6 {
 			manifest.SchemaVersion = ManifestSchema
 			if header.SchemaVersion == 2 {
 				manifest.Workspace.ID = legacyWorkspaceID(manifest.Workspace.Name)
 				manifest.BlobStore = BlobStoreConfig{Type: "local"}
+			}
+			if header.SchemaVersion == 5 {
+				for name, repository := range manifest.Repositories {
+					if len(repository.SigningKeys) == 1 && repository.SigningKeyring == "" {
+						repository.SigningKeyring = manifest.Keys[repository.SigningKeys[0]].PublicKeyPath
+						manifest.Repositories[name] = repository
+					}
+				}
+			}
+		}
+	}
+	if header.SchemaVersion < ManifestSchema {
+		for name, repository := range manifest.Repositories {
+			if repository.Track == "" {
+				repository.Track = "stable"
+				manifest.Repositories[name] = repository
 			}
 		}
 	}
@@ -275,6 +300,9 @@ func LoadManifest(root string) (Manifest, error) {
 		}
 		if repository.Format != "pypi" && repository.Format != "deb" && repository.Format != "helm" {
 			return Manifest{}, fmt.Errorf("repository %q has unsupported format %q", name, repository.Format)
+		}
+		if !placementCoordinatePattern.MatchString(repository.Track) {
+			return Manifest{}, fmt.Errorf("repository %q has invalid rendered track %q", name, repository.Track)
 		}
 		if !validGate(repository.Gate) {
 			return Manifest{}, fmt.Errorf("repository %q has invalid gate %q", name, repository.Gate)
@@ -504,6 +532,7 @@ func ValidateGateConfiguration(policy string, approvalKeys []string, forgeReposi
 }
 
 func validateSigningKeys(manifest Manifest) error {
+	fingerprints := make(map[string]string)
 	for name, key := range manifest.Keys {
 		if !identifierPattern.MatchString(name) || key.Algorithm != "openpgp-rsa4096" || key.Usage != "sign" || !fingerprintPattern.MatchString(key.Fingerprint) ||
 			!validSHA256(key.PublicKeySHA256) || !validSHA256(key.PublicArmorSHA256) || key.PublicKeyPath != filepath.ToSlash(filepath.Join("keys", name+".gpg")) ||
@@ -515,19 +544,26 @@ func validateSigningKeys(manifest Manifest) error {
 		if createdErr != nil || expiresErr != nil || !expiresAt.After(createdAt) {
 			return fmt.Errorf("signing key %q has invalid validity", name)
 		}
+		if previous, exists := fingerprints[key.Fingerprint]; exists {
+			return fmt.Errorf("signing keys %q and %q have the same fingerprint", previous, name)
+		}
+		fingerprints[key.Fingerprint] = name
 	}
 	return nil
 }
 
 func validateRepositorySigning(name string, repository Repository, keys map[string]SigningKey) error {
 	if len(repository.SigningKeys) == 0 {
+		if repository.SigningKeyring != "" || repository.SigningRotation != nil {
+			return fmt.Errorf("repository %q has signing trust without an active key", name)
+		}
 		return nil
 	}
 	if repository.Format != "deb" {
 		return fmt.Errorf("repository %q: repository signing is currently implemented for Debian only", name)
 	}
-	if len(repository.SigningKeys) > 1 {
-		return fmt.Errorf("repository %q: dual-sign rotation is not implemented yet", name)
+	if len(repository.SigningKeys) != 1 {
+		return fmt.Errorf("repository %q must have exactly one active signing key", name)
 	}
 	previous := ""
 	for _, signingKey := range repository.SigningKeys {
@@ -538,6 +574,17 @@ func validateRepositorySigning(name string, repository Repository, keys map[stri
 			return fmt.Errorf("repository %q signing keys must be unique and sorted", name)
 		}
 		previous = signingKey
+	}
+	if err := validateRelativePath(repository.SigningKeyring); err != nil || !strings.HasPrefix(repository.SigningKeyring, "keys/") || !strings.HasSuffix(repository.SigningKeyring, ".gpg") {
+		return fmt.Errorf("repository %q has invalid signing keyring path", name)
+	}
+	if rotation := repository.SigningRotation; rotation != nil {
+		if rotation.SuccessorKey == repository.SigningKeys[0] || (rotation.Phase != "introducing" && rotation.Phase != "activated") || rotation.MinimumRefreshSeconds < MinimumSigningRefreshSeconds {
+			return fmt.Errorf("repository %q has invalid signing rotation", name)
+		}
+		if _, exists := keys[rotation.SuccessorKey]; !exists {
+			return fmt.Errorf("repository %q rotation references unknown successor key %q", name, rotation.SuccessorKey)
+		}
 	}
 	return nil
 }
@@ -626,7 +673,7 @@ func WriteManifest(root string, manifest Manifest) error {
 		return err
 	}
 	for name, repository := range manifest.Repositories {
-		if !identifierPattern.MatchString(name) || !validGate(repository.Gate) {
+		if !identifierPattern.MatchString(name) || !validGate(repository.Gate) || !placementCoordinatePattern.MatchString(repository.Track) {
 			return fmt.Errorf("repository %q has invalid name or gate", name)
 		}
 		if err := validateRepositoryHost(name, repository); err != nil {
@@ -761,6 +808,9 @@ func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob
 	if track == "" {
 		track = "stable"
 	}
+	if err := validatePlacementCoordinates(format, track, distro); err != nil {
+		return false, err
+	}
 	if filepath.Base(blob.Filename) != blob.Filename || blob.Filename == "" {
 		return false, fmt.Errorf("unsafe artifact filename %q", blob.Filename)
 	}
@@ -801,6 +851,75 @@ func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob
 	}
 	canonicalizeLock(lock)
 	return true, nil
+}
+
+func PromotePlacement(lock *RepositoryLock, format, packageName, version, track, distro string) (bool, error) {
+	if err := validatePlacementCoordinates(format, track, distro); err != nil {
+		return false, err
+	}
+	if !packageVersionExists(*lock, packageName, version) {
+		return false, fmt.Errorf("package version %s@%s is not recorded", packageName, version)
+	}
+	for _, placement := range lock.Placement {
+		if placement.Package == packageName && placement.Version == version && placement.Track == track && placement.Distro == distro {
+			return false, nil
+		}
+	}
+	lock.Placement = append(lock.Placement, Placement{Package: packageName, Version: version, Track: track, Distro: distro})
+	canonicalizeLock(lock)
+	return true, nil
+}
+
+func YankPlacements(lock *RepositoryLock, format, packageName, version, track, distro string, all bool) (int, error) {
+	if !packageVersionExists(*lock, packageName, version) {
+		return 0, fmt.Errorf("package version %s@%s is not recorded", packageName, version)
+	}
+	if all {
+		if track != "" || distro != "" {
+			return 0, errors.New("all-placement yank cannot select a track or distro")
+		}
+	} else if err := validatePlacementCoordinates(format, track, distro); err != nil {
+		return 0, err
+	}
+	kept := lock.Placement[:0]
+	removed := 0
+	for _, placement := range lock.Placement {
+		matches := placement.Package == packageName && placement.Version == version
+		if !all {
+			matches = matches && placement.Track == track && placement.Distro == distro
+		}
+		if matches {
+			removed++
+			continue
+		}
+		kept = append(kept, placement)
+	}
+	lock.Placement = kept
+	canonicalizeLock(lock)
+	return removed, nil
+}
+
+func packageVersionExists(lock RepositoryLock, packageName, version string) bool {
+	for _, packageVersion := range lock.PackageVersion {
+		if packageVersion.Package == packageName && packageVersion.Version == version {
+			return true
+		}
+	}
+	return false
+}
+
+func validatePlacementCoordinates(format, track, distro string) error {
+	if !placementCoordinatePattern.MatchString(track) {
+		return fmt.Errorf("invalid placement track %q", track)
+	}
+	if format == "deb" {
+		if !placementCoordinatePattern.MatchString(distro) {
+			return fmt.Errorf("invalid Debian placement distro %q", distro)
+		}
+	} else if distro != "" {
+		return fmt.Errorf("format %q does not support placement distros", format)
+	}
+	return nil
 }
 
 func HashFile(name string) (string, error) {

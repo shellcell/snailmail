@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
+	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/internal/testutil"
 	"github.com/shellcell/snailmail/signer"
@@ -298,6 +300,295 @@ func TestNewDebianRepositoryRequiresSigningOrExplicitOptOut(t *testing.T) {
 	request.AllowUnsigned = true
 	if err := SetupRepository(request); err != nil {
 		t.Fatalf("explicit unsigned Debian repository: %v", err)
+	}
+}
+
+func TestDebianSigningKeyRotationLifecycle(t *testing.T) {
+	root := t.TempDir()
+	command := exec.Command("git", "init", "-b", "main")
+	command.Dir = root
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := InitWorkspace(InitWorkspaceRequest{Root: root, Name: "rotation"}); err != nil {
+		t.Fatal(err)
+	}
+	store, err := filesigner.New(t.TempDir(), func() ([]byte, error) { return []byte("rotation-test-secret-value"), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseTime := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	oldKey, err := NewKey(context.Background(), NewKeyRequest{Root: root, Name: "archive-2026", CreatedAt: baseTime, ExpiresIn: 365 * 24 * time.Hour, Keys: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SetupRepository(SetupRepositoryRequest{
+		Root: root, Name: "debian", Format: "deb", HostType: "local", Output: "public/debian", Visibility: "public",
+		SigningKey: "archive-2026", Suite: "stable", Component: "main", Architectures: []string{"amd64"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := workspaceArtifact(t, root, "deb", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "debian", Artifacts: []string{artifact}}); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "configure rotation fixture")
+	applyAt := func(label string, at time.Time) buildgraph.RepositoryManifest {
+		t.Helper()
+		planName := filepath.Join(root, label+".json")
+		if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+			Root: root, Output: planName, createdAt: at, GeneratedAt: at, ExpiresIn: time.Hour,
+			VerificationMode: "structural", Signers: store,
+		}); err != nil {
+			t.Fatalf("%s plan: %v", label, err)
+		}
+		if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, now: at.Add(time.Minute), StructuralOnly: true}); err != nil {
+			t.Fatalf("%s apply: %v", label, err)
+		}
+		manifest, err := app.VerifyRepository(filepath.Join(root, "public", "debian"))
+		if err != nil {
+			t.Fatalf("%s verify: %v", label, err)
+		}
+		return manifest
+	}
+	initial := applyAt("initial", baseTime.Add(time.Hour))
+	keyringPath := initial.Install.SigningKeyPath
+	if initial.Install.SigningFingerprint != oldKey.Fingerprint || len(initial.Install.TrustedSigningFingerprints) != 1 {
+		t.Fatalf("initial signing metadata %#v", initial.Install)
+	}
+	rotationTime := baseTime.Add(2 * time.Hour)
+	minimumRefresh := time.Duration(state.MinimumSigningRefreshSeconds) * time.Second
+	stableManifest, err := state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanRef := signer.Ref{Backend: "file", ID: stableManifest.Workspace.ID + "/archive-2027"}
+	orphan, err := store.Generate(context.Background(), orphanRef, "archive-2027", rotationTime, 365*24*time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanKey, err := signingKeyFromGenerated("archive-2027", orphanRef, orphan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.WriteSigningPublic(root, orphanKey, orphan.PublicBinary, orphan.PublicArmor); err != nil {
+		t.Fatal(err)
+	}
+	started, err := RotateKey(context.Background(), RotateKeyRequest{
+		Root: root, Repository: "debian", Successor: "archive-2027", MinimumRefresh: minimumRefresh,
+		ExpiresIn: 365 * 24 * time.Hour, Keys: store, now: rotationTime,
+	})
+	if err != nil || started.Phase != "introducing" || started.ActiveKey != "archive-2026" || len(started.TrustedKeys) != 2 {
+		t.Fatalf("start rotation=%#v err=%v", started, err)
+	}
+	commitWorkspace(t, root, "introduce successor signing key")
+	if repeated, err := RotateKey(context.Background(), RotateKeyRequest{
+		Root: root, Repository: "debian", Successor: "archive-2027", MinimumRefresh: minimumRefresh, Keys: store, now: rotationTime,
+	}); err != nil || repeated.Phase != "introducing" {
+		t.Fatalf("idempotent committed rotation start=%#v err=%v", repeated, err)
+	}
+	introducedAt := rotationTime.Add(time.Hour)
+	introducedPlan := filepath.Join(root, "introduced.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: introducedPlan, createdAt: introducedAt, GeneratedAt: introducedAt, ExpiresIn: time.Hour,
+		VerificationMode: "structural", Signers: store,
+	}); err != nil {
+		t.Fatalf("introduced plan: %v", err)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: introducedPlan, now: introducedAt.Add(time.Minute), StructuralOnly: true,
+		beforeDeploymentCommit: func() error { return errors.New("simulated process interruption") },
+	}); err == nil {
+		t.Fatal("introduction unexpectedly recorded receipt after simulated interruption")
+	}
+	if result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: introducedPlan, now: introducedAt.Add(2 * time.Minute), StructuralOnly: true}); err != nil || result.Current != 1 {
+		t.Fatalf("introduction receipt recovery=%#v err=%v", result, err)
+	}
+	introduced, err := app.VerifyRepository(filepath.Join(root, "public", "debian"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := manifest.Keys["archive-2027"]
+	if introduced.Install.SigningKeyPath != keyringPath || introduced.Install.SigningFingerprint != oldKey.Fingerprint ||
+		!reflect.DeepEqual(introduced.Install.TrustedSigningFingerprints, []string{oldKey.Fingerprint, successor.Fingerprint}) {
+		t.Fatalf("introduced signing metadata %#v", introduced.Install)
+	}
+	if _, err := RotateKey(context.Background(), RotateKeyRequest{Root: root, Repository: "debian", Advance: true, now: introducedAt.Add(minimumRefresh)}); err == nil {
+		t.Fatal("rotation advanced before the post-publication refresh window")
+	}
+	introductionReceipt, err := state.LoadDeployment(root, "debian")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trustSince, err := time.Parse(time.RFC3339, introductionReceipt.TrustSince)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptPath := filepath.Join(root, "deployments", "debian.json")
+	receiptContent, err := os.ReadFile(receiptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forgedReceipt := introductionReceipt
+	forgedReceipt.TrustSince = trustSince.Add(-minimumRefresh).Format(time.RFC3339)
+	forgedContent, err := json.MarshalIndent(forgedReceipt, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(receiptPath, append(forgedContent, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RotateKey(context.Background(), RotateKeyRequest{Root: root, Repository: "debian", Advance: true, now: trustSince.Add(minimumRefresh)}); err == nil {
+		t.Fatal("uncommitted backdated deployment receipt authorized activation")
+	}
+	if err := os.WriteFile(receiptPath, receiptContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	directManifest, err := state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directRepository := directManifest.Repositories["debian"]
+	directRepository.SigningRotation.Phase = "activated"
+	directManifest.Repositories["debian"] = directRepository
+	if err := state.WriteManifest(root, directManifest); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "attempt early direct activation")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: filepath.Join(root, "direct-activation.json"), createdAt: trustSince.Add(time.Hour), GeneratedAt: trustSince.Add(time.Hour), ExpiresIn: time.Hour,
+		VerificationMode: "structural", Signers: store,
+	}); err == nil {
+		t.Fatal("direct manifest edit bypassed introduction refresh window")
+	}
+	directRepository.SigningRotation.Phase = "introducing"
+	directManifest.Repositories["debian"] = directRepository
+	if err := state.WriteManifest(root, directManifest); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "restore introducing rotation state")
+	directManifest, err = state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directRepository = directManifest.Repositories["debian"]
+	directRepository.SigningKeys = []string{"archive-2027"}
+	directRepository.SigningRotation = nil
+	directManifest.Repositories["debian"] = directRepository
+	if err := state.WriteManifest(root, directManifest); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "attempt to skip activated overlap")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: filepath.Join(root, "direct-retirement.json"), createdAt: trustSince.Add(minimumRefresh + time.Hour), GeneratedAt: trustSince.Add(minimumRefresh + time.Hour), ExpiresIn: time.Hour,
+		VerificationMode: "structural", Signers: store,
+	}); err == nil {
+		t.Fatal("direct manifest edit skipped the activated deployment phase")
+	}
+	directRepository.SigningKeys = []string{"archive-2026"}
+	directRepository.SigningRotation = &state.SigningRotation{SuccessorKey: "archive-2027", Phase: "introducing", MinimumRefreshSeconds: int64(minimumRefresh / time.Second)}
+	directManifest.Repositories["debian"] = directRepository
+	if err := state.WriteManifest(root, directManifest); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "restore introduction before activation")
+	if audit, err := AuditKeys(PublishKeyRequest{Root: root}, trustSince.Add(time.Hour)); err != nil || len(audit.Rotations) != 1 || !audit.Rotations[0].Deployed || audit.Rotations[0].Ready {
+		t.Fatalf("introduction audit=%#v err=%v", audit, err)
+	}
+	activatedState, err := RotateKey(context.Background(), RotateKeyRequest{Root: root, Repository: "debian", Advance: true, now: trustSince.Add(minimumRefresh)})
+	if err != nil || activatedState.Phase != "activated" || activatedState.ActiveKey != "archive-2027" {
+		t.Fatalf("activate rotation=%#v err=%v", activatedState, err)
+	}
+	commitWorkspace(t, root, "activate successor signing key")
+	activatedAt := trustSince.Add(minimumRefresh + time.Hour)
+	activated := applyAt("activated", activatedAt)
+	if activated.Install.SigningKeyPath != keyringPath || activated.Install.SigningFingerprint != successor.Fingerprint ||
+		!reflect.DeepEqual(activated.Install.TrustedSigningFingerprints, []string{oldKey.Fingerprint, successor.Fingerprint}) {
+		t.Fatalf("activated signing metadata %#v", activated.Install)
+	}
+	activationReceipt, err := state.LoadDeployment(root, "debian")
+	if err != nil {
+		t.Fatal(err)
+	}
+	activationTrustSince, err := time.Parse(time.RFC3339, activationReceipt.TrustSince)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directManifest, err = state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directRepository = directManifest.Repositories["debian"]
+	directRepository.SigningKeys = []string{"archive-2027"}
+	directRepository.SigningRotation = nil
+	directManifest.Repositories["debian"] = directRepository
+	if err := state.WriteManifest(root, directManifest); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "attempt early direct retirement")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: filepath.Join(root, "early-retirement.json"), createdAt: activationTrustSince.Add(time.Hour), GeneratedAt: activationTrustSince.Add(time.Hour), ExpiresIn: time.Hour,
+		VerificationMode: "structural", Signers: store,
+	}); err == nil {
+		t.Fatal("direct manifest edit bypassed activated overlap window")
+	}
+	directRepository.SigningKeys = []string{"archive-2026"}
+	directRepository.SigningRotation = &state.SigningRotation{SuccessorKey: "archive-2027", Phase: "activated", MinimumRefreshSeconds: int64(minimumRefresh / time.Second)}
+	directManifest.Repositories["debian"] = directRepository
+	if err := state.WriteManifest(root, directManifest); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "restore activated overlap state")
+	if _, err := RotateKey(context.Background(), RotateKeyRequest{Root: root, Repository: "debian", Advance: true, now: activationTrustSince.Add(minimumRefresh - time.Second)}); err == nil {
+		t.Fatal("old trust retired before activated overlap elapsed")
+	}
+	retiredState, err := RotateKey(context.Background(), RotateKeyRequest{Root: root, Repository: "debian", Advance: true, now: activationTrustSince.Add(minimumRefresh)})
+	if err != nil || retiredState.Phase != "stable" || retiredState.ActiveKey != "archive-2027" || len(retiredState.TrustedKeys) != 1 {
+		t.Fatalf("retire old key=%#v err=%v", retiredState, err)
+	}
+	if _, err := RotateKey(context.Background(), RotateKeyRequest{Root: root, Repository: "debian", Advance: true, now: activationTrustSince.Add(minimumRefresh)}); err == nil {
+		t.Fatal("uncommitted retirement state authorized another transition")
+	}
+	commitWorkspace(t, root, "retire old signing key")
+	retired := applyAt("retired", activationTrustSince.Add(minimumRefresh+time.Hour))
+	if retired.Install.SigningKeyPath != keyringPath || retired.Install.SigningFingerprint != successor.Fingerprint ||
+		!reflect.DeepEqual(retired.Install.TrustedSigningFingerprints, []string{successor.Fingerprint}) {
+		t.Fatalf("retired signing metadata %#v", retired.Install)
+	}
+	if repeated, err := RotateKey(context.Background(), RotateKeyRequest{Root: root, Repository: "debian", Advance: true, now: activationTrustSince.Add(minimumRefresh + 2*time.Hour)}); err != nil || repeated.Phase != "stable" || repeated.RequiresDeploy {
+		t.Fatalf("retry completed retirement=%#v err=%v", repeated, err)
+	}
+	if audit, err := AuditKeys(PublishKeyRequest{Root: root}, activationTrustSince.Add(minimumRefresh+2*time.Hour)); err != nil || len(audit.Rotations) != 0 {
+		t.Fatalf("retired audit=%#v err=%v", audit, err)
+	}
+}
+
+func TestDeploymentTrustClockResetsAfterPublicationDrift(t *testing.T) {
+	trusted := []string{strings.Repeat("a", 40), strings.Repeat("b", 40)}
+	previous := state.DeploymentRecord{
+		NativeRevision: "old-native", TreeSHA256: strings.Repeat("c", 64), ManifestSHA256: strings.Repeat("d", 64),
+		ActiveSigningFingerprint: trusted[0], TrustedSigningFingerprints: trusted,
+		SigningKeyringPath: "keys/debian-archive-keyring.gpg", SigningRotationPhase: "introducing", SigningMinimumRefreshSeconds: state.MinimumSigningRefreshSeconds,
+		TrustSince: "2026-07-01T00:00:00Z",
+	}
+	planned := state.PlanRepository{Name: "debian", ChangeID: "debian:" + strings.Repeat("e", 12), DesiredTreeSHA256: strings.Repeat("e", 64), DesiredManifestSHA256: strings.Repeat("f", 64)}
+	signingState := deploymentSigningState{active: trusted[0], trusted: trusted, keyring: "keys/debian-archive-keyring.gpg", phase: "introducing", minimumRefresh: state.MinimumSigningRefreshSeconds}
+	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	continuous := deploymentRecordFor(planned, previous, host.PublishedRevision{
+		NativeRevision: previous.NativeRevision, TreeSHA256: previous.TreeSHA256, ManifestSHA256: previous.ManifestSHA256,
+	}, signingState, "new-native", strings.Repeat("1", 64), now.Format(time.RFC3339), now)
+	if continuous.TrustSince != previous.TrustSince {
+		t.Fatalf("continuous trust clock changed to %q", continuous.TrustSince)
+	}
+	republished := deploymentRecordFor(planned, previous, host.PublishedRevision{
+		NativeRevision: "drifted", TreeSHA256: strings.Repeat("2", 64), ManifestSHA256: strings.Repeat("3", 64),
+	}, signingState, "new-native", strings.Repeat("1", 64), now.Format(time.RFC3339), now)
+	if republished.TrustSince != now.Format(time.RFC3339) {
+		t.Fatalf("republished trust clock did not reset: %q", republished.TrustSince)
 	}
 }
 
@@ -637,22 +928,15 @@ func TestMissingDeploymentReceiptForcesRecoverableReconciliation(t *testing.T) {
 	}
 }
 
-func TestDeploymentReceiptRequiresMatchingPublicationIdentity(t *testing.T) {
+func TestDeploymentReceiptCanAuthorizeRemovalOnlyPublication(t *testing.T) {
 	tree := strings.Repeat("b", 64)
 	deployment := state.DeploymentRecord{
 		Repository: "python", PlanID: strings.Repeat("a", 64), ChangeID: "python:" + tree[:12],
 		TreeSHA256: tree, ManifestSHA256: strings.Repeat("c", 64), NativeRevision: "native",
 	}
 	observed := host.PublishedRevision{NativeRevision: "native"}
-	wrongLedger := []state.PublicationRecord{{
-		Repository: "python", PlanID: strings.Repeat("d", 64), ChangeID: deployment.ChangeID, TreeSHA256: tree,
-	}}
-	if deploymentMatchesDesired(deployment, observed, tree, deployment.ManifestSHA256, wrongLedger) {
-		t.Fatal("deployment with unrelated publication plan was accepted")
-	}
-	wrongLedger[0].PlanID = deployment.PlanID
-	if !deploymentMatchesDesired(deployment, observed, tree, deployment.ManifestSHA256, wrongLedger) {
-		t.Fatal("deployment with matching publication identity was rejected")
+	if !deploymentMatchesDesired(deployment, observed, tree, deployment.ManifestSHA256, deploymentSigningState{}) {
+		t.Fatal("authoritative removal-only deployment receipt was rejected")
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/shellcell/snailmail/engine"
 	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/internal/wire"
+	"github.com/shellcell/snailmail/signer"
 )
 
 const defaultGeneratedAt = "1970-01-01T00:00:00Z"
@@ -44,6 +45,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runSetup(args[1:], stdout, stderr)
 	case "add":
 		return runAdd(ctx, args[1:], stdout, stderr)
+	case "promote":
+		return runPromote(args[1:], stdout, stderr)
+	case "yank":
+		return runYank(args[1:], stdout, stderr)
 	case "blob-store":
 		return runBlobStore(ctx, args[1:], stdout, stderr)
 	case "plan":
@@ -108,6 +113,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	approvalKeys := flags.String("approval-keys", "", "comma-separated allowed Ed25519 public keys")
 	signingKey := flags.String("signing-key", "", "repository signing key name")
 	allowUnsigned := flags.Bool("allow-unsigned", false, "explicitly allow a new unsigned Debian repository")
+	track := flags.String("track", "stable", "rendered placement track")
 	bucket := flags.String("bucket", "", "S3 bucket")
 	prefix := flags.String("prefix", "", "S3 object prefix")
 	region := flags.String("region", "", "AWS region")
@@ -140,7 +146,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 		ReadAuth:     *readAuth, CredentialBroker: *credentialBroker,
 		RemoteRepository: *githubRepository, Branch: *githubBranch, PreviewRepository: *githubPreviewRepository,
 		PreviewBranch: *githubPreviewBranch, PreviewEndpoint: *githubPreviewEndpoint,
-		Suite: *suite, Component: *component, Architectures: splitList(*architectures),
+		Track: *track, Suite: *suite, Component: *component, Architectures: splitList(*architectures),
 	}); err != nil {
 		return err
 	}
@@ -156,7 +162,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 
 func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail keys <new|publish|audit> [options]")
+		return errors.New("usage: snailmail keys <new|publish|rotate|audit> [options]")
 	}
 	switch args[0] {
 	case "new":
@@ -214,6 +220,56 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fmt.Fprintf(stdout, "📦  published public forms for %s\n", result.Name)
 		fmt.Fprintf(stdout, "✉️   fingerprint %s\n", result.Fingerprint)
 		return nil
+	case "rotate":
+		if len(args) < 2 {
+			return errors.New("usage: snailmail keys rotate REPOSITORY --successor KEY [--minimum-refresh 720h] | --advance --yes")
+		}
+		repository := args[1]
+		flags := flag.NewFlagSet("keys rotate", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		workspace := flags.String("workspace", ".", "workspace root")
+		successor := flags.String("successor", "", "successor signing key name")
+		advance := flags.Bool("advance", false, "advance the deployed rotation to its next phase")
+		minimumRefresh := flags.Duration("minimum-refresh", 30*24*time.Hour, "minimum client keyring refresh window")
+		expiresIn := flags.Duration("expires-in", 2*365*24*time.Hour, "new successor key validity")
+		confirmed := flags.Bool("yes", false, "confirm an advance transition")
+		if err := flags.Parse(args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		if *advance && !*confirmed {
+			return errors.New("keys rotate --advance requires --yes")
+		}
+		if !*advance && *successor == "" {
+			return errors.New("keys rotate requires --successor when starting a rotation")
+		}
+		var keyGenerator signer.Generator
+		var err error
+		if !*advance {
+			keyGenerator, err = wire.NewSignerStore()
+			if err != nil {
+				return err
+			}
+		}
+		result, err := engine.RotateKey(ctx, engine.RotateKeyRequest{
+			Root: *workspace, Repository: repository, Successor: *successor, Advance: *advance,
+			MinimumRefresh: *minimumRefresh, ExpiresIn: *expiresIn, Keys: keyGenerator,
+		})
+		if err != nil {
+			return err
+		}
+		printBrand(stdout)
+		fmt.Fprintf(stdout, "📦  signing rotation for %s is %s\n", result.Repository, result.Phase)
+		fmt.Fprintf(stdout, "✉️   active %s; trusted %s\n", result.ActiveKey, strings.Join(result.TrustedKeys, ", "))
+		if result.EarliestAdvance != "" {
+			fmt.Fprintf(stdout, "    earliest next transition %s\n", result.EarliestAdvance)
+		}
+		if result.RequiresDeploy {
+			fmt.Fprintln(stdout, "    commit this state, then run plan and apply")
+		}
+		return nil
 	case "audit":
 		flags := flag.NewFlagSet("keys audit", flag.ContinueOnError)
 		flags.SetOutput(stderr)
@@ -231,7 +287,15 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		printBrand(stdout)
 		if len(result.Findings) == 0 {
 			fmt.Fprintln(stdout, "📦  signing keys and repository compatibility are valid")
-			return nil
+		}
+		for _, rotation := range result.Rotations {
+			state := "awaiting deployment"
+			if rotation.Deployed && rotation.Ready {
+				state = "ready to advance"
+			} else if rotation.Deployed {
+				state = "waiting until " + rotation.EarliestAdvance
+			}
+			fmt.Fprintf(stdout, "📦  rotation %s is %s: %s\n", rotation.Repository, rotation.Phase, state)
 		}
 		hasErrors := false
 		for _, finding := range result.Findings {
@@ -273,6 +337,63 @@ func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	fmt.Fprintln(stdout)
 	for _, packageVersion := range result.Packages {
 		fmt.Fprintf(stdout, "✉️   %s\n", packageVersion)
+	}
+	return nil
+}
+
+func runPromote(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("promote", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	track := flags.String("track", "stable", "destination placement track")
+	distro := flags.String("distro", "", "Debian placement distro (defaults to repository suite)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 3 {
+		return errors.New("usage: snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
+	}
+	result, err := engine.Promote(engine.PlacementMutationRequest{
+		Root: *workspace, Repository: flags.Arg(0), Package: flags.Arg(1), Version: flags.Arg(2), Track: *track, Distro: *distro,
+	})
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	if result.Changed == 0 {
+		fmt.Fprintf(stdout, "📦  placement %s@%s is already present in %s/%s\n", result.Package, result.Version, result.Repository, result.Track)
+	} else {
+		fmt.Fprintf(stdout, "📦  placed %s@%s in %s/%s\n", result.Package, result.Version, result.Repository, result.Track)
+	}
+	return nil
+}
+
+func runYank(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("yank", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	track := flags.String("track", "", "placement track to remove")
+	distro := flags.String("distro", "", "Debian placement distro (defaults to repository suite)")
+	all := flags.Bool("all", false, "remove every placement for the package version")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 3 || (*all == (*track != "")) || (*all && *distro != "") {
+		return errors.New("usage: snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
+	}
+	result, err := engine.Yank(engine.PlacementMutationRequest{
+		Root: *workspace, Repository: flags.Arg(0), Package: flags.Arg(1), Version: flags.Arg(2), Track: *track, Distro: *distro, All: *all,
+	})
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	if result.All {
+		fmt.Fprintf(stdout, "📦  removed %d %s for %s@%s from %s\n", result.Changed, plural(result.Changed, "placement", "placements"), result.Package, result.Version, result.Repository)
+	} else if result.Changed == 0 {
+		fmt.Fprintf(stdout, "📦  placement %s@%s is already absent from %s/%s\n", result.Package, result.Version, result.Repository, result.Track)
+	} else {
+		fmt.Fprintf(stdout, "📦  removed %s@%s from %s/%s\n", result.Package, result.Version, result.Repository, result.Track)
 	}
 	return nil
 }
@@ -761,11 +882,15 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm> --name NAME --output DIR")
 	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail add REPOSITORY ARTIFACT...")
+	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
+	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail blob-store s3 --bucket BUCKET [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
 	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")
 	fmt.Fprintln(output, "  snailmail keys new NAME [--algo openpgp-rsa4096]")
 	fmt.Fprintln(output, "  snailmail keys publish NAME")
+	fmt.Fprintln(output, "  snailmail keys rotate REPOSITORY --successor KEY [--minimum-refresh 720h]")
+	fmt.Fprintln(output, "  snailmail keys rotate REPOSITORY --advance --yes")
 	fmt.Fprintln(output, "  snailmail keys audit")
 	fmt.Fprintln(output, "  snailmail approve --plan PLAN --repository NAME --key FILE --yes")
 	fmt.Fprintln(output, "  snailmail render [--output site]")

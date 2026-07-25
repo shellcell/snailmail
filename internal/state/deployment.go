@@ -30,11 +30,8 @@ func LoadDeployment(root, repository string) (DeploymentRecord, error) {
 	if err := jsonstrict.Decode(content, &record, 1<<20); err != nil {
 		return DeploymentRecord{}, err
 	}
-	if record.SchemaVersion != DeploymentSchema || record.Repository != repository || !validDeploymentIdentity(record) {
-		return DeploymentRecord{}, errors.New("invalid deployment record")
-	}
-	if _, err := time.Parse(time.RFC3339, record.DeployedAt); err != nil {
-		return DeploymentRecord{}, errors.New("invalid deployment timestamp")
+	if err := ValidateDeploymentRecord(record, repository); err != nil {
+		return DeploymentRecord{}, err
 	}
 	canonical, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
@@ -78,11 +75,11 @@ func CommitDeployments(root, planID, baseRevision string, records []DeploymentRe
 			return "", errors.New("duplicate deployment record")
 		}
 		record.SchemaVersion = DeploymentSchema
-		if err := ValidateRepositoryName(record.Repository); err != nil || !validDeploymentIdentity(record) {
+		if err := ValidateRepositoryName(record.Repository); err != nil {
 			return "", errors.New("invalid deployment record")
 		}
-		if _, err := time.Parse(time.RFC3339, record.DeployedAt); err != nil {
-			return "", errors.New("invalid deployment timestamp")
+		if err := ValidateDeploymentRecord(record, record.Repository); err != nil {
+			return "", err
 		}
 		content, err := json.MarshalIndent(record, "", "  ")
 		if err != nil {
@@ -116,6 +113,58 @@ func validDeploymentIdentity(record DeploymentRecord) bool {
 	return validSHA256(record.PlanID) && validSHA256(record.TreeSHA256) &&
 		(record.ManifestSHA256 == "" || validSHA256(record.ManifestSHA256)) && record.NativeRevision != "" &&
 		record.ChangeID == record.Repository+":"+record.TreeSHA256[:12]
+}
+
+func ValidateDeploymentRecord(record DeploymentRecord, repository string) error {
+	if record.SchemaVersion == 0 && record.Repository == "" && record.PlanID == "" && record.ChangeID == "" && record.TreeSHA256 == "" && record.ManifestSHA256 == "" &&
+		record.NativeRevision == "" && record.DeployedAt == "" && record.ActiveSigningFingerprint == "" && record.SigningKeyringPath == "" &&
+		len(record.TrustedSigningFingerprints) == 0 && record.SigningRotationPhase == "" && record.SigningMinimumRefreshSeconds == 0 && record.TrustSince == "" {
+		return nil
+	}
+	if (record.SchemaVersion != 1 && record.SchemaVersion != DeploymentSchema) || record.Repository != repository || !validDeploymentIdentity(record) || !validDeploymentSigning(record) {
+		return errors.New("invalid deployment record")
+	}
+	if _, err := time.Parse(time.RFC3339, record.DeployedAt); err != nil {
+		return errors.New("invalid deployment timestamp")
+	}
+	return nil
+}
+
+func validDeploymentSigning(record DeploymentRecord) bool {
+	if record.SchemaVersion == 1 {
+		return record.ActiveSigningFingerprint == "" && len(record.TrustedSigningFingerprints) == 0 && record.SigningKeyringPath == "" && record.SigningRotationPhase == "" && record.SigningMinimumRefreshSeconds == 0 && record.TrustSince == ""
+	}
+	if record.ActiveSigningFingerprint == "" {
+		return len(record.TrustedSigningFingerprints) == 0 && record.SigningKeyringPath == "" && record.SigningRotationPhase == "" && record.SigningMinimumRefreshSeconds == 0 && record.TrustSince == ""
+	}
+	if !fingerprintPattern.MatchString(record.ActiveSigningFingerprint) || len(record.TrustedSigningFingerprints) == 0 ||
+		validateRelativePath(record.SigningKeyringPath) != nil || !strings.HasPrefix(record.SigningKeyringPath, "keys/") || !strings.HasSuffix(record.SigningKeyringPath, ".gpg") ||
+		(record.SigningRotationPhase != "" && record.SigningRotationPhase != "introducing" && record.SigningRotationPhase != "activated") {
+		return false
+	}
+	if (record.SigningRotationPhase == "" && record.SigningMinimumRefreshSeconds != 0) ||
+		(record.SigningRotationPhase != "" && record.SigningMinimumRefreshSeconds < MinimumSigningRefreshSeconds) {
+		return false
+	}
+	if (record.SigningRotationPhase == "" && (len(record.TrustedSigningFingerprints) != 1 || record.ActiveSigningFingerprint != record.TrustedSigningFingerprints[0])) ||
+		(record.SigningRotationPhase == "introducing" && (len(record.TrustedSigningFingerprints) != 2 || record.ActiveSigningFingerprint != record.TrustedSigningFingerprints[0])) ||
+		(record.SigningRotationPhase == "activated" && (len(record.TrustedSigningFingerprints) != 2 || record.ActiveSigningFingerprint != record.TrustedSigningFingerprints[1])) {
+		return false
+	}
+	foundActive := false
+	seen := make(map[string]bool)
+	for _, fingerprint := range record.TrustedSigningFingerprints {
+		if !fingerprintPattern.MatchString(fingerprint) || seen[fingerprint] {
+			return false
+		}
+		seen[fingerprint] = true
+		foundActive = foundActive || fingerprint == record.ActiveSigningFingerprint
+	}
+	if !foundActive {
+		return false
+	}
+	_, err := time.Parse(time.RFC3339, record.TrustSince)
+	return err == nil
 }
 
 func commitManagedPaths(root, planID, baseRevision string, relativePaths []string, subject string) (string, error) {

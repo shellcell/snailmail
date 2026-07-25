@@ -103,6 +103,40 @@ func InspectPublic(content []byte) (signer.Identity, error) {
 	return inspectEntity(entities[0])
 }
 
+func InspectPublicKeyring(content []byte) ([]signer.Identity, error) {
+	entities, err := protonopenpgp.ReadKeyRing(bytes.NewReader(content))
+	if err != nil || len(entities) == 0 {
+		return nil, errors.New("invalid OpenPGP public keyring")
+	}
+	identities := make([]signer.Identity, 0, len(entities))
+	for _, entity := range entities {
+		identity, err := inspectEntity(entity)
+		if err != nil {
+			return nil, err
+		}
+		identities = append(identities, identity)
+	}
+	return identities, nil
+}
+
+func ExtractPublicKey(content []byte, fingerprint string) ([]byte, error) {
+	entities, err := protonopenpgp.ReadKeyRing(bytes.NewReader(content))
+	if err != nil {
+		return nil, errors.New("invalid OpenPGP public keyring")
+	}
+	for _, entity := range entities {
+		identity, err := inspectEntity(entity)
+		if err != nil {
+			return nil, err
+		}
+		if identity.Fingerprint == fingerprint {
+			binary, _, err := serializePublic(entity)
+			return binary, err
+		}
+	}
+	return nil, errors.New("OpenPGP public keyring does not contain fingerprint")
+}
+
 func InspectArmoredPublic(content []byte) (signer.Identity, error) {
 	entities, err := protonopenpgp.ReadArmoredKeyRing(bytes.NewReader(content))
 	if err != nil || len(entities) != 1 {

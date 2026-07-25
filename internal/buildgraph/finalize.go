@@ -17,11 +17,11 @@ import (
 
 const (
 	ManifestFilename = "snailmail.repository.json"
-	ManifestSchema   = 2
+	ManifestSchema   = 3
 )
 
 func SupportedManifestSchema(schema int) bool {
-	return schema == 1 || schema == ManifestSchema
+	return schema == 1 || schema == 2 || schema == ManifestSchema
 }
 
 type ManifestFile struct {

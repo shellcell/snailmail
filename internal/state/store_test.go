@@ -75,6 +75,65 @@ type = "local"
 	}
 }
 
+func TestLoadManifestMigratesSchemaFiveSigningKeyring(t *testing.T) {
+	root := t.TempDir()
+	manifest := Manifest{
+		SchemaVersion: ManifestSchema,
+		Workspace:     Workspace{Name: "rotation", ID: strings.Repeat("a", 64)},
+		BlobStore:     BlobStoreConfig{Type: "local"},
+		Keys: map[string]SigningKey{"archive": {
+			Algorithm: "openpgp-rsa4096", Usage: "sign", Fingerprint: strings.Repeat("b", 40),
+			CreatedAt: "2026-01-01T00:00:00Z", ExpiresAt: "2028-01-01T00:00:00Z",
+			PublicKeyPath: "keys/archive.gpg", PublicKeySHA256: strings.Repeat("c", 64),
+			PublicArmorPath: "keys/archive.asc", PublicArmorSHA256: strings.Repeat("d", 64),
+			Ref: KeyRef{Backend: "file", ID: strings.Repeat("a", 64) + "/archive"},
+		}},
+		Repositories: map[string]Repository{"debian": {
+			Format: "deb", Lock: "repos/debian.lock.toml", Visibility: "public", Gate: "auto",
+			Track: "stable",
+			Host:  HostConfig{Type: "local", Path: "public/debian"}, SigningKeys: []string{"archive"},
+			SigningKeyring: "keys/debian-archive-keyring.gpg", Suite: "stable", Component: "main", Architectures: []string{"amd64"},
+		}},
+	}
+	if err := WriteManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	name := filepath.Join(root, ManifestFilename)
+	content, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content = []byte(strings.Replace(string(content), "schema_version = 7", "schema_version = 5", 1))
+	content = []byte(strings.Replace(string(content), "signing_keyring = 'keys/debian-archive-keyring.gpg'\n", "", 1))
+	content = []byte(strings.Replace(string(content), "signing_keyring = \"keys/debian-archive-keyring.gpg\"\n", "", 1))
+	content = []byte(strings.Replace(string(content), "track = 'stable'\n", "", 1))
+	content = []byte(strings.Replace(string(content), "track = \"stable\"\n", "", 1))
+	if err := os.WriteFile(name, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Repositories["debian"].SigningKeyring != "keys/archive.gpg" {
+		t.Fatalf("migrated keyring path = %q", loaded.Repositories["debian"].SigningKeyring)
+	}
+	if loaded.Repositories["debian"].Track != "stable" {
+		t.Fatalf("migrated rendered track = %q", loaded.Repositories["debian"].Track)
+	}
+	repository := loaded.Repositories["debian"]
+	repository.SigningRotation = &SigningRotation{SuccessorKey: "archive", Phase: "introducing", MinimumRefreshSeconds: MinimumSigningRefreshSeconds}
+	loaded.Repositories["debian"] = repository
+	if err := WriteManifest(root, loaded); err == nil {
+		t.Fatal("rotation accepted active key as its own successor")
+	}
+	repository.SigningRotation = &SigningRotation{SuccessorKey: "missing", Phase: "introducing", MinimumRefreshSeconds: MinimumSigningRefreshSeconds - 1}
+	loaded.Repositories["debian"] = repository
+	if err := WriteManifest(root, loaded); err == nil {
+		t.Fatal("rotation accepted missing successor and short refresh window")
+	}
+}
+
 func TestValidateBlobStoreRejectsSecretsAndUnsafeConfiguration(t *testing.T) {
 	for _, configuration := range []BlobStoreConfig{
 		{Type: "local", Bucket: "unexpected"},

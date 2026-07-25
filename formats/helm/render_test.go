@@ -55,6 +55,16 @@ func TestBuildRejectsDifferentBytesForSameChartVersion(t *testing.T) {
 	}
 }
 
+func TestBuildRendersEmptyRepository(t *testing.T) {
+	artifact, err := Build(nil, BuildOptions{GeneratedAt: time.Unix(0, 0).UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index := generatedContent(artifact, "index.yaml"); !strings.Contains(index, "entries:\n") || len(artifact.VerificationCases) != 0 {
+		t.Fatalf("empty Helm artifact %#v", artifact)
+	}
+}
+
 func TestBuildDeduplicatesIdenticalChartInputs(t *testing.T) {
 	chart := chartBlob(t, "snail-demo", "1.2.3")
 	artifact, err := Build([]domain.Blob{chart, chart}, BuildOptions{GeneratedAt: time.Unix(0, 0).UTC()})

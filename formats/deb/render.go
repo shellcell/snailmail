@@ -50,9 +50,6 @@ type releaseFile struct {
 // Build renders deterministic unsigned apt metadata. The workspace engine may
 // resolve and assemble repository-signing effects before finalization.
 func Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
-	if len(blobs) == 0 {
-		return domain.RepositoryArtifact{}, fmt.Errorf("at least one Debian package is required")
-	}
 	if !coordinatePattern.MatchString(options.Suite) || !coordinatePattern.MatchString(options.Component) {
 		return domain.RepositoryArtifact{}, fmt.Errorf("suite and component must be safe path segments")
 	}

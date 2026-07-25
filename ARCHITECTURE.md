@@ -519,6 +519,17 @@ manifest transaction. Gate handling determines whether that transaction is
 committed on the current branch, proposed in a review branch, or held for
 approval. Deployment always reconciles committed desired state.
 
+`promote` adds one exact repository-local package-version placement. `yank`
+removes either one explicitly selected track or, with `--all`, every placement
+for that version. Both preserve package-version records, blob bindings, and
+publication ledgers. A removal-only plan declares that it has no publication
+record effects, and removing the final placement renders a deterministic empty
+repository rather than deleting historical state.
+Repository rendering selects only placements matching the repository's
+configured track. Debian also requires the placement distro to match its suite;
+coordinates for other views remain desired state but cannot leak into the
+configured output.
+
 ### 8.1 Artifact ingestion
 
 `snailmail add` performs this transaction:
@@ -972,6 +983,15 @@ The phase numbers below use the canonical roadmap in `PLAN.md` §14:
    identity and plan state are list-shaped for future overlap rotation, while
    the first backend currently permits one active key. Apply replays those
    public responses and never resolves private key references.
+
+   Debian key rotation is a receipt-backed state machine. `introducing` keeps
+   the old active signer and publishes an ordered old-plus-successor binary
+   keyring at a stable path. `activated` signs with the successor while retaining
+   both public identities. Retirement rewrites trust to successor-only. Each
+   transition requires the exact prior trust tuple in a canonical deployment
+   receipt and a minimum seven-day refresh interval measured from that receipt's
+   `trust_since`; manifest, plan, and staging timestamps grant no transition
+   authority.
 5. **Phase 4:** add read-only foreign observation before irreversible remote
    publication targets.
 6. **Phase 5:** add optional server, console, forge-app, attestation, and

@@ -29,9 +29,6 @@ func NormalizeName(name string) string {
 
 // Build renders a PEP 503 repository description without performing I/O.
 func Build(blobs []domain.Blob) (domain.RepositoryArtifact, error) {
-	if len(blobs) == 0 {
-		return domain.RepositoryArtifact{}, fmt.Errorf("at least one PyPI distribution is required")
-	}
 	projects := make(map[string]*project)
 	for _, blob := range blobs {
 		if err := validateBlob(blob); err != nil {

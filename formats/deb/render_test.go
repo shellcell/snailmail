@@ -80,6 +80,21 @@ func TestBuildRejectsDifferentBytesForSameIdentity(t *testing.T) {
 	}
 }
 
+func TestBuildRendersEmptyRepository(t *testing.T) {
+	artifact, err := Build(nil, BuildOptions{
+		Suite: "stable", Component: "main", Architectures: []string{"amd64"}, GeneratedAt: time.Unix(0, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := generatedContent(artifact, "dists/stable/main/binary-amd64/Packages"); got != "" {
+		t.Fatalf("empty Packages = %q", got)
+	}
+	if generatedContent(artifact, "dists/stable/Release") == "" || len(artifact.VerificationCases) != 0 {
+		t.Fatalf("empty Debian artifact %#v", artifact)
+	}
+}
+
 func TestBuildRejectsArchitectureWithoutVerifierPlatform(t *testing.T) {
 	blob := testBlob(t, "snail-demo", "1.2.3-1", "all")
 	_, err := Build([]domain.Blob{blob}, BuildOptions{

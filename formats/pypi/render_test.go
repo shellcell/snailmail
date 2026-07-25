@@ -78,6 +78,16 @@ func TestBuildRejectsInvalidDigest(t *testing.T) {
 	}
 }
 
+func TestBuildRendersEmptyRepository(t *testing.T) {
+	artifact, err := Build(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generatedContent(artifact, "simple/index.html") == "" || len(artifact.VerificationCases) != 0 {
+		t.Fatalf("empty PyPI artifact %#v", artifact)
+	}
+}
+
 func generatedContent(artifact domain.RepositoryArtifact, name string) string {
 	for _, file := range artifact.Files {
 		if file.Path == name {

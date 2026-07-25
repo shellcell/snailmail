@@ -44,6 +44,21 @@ func RequireGitRepository(root string) error {
 }
 
 func RequireCleanGit(root string) (string, error) {
+	return requireCleanGit(root, nil)
+}
+
+func RequireCleanGitAllowingUntracked(root string, relativePaths []string) (string, error) {
+	allowed := make(map[string]bool, len(relativePaths))
+	for _, name := range relativePaths {
+		if err := validateRelativePath(name); err != nil {
+			return "", err
+		}
+		allowed[filepath.ToSlash(name)] = true
+	}
+	return requireCleanGit(root, allowed)
+}
+
+func requireCleanGit(root string, allowedUntracked map[string]bool) (string, error) {
 	if err := requireCompleteGitHistory(root); err != nil {
 		return "", err
 	}
@@ -62,10 +77,10 @@ func RequireCleanGit(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := validateGitStatus(status, nil, authoritative); err != nil {
+	if err := validateGitStatusAllowingUntracked(status, allowedUntracked, authoritative); err != nil {
 		return "", err
 	}
-	if err := requireAuthoritativeFilesCommitted(root, revision, authoritative, nil); err != nil {
+	if err := requireAuthoritativeFilesCommitted(root, revision, authoritative, allowedUntracked); err != nil {
 		return "", err
 	}
 	confirmedRevision, err := gitOutput(root, "rev-parse", "HEAD")
@@ -75,9 +90,28 @@ func RequireCleanGit(root string) (string, error) {
 	return revision, nil
 }
 
+func validateGitStatusAllowingUntracked(status string, allowedUntracked, authoritative map[string]bool) error {
+	for _, line := range strings.Split(status, "\n") {
+		if line == "" {
+			continue
+		}
+		if len(line) < 4 {
+			return errors.New("cannot parse Git status")
+		}
+		name := filepath.ToSlash(strings.TrimSpace(line[3:]))
+		if strings.HasPrefix(line, "?? ") && allowedUntracked[name] {
+			continue
+		}
+		if err := validateGitStatus(line, nil, authoritative); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ValidatePlanGit accepts the reviewed base commit, its exact publication
 // ledger commit, or that ledger commit followed by this plan's deployment receipt.
-func ValidatePlanGit(root, baseRevision, planID string, repositories []string) (bool, error) {
+func ValidatePlanGit(root, baseRevision, planID string, repositories, deploymentRepositories []string) (bool, error) {
 	if err := requireCompleteGitHistory(root); err != nil {
 		return false, err
 	}
@@ -117,9 +151,15 @@ func ValidatePlanGit(root, baseRevision, planID string, repositories []string) (
 	if deployment, deploymentErr := isPlanDeploymentCommit(root, current, planID); deploymentErr != nil {
 		return false, deploymentErr
 	} else if deployment {
+		if err := ValidateDeploymentCommitPaths(root, current, deploymentRepositories); err != nil {
+			return false, err
+		}
 		ledgerRevision, err = gitOutput(root, "rev-parse", current+"^")
 		if err != nil {
 			return false, errors.New("invalid deployment receipt commit")
+		}
+		if len(repositories) == 0 && ledgerRevision == baseRevision {
+			return true, nil
 		}
 	}
 	parent, err := gitOutput(root, "rev-parse", ledgerRevision+"^")
@@ -327,6 +367,37 @@ func ValidatePublicationCommitPaths(root, revision string, repositories []string
 	for name := range expected {
 		if !actual[name] {
 			return fmt.Errorf("publication commit did not record %q", name)
+		}
+	}
+	return nil
+}
+
+func ValidateDeploymentCommitPaths(root, revision string, repositories []string) error {
+	expected := make(map[string]bool, len(repositories))
+	for _, repository := range repositories {
+		if err := ValidateRepositoryName(repository); err != nil {
+			return err
+		}
+		path, err := workspaceGitPath(root, filepath.ToSlash(filepath.Join("deployments", repository+".json")))
+		if err != nil {
+			return err
+		}
+		expected[path] = true
+	}
+	paths, err := gitChangedPaths(root, revision)
+	if err != nil {
+		return err
+	}
+	actual := make(map[string]bool, len(paths))
+	for _, name := range paths {
+		actual[name] = true
+	}
+	if len(actual) != len(expected) {
+		return errors.New("deployment commit changed an unexpected receipt set")
+	}
+	for name := range expected {
+		if !actual[name] {
+			return fmt.Errorf("deployment commit did not record %q", name)
 		}
 	}
 	return nil

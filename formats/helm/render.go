@@ -27,9 +27,6 @@ type indexedChart struct {
 }
 
 func Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
-	if len(blobs) == 0 {
-		return domain.RepositoryArtifact{}, fmt.Errorf("at least one Helm chart is required")
-	}
 	if options.GeneratedAt.IsZero() {
 		return domain.RepositoryArtifact{}, fmt.Errorf("generation time is required")
 	}

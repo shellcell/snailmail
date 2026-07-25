@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/sha1"
@@ -31,6 +32,7 @@ import (
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
+	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
 const (
@@ -261,12 +263,17 @@ func verifyPyPICases(ctx context.Context, manifest buildgraph.RepositoryManifest
 			}
 		}
 	}
+	verificationCases := manifest.VerificationCases
+	emptyProbe := len(verificationCases) == 0
+	if emptyProbe {
+		verificationCases = []domain.VerificationCase{{Project: "snailmail-empty-probe", Version: "0"}}
+	}
 	for _, verification := range manifest.VerificationCases {
 		if !wheels[verification.Project+"\x00"+verification.Version] {
 			return 0, fmt.Errorf("%s==%s has no wheel; source distribution verification requires an isolated runner", verification.Project, verification.Version)
 		}
 	}
-	for _, verification := range manifest.VerificationCases {
+	for _, verification := range verificationCases {
 		sandbox, err := os.MkdirTemp("", ".snailmail-pip-*")
 		if err != nil {
 			return 0, fmt.Errorf("create pip sandbox: %w", err)
@@ -318,6 +325,18 @@ func verifyPyPICases(ctx context.Context, manifest buildgraph.RepositoryManifest
 			"no_proxy=" + noProxy,
 		}
 		output, commandErr := command.CombinedOutput()
+		if emptyProbe {
+			expectedMiss := commandErr != nil && (bytes.Contains(output, []byte("No matching distribution found")) || bytes.Contains(output, []byte("Could not find a version that satisfies")))
+			if !expectedMiss {
+				if commandErr == nil {
+					commandErr = errors.New("empty PyPI repository unexpectedly resolved probe package")
+				} else {
+					commandErr = fmt.Errorf("empty PyPI client probe did not report an expected package miss: %w", commandErr)
+				}
+			} else {
+				commandErr = nil
+			}
+		}
 		credentialCleanupErr := error(nil)
 		if private {
 			netrcPath := filepath.Join(home, ".netrc")
@@ -486,7 +505,13 @@ func VerifyDebClient(ctx context.Context, root, runner, image string, maxWorkspa
 	if err != nil {
 		return buildgraph.RepositoryManifest{}, 0, err
 	}
-	for _, verification := range manifest.VerificationCases {
+	verificationCases := manifest.VerificationCases
+	if len(verificationCases) == 0 {
+		for _, architecture := range manifest.Install.Architectures {
+			verificationCases = append(verificationCases, domain.VerificationCase{Architecture: architecture})
+		}
+	}
+	for _, verification := range verificationCases {
 		if err := verifyDebCase(ctx, runner, image, snapshot, workspaceBytes, manifest, verification); err != nil {
 			return buildgraph.RepositoryManifest{}, 0, err
 		}
@@ -534,9 +559,11 @@ else
     printf 'deb [trusted=yes arch=%s] file:/repo %s %s\n' "$SNAILMAIL_ARCHITECTURE" "$SNAILMAIL_SUITE" "$SNAILMAIL_COMPONENT" >/target/etc/apt/sources.list
 fi
 chroot /target apt-get -o APT::Sandbox::User=root -o Acquire::Languages=none update
-chroot /target apt-get -o APT::Sandbox::User=root install -y --reinstall --no-install-recommends "$SNAILMAIL_PACKAGE=$SNAILMAIL_VERSION"
-status=$(chroot /target dpkg-query -W -f='${Status} ${Version}' "$SNAILMAIL_PACKAGE")
-test "$status" = "install ok installed $SNAILMAIL_VERSION"
+if test -n "$SNAILMAIL_PACKAGE"; then
+    chroot /target apt-get -o APT::Sandbox::User=root install -y --reinstall --no-install-recommends "$SNAILMAIL_PACKAGE=$SNAILMAIL_VERSION"
+    status=$(chroot /target dpkg-query -W -f='${Status} ${Version}' "$SNAILMAIL_PACKAGE")
+    test "$status" = "install ok installed $SNAILMAIL_VERSION"
+fi
 `,
 	}
 	command := exec.CommandContext(caseCtx, runner, arguments...)
@@ -640,7 +667,11 @@ func VerifyHelmClient(ctx context.Context, root, runner, image string) (buildgra
 	if !digestPinnedImage(image) {
 		return buildgraph.RepositoryManifest{}, 0, errors.New("a digest-pinned Helm verification image is required")
 	}
-	for _, verification := range manifest.VerificationCases {
+	verificationCases := manifest.VerificationCases
+	if len(verificationCases) == 0 {
+		verificationCases = []domain.VerificationCase{{}}
+	}
+	for _, verification := range verificationCases {
 		if err := verifyHelmCase(ctx, runner, image, snapshot, verification); err != nil {
 			return buildgraph.RepositoryManifest{}, 0, err
 		}
@@ -703,11 +734,13 @@ server=$!
 trap 'kill "$server"' EXIT
 helm repo add staged http://127.0.0.1:8879
 helm repo update staged
-mkdir -p /tmp/chart
-helm pull "staged/$SNAILMAIL_CHART" --version "$SNAILMAIL_VERSION" --untar --untardir /tmp/chart
-helm show chart "staged/$SNAILMAIL_CHART" --version "$SNAILMAIL_VERSION" >/tmp/chart-metadata.yaml
-helm lint "/tmp/chart/$SNAILMAIL_CHART"
-helm template snailmail "/tmp/chart/$SNAILMAIL_CHART" >/tmp/rendered.yaml
+if test -n "$SNAILMAIL_CHART"; then
+    mkdir -p /tmp/chart
+    helm pull "staged/$SNAILMAIL_CHART" --version "$SNAILMAIL_VERSION" --untar --untardir /tmp/chart
+    helm show chart "staged/$SNAILMAIL_CHART" --version "$SNAILMAIL_VERSION" >/tmp/chart-metadata.yaml
+    helm lint "/tmp/chart/$SNAILMAIL_CHART"
+    helm template snailmail "/tmp/chart/$SNAILMAIL_CHART" >/tmp/rendered.yaml
+fi
 `,
 	}
 	command := exec.CommandContext(caseCtx, runner, arguments...)
@@ -919,7 +952,7 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 			path.Clean(manifest.Install.SigningKeyPath) != manifest.Install.SigningKeyPath || !strings.HasPrefix(manifest.Install.SigningKeyPath, "keys/") {
 			return nil, errors.New("signed Debian repository has incomplete signature metadata")
 		}
-		keyContent, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(manifest.Install.SigningKeyPath)))
+		keyringContent, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(manifest.Install.SigningKeyPath)))
 		if err != nil {
 			return nil, fmt.Errorf("read Debian public signing key: %w", err)
 		}
@@ -935,9 +968,17 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 		if err != nil || manifest.Signatures[1].CreatedAt != manifest.Signatures[0].CreatedAt {
 			return nil, errors.New("Debian signature metadata has inconsistent creation times")
 		}
-		keyName := strings.TrimSuffix(path.Base(manifest.Install.SigningKeyPath), ".gpg")
+		trustedFingerprints := append([]string(nil), manifest.Install.TrustedSigningFingerprints...)
+		if len(trustedFingerprints) == 0 {
+			trustedFingerprints = []string{manifest.Install.SigningFingerprint}
+		}
+		activePublic, err := openpgpsigner.ExtractPublicKey(keyringContent, manifest.Install.SigningFingerprint)
+		if err != nil {
+			return nil, fmt.Errorf("extract active Debian signing key: %w", err)
+		}
 		expectedArtifact, err = deb.ApplySigning(expectedArtifact, manifest.Install.Suite, deb.SigningMaterial{
-			KeyName: keyName, Fingerprint: manifest.Install.SigningFingerprint, PublicKey: keyContent,
+			Fingerprint: manifest.Install.SigningFingerprint, PublicKey: activePublic,
+			KeyringPath: manifest.Install.SigningKeyPath, PublicKeyring: keyringContent, TrustedFingerprints: trustedFingerprints,
 			SignatureTime: signatureTime, InRelease: inRelease, ReleaseGPG: releaseGPG,
 		})
 		if err != nil {
@@ -951,6 +992,9 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 		return nil, fmt.Errorf("finalize expected Debian structure: %w", err)
 	}
 	expectedManifest.SchemaVersion = manifest.SchemaVersion
+	if manifest.SchemaVersion < 3 {
+		expectedManifest.Install.TrustedSigningFingerprints = nil
+	}
 	if !reflect.DeepEqual(expectedManifest, manifest) {
 		return nil, errors.New("Debian indexes or verification metadata do not match package bytes")
 	}

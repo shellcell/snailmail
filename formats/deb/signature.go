@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"regexp"
 	"strings"
 	"time"
 
@@ -16,24 +15,39 @@ import (
 	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
-var signingKeyNamePattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
-
 type SigningMaterial struct {
-	KeyName       string
-	Fingerprint   string
-	PublicKey     []byte
-	SignatureTime time.Time
-	InRelease     []byte
-	ReleaseGPG    []byte
+	Fingerprint         string
+	PublicKey           []byte
+	KeyringPath         string
+	PublicKeyring       []byte
+	TrustedFingerprints []string
+	SignatureTime       time.Time
+	InRelease           []byte
+	ReleaseGPG          []byte
 }
 
 func ApplySigning(artifact domain.RepositoryArtifact, suite string, material SigningMaterial) (domain.RepositoryArtifact, error) {
-	if artifact.Format != FormatID || !coordinatePattern.MatchString(suite) || !signingKeyNamePattern.MatchString(material.KeyName) || material.SignatureTime.IsZero() {
+	if artifact.Format != FormatID || !coordinatePattern.MatchString(suite) || material.SignatureTime.IsZero() ||
+		path.IsAbs(material.KeyringPath) || path.Clean(material.KeyringPath) != material.KeyringPath || !strings.HasPrefix(material.KeyringPath, "keys/") || !strings.HasSuffix(material.KeyringPath, ".gpg") {
 		return domain.RepositoryArtifact{}, errors.New("invalid Debian signing input")
 	}
 	identity, err := openpgpsigner.InspectPublic(material.PublicKey)
 	if err != nil || identity.Fingerprint != material.Fingerprint || identity.Algorithm != signer.AlgorithmOpenPGPRSA4096 {
 		return domain.RepositoryArtifact{}, errors.New("Debian public key does not match signing identity")
+	}
+	keyringIdentities, err := openpgpsigner.InspectPublicKeyring(material.PublicKeyring)
+	if err != nil || len(keyringIdentities) != len(material.TrustedFingerprints) {
+		return domain.RepositoryArtifact{}, errors.New("Debian public keyring does not match trusted identities")
+	}
+	foundActive := false
+	for index, trusted := range material.TrustedFingerprints {
+		if keyringIdentities[index].Fingerprint != trusted {
+			return domain.RepositoryArtifact{}, errors.New("Debian public keyring order does not match trusted identities")
+		}
+		foundActive = foundActive || trusted == material.Fingerprint
+	}
+	if !foundActive {
+		return domain.RepositoryArtifact{}, errors.New("Debian active signer is absent from public keyring")
 	}
 	releasePath := path.Join("dists", suite, "Release")
 	var release []byte
@@ -41,7 +55,7 @@ func ApplySigning(artifact domain.RepositoryArtifact, suite string, material Sig
 		if file.Path == releasePath {
 			release = file.Content
 		}
-		if file.Path == path.Join("dists", suite, "InRelease") || file.Path == path.Join("dists", suite, "Release.gpg") || file.Path == path.Join("keys", material.KeyName+".gpg") {
+		if file.Path == path.Join("dists", suite, "InRelease") || file.Path == path.Join("dists", suite, "Release.gpg") || file.Path == material.KeyringPath {
 			return domain.RepositoryArtifact{}, fmt.Errorf("Debian unsigned artifact already contains signing path %q", file.Path)
 		}
 	}
@@ -74,10 +88,10 @@ func ApplySigning(artifact domain.RepositoryArtifact, suite string, material Sig
 			PayloadSHA256: hex.EncodeToString(payloadDigest[:]), SHA256: hex.EncodeToString(digest[:]), CreatedAt: material.SignatureTime.UTC().Format(time.RFC3339),
 		})
 	}
-	keyPath := path.Join("keys", material.KeyName+".gpg")
-	artifact.Files = append(artifact.Files, domain.File{Path: keyPath, Content: append([]byte(nil), material.PublicKey...)})
-	artifact.Install.SigningKeyPath = keyPath
+	artifact.Files = append(artifact.Files, domain.File{Path: material.KeyringPath, Content: append([]byte(nil), material.PublicKeyring...)})
+	artifact.Install.SigningKeyPath = material.KeyringPath
 	artifact.Install.SigningFingerprint = material.Fingerprint
+	artifact.Install.TrustedSigningFingerprints = append([]string(nil), material.TrustedFingerprints...)
 	return artifact, nil
 }
 
