@@ -103,6 +103,7 @@ func Build(blobs []domain.Blob) (domain.RepositoryArtifact, error) {
 		files = append(files, generatedFile(path.Join("simple", name, "index.html"), htmlPage(name, links)))
 	}
 	files = append(files, generatedFile(path.Join("simple", "index.html"), htmlPage("Simple index", rootLinks)))
+	files = append(files, generatedFile(".nojekyll", nil))
 	sort.Slice(verification, func(i, j int) bool {
 		if verification[i].Project != verification[j].Project {
 			return verification[i].Project < verification[j].Project

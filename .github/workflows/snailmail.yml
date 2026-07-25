@@ -1,0 +1,124 @@
+name: snailmail
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Apply the generated plan
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: snailmail-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build --target test --tag snailmail-ci-test:${GITHUB_SHA} .
+
+  plan:
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - run: git checkout -B snailmail-ci "${GITHUB_SHA}"
+      - uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        if: vars.AWS_ROLE_ARN != ''
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - run: docker build --tag snailmail-ci:${GITHUB_SHA} .
+      - name: Plan
+        run: >-
+          docker run --rm
+          -v "$PWD:/workspace"
+          -w /workspace
+          -e GH_TOKEN
+          -e AWS_ACCESS_KEY_ID
+          -e AWS_SECRET_ACCESS_KEY
+          -e AWS_SESSION_TOKEN
+          -e AWS_REGION
+          snailmail-ci:${GITHUB_SHA}
+          plan --out snailmail.snailmail-plan.json
+        env:
+          GH_TOKEN: ${{ secrets.SNAILMAIL_GITHUB_TOKEN || github.token }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: snailmail-plan-${{ github.sha }}
+          path: snailmail.snailmail-plan.json
+          if-no-files-found: error
+
+  apply:
+    if: >-
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.apply)) &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - run: git checkout -B snailmail-ci "${GITHUB_SHA}"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: snailmail-plan-${{ github.sha }}
+      - uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c # v4
+        if: vars.AWS_ROLE_ARN != ''
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - run: docker build --tag snailmail-ci:${GITHUB_SHA} .
+      - name: Create signed approval evidence
+        if: vars.SNAILMAIL_APPROVAL_REPOSITORIES != ''
+        env:
+          APPROVAL_KEY: ${{ secrets.SNAILMAIL_APPROVAL_PRIVATE_KEY }}
+          APPROVAL_REPOSITORIES: ${{ vars.SNAILMAIL_APPROVAL_REPOSITORIES }}
+        run: |
+          test -n "$APPROVAL_KEY"
+          printf '%s' "$APPROVAL_KEY" > "$RUNNER_TEMP/snailmail-approval-key.json"
+          chmod 600 "$RUNNER_TEMP/snailmail-approval-key.json"
+          for repository in ${APPROVAL_REPOSITORIES//,/ }; do
+            docker run --rm -v "$PWD:/workspace" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w /workspace snailmail-ci:${GITHUB_SHA} approve --plan snailmail.snailmail-plan.json --repository "$repository" --key "$RUNNER_TEMP/snailmail-approval-key.json" --yes
+          done
+      - name: Apply reviewed plan
+        env:
+          GH_TOKEN: ${{ secrets.SNAILMAIL_GITHUB_TOKEN || github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/snailmail-tmp"
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -v "$RUNNER_TEMP/snailmail-tmp:$RUNNER_TEMP/snailmail-tmp" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -w /workspace \
+            -e GH_TOKEN -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION \
+            -e TMPDIR="$RUNNER_TEMP/snailmail-tmp" \
+            snailmail-ci:${GITHUB_SHA} apply --plan snailmail.snailmail-plan.json --runner docker
+      - name: Push publication and deployment records
+        run: git push origin HEAD:${GITHUB_REF_NAME}
+      - name: Render public status
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace snailmail-ci:${GITHUB_SHA} render --output site
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: snailmail-status-${{ github.sha }}
+          path: site
+          if-no-files-found: error

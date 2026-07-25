@@ -1163,6 +1163,13 @@ GitHub Pages, `auto`/`pr`/`approval` gates, generated install and status pages,
 and containerized CI distribution. The private five-minute target uses
 authenticated object storage or a CDN, not GitHub Pages.
 
+The implemented Phase 2 slice now includes those completion items: scoped Basic
+gateway credentials for private S3, workspace-scoped shared S3 CAS, public
+GitHub Pages with an isolated preview repository, merged-PR and Ed25519 approval
+gates, generated install/status artifacts with post-probe deployment receipts,
+and a pinned container/CI template. Additional formats and repository signing
+remain Phase 3 work rather than hidden Phase 2 prerequisites.
+
 **Phase 3 — signing, operations, and breadth.** Add explicit signer effects,
 key backends, the compatibility table, and `keys new|publish|audit|rotate`;
 then `promote`, `yank`, `prune`, `check`, `status`, `doctor`, `import`/`adopt`,

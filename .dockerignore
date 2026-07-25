@@ -1,0 +1,9 @@
+.git
+.snailmail
+site
+*.snailmail-plan.json
+*.approvals.json
+.env
+.env.*
+**/*private-key*
+**/*approval-key*

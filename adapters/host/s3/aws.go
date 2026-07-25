@@ -25,7 +25,7 @@ type AWSClient struct {
 	bucket string
 }
 
-func NewAWS(ctx context.Context, repository host.Repository) (*Adapter, error) {
+func NewAWS(ctx context.Context, repository host.Repository, brokers ...host.CredentialBroker) (*Adapter, error) {
 	if err := validateRepository(repository); err != nil {
 		return nil, err
 	}
@@ -43,7 +43,7 @@ func NewAWS(ctx context.Context, repository host.Repository) (*Adapter, error) {
 			options.BaseEndpoint = aws.String(repository.Endpoint)
 		}
 	})
-	return New(&AWSClient{client: client, bucket: repository.Bucket}), nil
+	return New(&AWSClient{client: client, bucket: repository.Bucket}, brokers...), nil
 }
 
 func (client *AWSClient) Head(ctx context.Context, key string) (ObjectInfo, error) {
@@ -105,7 +105,10 @@ func (client *AWSClient) Put(ctx context.Context, request PutRequest) (ObjectInf
 	if err != nil {
 		return ObjectInfo{}, normalizeAWSError(err)
 	}
-	return ObjectInfo{ETag: aws.ToString(result.ETag), Size: request.Size, SHA256: request.SHA256, Metadata: request.Metadata}, nil
+	return ObjectInfo{
+		ETag: aws.ToString(result.ETag), Size: request.Size,
+		SHA256: decodeChecksum(aws.ToString(result.ChecksumSHA256)), Metadata: request.Metadata,
+	}, nil
 }
 
 func (client *AWSClient) CopyCreate(ctx context.Context, source, destination string, expectedSize int64, expectedSHA256 string) (ObjectInfo, error) {

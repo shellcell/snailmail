@@ -11,11 +11,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/shellcell/snailmail/engine"
+	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/internal/wire"
 )
 
@@ -41,11 +43,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	case "setup":
 		return runSetup(args[1:], stdout, stderr)
 	case "add":
-		return runAdd(args[1:], stdout, stderr)
+		return runAdd(ctx, args[1:], stdout, stderr)
+	case "blob-store":
+		return runBlobStore(ctx, args[1:], stdout, stderr)
 	case "plan":
 		return runPlan(ctx, args[1:], stdout, stderr)
 	case "apply":
 		return runApply(ctx, args[1:], stdout, stderr)
+	case "approve":
+		return runApprove(args[1:], stdout, stderr)
+	case "approval-key":
+		return runApprovalKey(args[1:], stdout, stderr)
+	case "render":
+		return runRender(args[1:], stdout, stderr)
 	case "build":
 		return runBuild(ctx, args[1:], stdout, stderr)
 	case "verify":
@@ -65,13 +75,14 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	workspace := flags.String("workspace", ".", "workspace root")
 	name := flags.String("name", "", "workspace name")
+	forgeRepository := flags.String("forge-repo", "", "GitHub state repository (owner/name) for PR gates")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
-	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: *workspace, Name: *name}); err != nil {
+	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: *workspace, Name: *name, ForgeRepository: *forgeRepository}); err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -81,7 +92,7 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 
 func runSetup(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail setup <pypi|deb|helm> --name NAME --host <local|s3> [host options]")
+		return errors.New("usage: snailmail setup <pypi|deb|helm> --name NAME --host <local|s3|github-pages> [host options]")
 	}
 	format := args[0]
 	flags := flag.NewFlagSet("setup "+format, flag.ContinueOnError)
@@ -89,14 +100,23 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	workspace := flags.String("workspace", ".", "workspace root")
 	name := flags.String("name", "", "repository name")
 	output := flags.String("output", "", "workspace-relative published directory")
-	hostType := flags.String("host", "local", "host type: local or s3")
+	hostType := flags.String("host", "local", "host type: local, s3, or github-pages")
 	visibility := flags.String("visibility", "public", "repository visibility")
+	gatePolicy := flags.String("gate", "auto", "publication gate: auto, pr, or approval")
+	approvalKeys := flags.String("approval-keys", "", "comma-separated allowed Ed25519 public keys")
 	bucket := flags.String("bucket", "", "S3 bucket")
 	prefix := flags.String("prefix", "", "S3 object prefix")
 	region := flags.String("region", "", "AWS region")
 	endpoint := flags.String("endpoint", "", "optional S3 API endpoint")
 	canonicalEndpoint := flags.String("base-url", "", "canonical public repository URL")
 	usePathStyle := flags.Bool("use-path-style", false, "use path-style S3 requests")
+	readAuth := flags.String("read-auth", "", "private read authentication: basic")
+	credentialBroker := flags.String("credential-broker", "", "non-secret credential broker reference")
+	githubRepository := flags.String("github-repo", "", "GitHub Pages repository (owner/name)")
+	githubBranch := flags.String("branch", "", "GitHub Pages publish branch")
+	githubPreviewRepository := flags.String("github-preview-repo", "", "companion preview Pages repository (owner/name)")
+	githubPreviewBranch := flags.String("preview-branch", "", "preview Pages publish branch")
+	githubPreviewEndpoint := flags.String("preview-url", "", "companion preview Pages base URL")
 	suite := flags.String("suite", "stable", "Debian suite")
 	component := flags.String("component", "main", "Debian component")
 	architectures := flags.String("architectures", "amd64", "comma-separated Debian architectures")
@@ -106,26 +126,31 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
+	resolvedApprovalKeys := splitList(*approvalKeys)
+	sort.Strings(resolvedApprovalKeys)
 	if err := engine.SetupRepository(engine.SetupRepositoryRequest{
 		Root: *workspace, Name: *name, Format: format, Output: *output,
-		HostType: *hostType, Visibility: *visibility, Bucket: *bucket, Prefix: *prefix,
+		HostType: *hostType, Visibility: *visibility, Gate: *gatePolicy, ApprovalKeys: resolvedApprovalKeys, Bucket: *bucket, Prefix: *prefix,
 		Region: *region, Endpoint: *endpoint, CanonicalEndpoint: *canonicalEndpoint,
 		UsePathStyle: *usePathStyle,
-		Suite:        *suite, Component: *component, Architectures: splitList(*architectures),
+		ReadAuth:     *readAuth, CredentialBroker: *credentialBroker,
+		RemoteRepository: *githubRepository, Branch: *githubBranch, PreviewRepository: *githubPreviewRepository,
+		PreviewBranch: *githubPreviewBranch, PreviewEndpoint: *githubPreviewEndpoint,
+		Suite: *suite, Component: *component, Architectures: splitList(*architectures),
 	}); err != nil {
 		return err
 	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  configured %s repository %s\n", format, *name)
 	target := *output
-	if *hostType == "s3" {
+	if *hostType == "s3" || *hostType == "github-pages" {
 		target = *canonicalEndpoint
 	}
 	fmt.Fprintf(stdout, "✉️   desired state will publish to %s\n", target)
 	return nil
 }
 
-func runAdd(args []string, stdout, stderr io.Writer) error {
+func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("add", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	workspace := flags.String("workspace", ".", "workspace root")
@@ -137,7 +162,8 @@ func runAdd(args []string, stdout, stderr io.Writer) error {
 		return errors.New("usage: snailmail add [--track stable] REPOSITORY ARTIFACT...")
 	}
 	result, err := engine.AddArtifacts(engine.AddArtifactsRequest{
-		Root: *workspace, Repository: flags.Arg(0), Artifacts: flags.Args()[1:], Track: *track,
+		Context: ctx, Root: *workspace, Repository: flags.Arg(0), Artifacts: flags.Args()[1:], Track: *track,
+		Blobs: wire.NewBlobResolver(),
 	})
 	if err != nil {
 		return err
@@ -151,6 +177,37 @@ func runAdd(args []string, stdout, stderr io.Writer) error {
 	for _, packageVersion := range result.Packages {
 		fmt.Fprintf(stdout, "✉️   %s\n", packageVersion)
 	}
+	return nil
+}
+
+func runBlobStore(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: snailmail blob-store <local|s3> [options]")
+	}
+	storeType := args[0]
+	flags := flag.NewFlagSet("blob-store "+storeType, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	bucket := flags.String("bucket", "", "S3 blob bucket")
+	prefix := flags.String("prefix", "", "S3 blob prefix")
+	region := flags.String("region", "", "AWS region")
+	endpoint := flags.String("endpoint", "", "optional S3 API endpoint")
+	usePathStyle := flags.Bool("use-path-style", false, "use path-style S3 requests")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if err := engine.ConfigureBlobStore(ctx, engine.ConfigureBlobStoreRequest{
+		Root: *workspace, Type: storeType, Bucket: *bucket, Prefix: *prefix, Region: *region,
+		Endpoint: *endpoint, UsePathStyle: *usePathStyle, Blobs: wire.NewBlobResolver(),
+	}); err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  configured %s blob storage\n", storeType)
+	fmt.Fprintln(stdout, "✉️   existing locked artifacts are durable")
 	return nil
 }
 
@@ -172,9 +229,11 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err != nil {
 		return err
 	}
+	hosts := wire.NewHostResolver()
+	defer hosts.Close()
 	result, err := engine.PlanWorkspace(ctx, engine.PlanWorkspaceRequest{
 		Root: *workspace, Output: *output, GeneratedAt: generatedAt, ExpiresIn: *expires,
-		Hosts: wire.NewHostResolver(), VerificationMode: verificationMode(*structuralOnly),
+		Hosts: hosts, Blobs: wire.NewBlobResolver(), VerificationMode: verificationMode(*structuralOnly),
 	})
 	if err != nil {
 		return err
@@ -197,16 +256,26 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	debianImage := flags.String("debian-image", engine.DefaultDebianVerificationImage, "digest-pinned Debian image")
 	helmImage := flags.String("helm-image", engine.DefaultHelmVerificationImage, "digest-pinned Helm image")
 	maxWorkspaceMiB := flags.Int64("max-workspace-mib", 4096, "maximum Debian verification workspace in MiB")
+	approvalFile := flags.String("approvals", "", "approval evidence file (defaults beside plan)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
+	hosts := wire.NewHostResolver()
+	defer hosts.Close()
+	resolvedApprovalFile := *approvalFile
+	if resolvedApprovalFile == "" {
+		resolvedApprovalFile = *plan + ".approvals.json"
+	}
+	if !filepath.IsAbs(resolvedApprovalFile) {
+		resolvedApprovalFile = filepath.Join(*workspace, resolvedApprovalFile)
+	}
 	result, err := engine.ApplyWorkspace(ctx, engine.ApplyWorkspaceRequest{
 		Root: *workspace, Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
 		DebianImage: *debianImage, HelmImage: *helmImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
-		Hosts: wire.NewHostResolver(),
+		Hosts: hosts, Blobs: wire.NewBlobResolver(), Gates: gate.NewDefaultEvaluator(resolvedApprovalFile),
 	})
 	if err != nil {
 		if result.Applied != 0 || result.Current != 0 {
@@ -226,6 +295,83 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	fmt.Fprintln(stdout)
 	fmt.Fprintf(stdout, "✉️   plan sha256:%s\n", result.PlanID)
+	return nil
+}
+
+func runApprove(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("approve", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	plan := flags.String("plan", "snailmail.snailmail-plan.json", "reviewed plan file")
+	output := flags.String("out", "", "approval evidence output")
+	repository := flags.String("repository", "", "repository to approve")
+	keyFile := flags.String("key", "", "Ed25519 approval private key file")
+	expires := flags.Duration("expires", 30*time.Minute, "approval lifetime")
+	yes := flags.Bool("yes", false, "confirm approval of the exact plan ID")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	if !*yes {
+		return errors.New("approval requires --yes after reviewing the exact plan")
+	}
+	result, err := engine.ApprovePlan(engine.ApprovePlanRequest{
+		Root: *workspace, Plan: *plan, Output: *output, Repository: *repository,
+		KeyFile: *keyFile, ExpiresIn: *expires,
+	})
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  approved repository %s\n", *repository)
+	fmt.Fprintf(stdout, "✉️   %s\n", result.Output)
+	fmt.Fprintf(stdout, "    plan sha256:%s\n", result.PlanID)
+	fmt.Fprintf(stdout, "    approver %s\n", result.Approver)
+	return nil
+}
+
+func runApprovalKey(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("approval-key", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	output := flags.String("out", "", "private key output file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 || flags.Arg(0) != "generate" || *output == "" {
+		return errors.New("usage: snailmail approval-key generate --out FILE")
+	}
+	publicKey, err := gate.GenerateApprovalKey(*output)
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintln(stdout, "📦  generated Ed25519 approval key")
+	fmt.Fprintf(stdout, "✉️   %s\n", *output)
+	fmt.Fprintf(stdout, "    public key %s\n", publicKey)
+	return nil
+}
+
+func runRender(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("render", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	output := flags.String("output", "site", "status site output directory")
+	plan := flags.String("plan", "snailmail.snailmail-plan.json", "optional plan used for pending gates")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+	}
+	result, err := engine.RenderStatus(engine.RenderStatusRequest{Root: *workspace, Output: *output, Plan: *plan})
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  rendered %d repository %s\n", result.Repositories, plural(result.Repositories, "status", "statuses"))
+	fmt.Fprintf(stdout, "✉️   %s\n", result.Output)
 	return nil
 }
 
@@ -514,7 +660,11 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm> --name NAME --output DIR")
 	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail add REPOSITORY ARTIFACT...")
+	fmt.Fprintln(output, "  snailmail blob-store s3 --bucket BUCKET [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
+	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")
+	fmt.Fprintln(output, "  snailmail approve --plan PLAN --repository NAME --key FILE --yes")
+	fmt.Fprintln(output, "  snailmail render [--output site]")
 	fmt.Fprintln(output, "  snailmail apply [--plan snailmail.snailmail-plan.json]")
 	fmt.Fprintln(output, "  snailmail build pypi --input DIR --output DIR")
 	fmt.Fprintln(output, "  snailmail build deb --input DIR --output DIR [--suite stable --architectures amd64]")

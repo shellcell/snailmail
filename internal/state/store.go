@@ -2,7 +2,10 @@ package state
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/pelletier/go-toml/v2"
+	"github.com/shellcell/snailmail/blob"
 )
 
 const ManifestFilename = "snailmail.toml"
@@ -33,6 +37,9 @@ func Init(root string, options InitOptions) error {
 	if !identifierPattern.MatchString(options.Name) {
 		return fmt.Errorf("workspace name %q must use lowercase letters, digits, and hyphens", options.Name)
 	}
+	if options.ForgeRepository != "" && !validGitHubRepository(options.ForgeRepository) {
+		return errors.New("forge repository must use GitHub owner/name syntax")
+	}
 	root, err := filepath.Abs(root)
 	if err != nil {
 		return err
@@ -46,7 +53,14 @@ func Init(root string, options InitOptions) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	manifest := Manifest{SchemaVersion: ManifestSchema, Workspace: Workspace{Name: options.Name}, Repositories: map[string]Repository{}}
+	workspaceID, err := randomWorkspaceID()
+	if err != nil {
+		return fmt.Errorf("create workspace identity: %w", err)
+	}
+	manifest := Manifest{
+		SchemaVersion: ManifestSchema, Workspace: Workspace{Name: options.Name, ID: workspaceID, ForgeRepository: options.ForgeRepository},
+		BlobStore: BlobStoreConfig{Type: "local"}, Repositories: map[string]Repository{},
+	}
 	if err := WriteManifest(root, manifest); err != nil {
 		return err
 	}
@@ -71,6 +85,10 @@ func Setup(root string, options SetupOptions) error {
 	if visibility == "" {
 		visibility = "public"
 	}
+	gatePolicy := options.Gate
+	if gatePolicy == "" {
+		gatePolicy = "auto"
+	}
 	manifest, err := LoadManifest(root)
 	if err != nil {
 		return err
@@ -80,14 +98,28 @@ func Setup(root string, options SetupOptions) error {
 	}
 	lockPath := filepath.ToSlash(filepath.Join("repos", options.Name+".lock.toml"))
 	repository := Repository{
-		Format: options.Format, Lock: lockPath, Gate: "auto", Visibility: visibility,
+		Format: options.Format, Lock: lockPath, Gate: gatePolicy, ApprovalKeys: append([]string(nil), options.ApprovalKeys...), Visibility: visibility,
 		Host: HostConfig{
 			Type: hostType, Path: filepath.ToSlash(options.Output), Bucket: options.Bucket,
 			Prefix: options.Prefix, Region: options.Region, Endpoint: options.Endpoint,
 			CanonicalEndpoint: options.CanonicalEndpoint, UsePathStyle: options.UsePathStyle,
+			ReadAuth: options.ReadAuth, CredentialBroker: options.CredentialBroker,
+			Repository: options.Repository, Branch: options.Branch, PreviewRepository: options.PreviewRepository,
+			PreviewBranch: options.PreviewBranch, PreviewEndpoint: options.PreviewEndpoint,
 		},
 	}
+	if hostType == "github-pages" {
+		if repository.Host.Branch == "" {
+			repository.Host.Branch = "gh-pages"
+		}
+		if repository.Host.PreviewBranch == "" {
+			repository.Host.PreviewBranch = "gh-pages"
+		}
+	}
 	if err := validateRepositoryHost(options.Name, repository); err != nil {
+		return err
+	}
+	if err := validateGateConfiguration(options.Name, repository, manifest.Workspace.ForgeRepository); err != nil {
 		return err
 	}
 	if options.Format == "deb" {
@@ -129,7 +161,7 @@ func Setup(root string, options SetupOptions) error {
 }
 
 func writeInstallDocument(root, name string, repository Repository) error {
-	if repository.Host.Type != "s3" || repository.Format != "pypi" {
+	if (repository.Host.Type != "s3" && repository.Host.Type != "github-pages") || repository.Format != "pypi" {
 		return nil
 	}
 	content := installDocumentContent(name, repository)
@@ -141,7 +173,7 @@ func writeInstallDocument(root, name string, repository Repository) error {
 }
 
 func ValidateInstallDocument(root, name string, repository Repository) error {
-	if repository.Host.Type != "s3" || repository.Format != "pypi" {
+	if (repository.Host.Type != "s3" && repository.Host.Type != "github-pages") || repository.Format != "pypi" {
 		return nil
 	}
 	filename, err := WorkspacePath(root, filepath.ToSlash(filepath.Join("docs", "install-"+name+".md")))
@@ -160,7 +192,12 @@ func ValidateInstallDocument(root, name string, repository Repository) error {
 
 func installDocumentContent(name string, repository Repository) []byte {
 	endpoint := strings.TrimSuffix(repository.Host.CanonicalEndpoint, "/") + "/simple/"
-	return []byte("# Install from " + name + "\n\n" +
+	credentialNote := ""
+	if repository.Visibility == "private" {
+		parsed, _ := url.Parse(repository.Host.CanonicalEndpoint)
+		credentialNote = "Configure a short-lived Basic credential for `" + parsed.Hostname() + "` in your netrc before installing.\n\n"
+	}
+	return []byte("# Install from " + name + "\n\n" + credentialNote +
 		"```sh\npython -m pip install --index-url " + shellQuote(endpoint) + " PACKAGE\n```\n")
 }
 
@@ -198,9 +235,22 @@ func LoadManifest(root string) (Manifest, error) {
 		if err := decoder.Decode(&manifest); err != nil {
 			return Manifest{}, fmt.Errorf("decode %q: %w", name, err)
 		}
+		if header.SchemaVersion == 2 || header.SchemaVersion == 3 {
+			manifest.SchemaVersion = ManifestSchema
+			if header.SchemaVersion == 2 {
+				manifest.Workspace.ID = legacyWorkspaceID(manifest.Workspace.Name)
+				manifest.BlobStore = BlobStoreConfig{Type: "local"}
+			}
+		}
 	}
-	if manifest.SchemaVersion != ManifestSchema || !identifierPattern.MatchString(manifest.Workspace.Name) {
+	if manifest.SchemaVersion != ManifestSchema || !identifierPattern.MatchString(manifest.Workspace.Name) || !validSHA256(manifest.Workspace.ID) {
 		return Manifest{}, errors.New("invalid workspace manifest schema or name")
+	}
+	if manifest.Workspace.ForgeRepository != "" && !validGitHubRepository(manifest.Workspace.ForgeRepository) {
+		return Manifest{}, errors.New("invalid workspace forge repository")
+	}
+	if err := ValidateBlobStore(manifest.BlobStore); err != nil {
+		return Manifest{}, err
 	}
 	if manifest.Repositories == nil {
 		manifest.Repositories = make(map[string]Repository)
@@ -211,6 +261,12 @@ func LoadManifest(root string) (Manifest, error) {
 		}
 		if repository.Format != "pypi" && repository.Format != "deb" && repository.Format != "helm" {
 			return Manifest{}, fmt.Errorf("repository %q has unsupported format %q", name, repository.Format)
+		}
+		if !validGate(repository.Gate) {
+			return Manifest{}, fmt.Errorf("repository %q has invalid gate %q", name, repository.Gate)
+		}
+		if err := validateGateConfiguration(name, repository, manifest.Workspace.ForgeRepository); err != nil {
+			return Manifest{}, err
 		}
 		if err := validateRelativePath(repository.Lock); err != nil {
 			return Manifest{}, fmt.Errorf("repository %q lock path: %w", name, err)
@@ -239,7 +295,12 @@ type legacyRepository struct {
 }
 
 func migrateLegacyManifest(legacy legacyManifest) Manifest {
-	manifest := Manifest{SchemaVersion: ManifestSchema, Workspace: legacy.Workspace, Repositories: make(map[string]Repository, len(legacy.Repositories))}
+	workspace := legacy.Workspace
+	workspace.ID = legacyWorkspaceID(workspace.Name)
+	manifest := Manifest{
+		SchemaVersion: ManifestSchema, Workspace: workspace, BlobStore: BlobStoreConfig{Type: "local"},
+		Repositories: make(map[string]Repository, len(legacy.Repositories)),
+	}
 	for name, repository := range legacy.Repositories {
 		manifest.Repositories[name] = Repository{
 			Format: repository.Format, Lock: repository.Lock, Gate: repository.Gate,
@@ -260,17 +321,20 @@ func validateRepositoryHost(name string, repository Repository) error {
 		if err := validateRelativePath(repository.Host.Path); err != nil {
 			return fmt.Errorf("repository %q local host path: %w", name, err)
 		}
-		if repository.Host.Bucket != "" || repository.Host.Prefix != "" || repository.Host.Endpoint != "" || repository.Host.CanonicalEndpoint != "" {
+		if repository.Host.Bucket != "" || repository.Host.Prefix != "" || repository.Host.Endpoint != "" || repository.Host.CanonicalEndpoint != "" || repository.Host.ReadAuth != "" || repository.Host.CredentialBroker != "" || repository.Host.Repository != "" || repository.Host.PreviewRepository != "" || repository.Host.PreviewEndpoint != "" || repository.Host.Branch != "" || repository.Host.PreviewBranch != "" {
 			return fmt.Errorf("repository %q local host has S3-only configuration", name)
 		}
 	case "s3":
 		if repository.Format != "pypi" {
 			return fmt.Errorf("repository %q: the first S3 host slice supports PyPI only", name)
 		}
-		if repository.Visibility != "public" {
-			return fmt.Errorf("repository %q: private S3 hosting requires a scoped read credential broker", name)
+		if repository.Visibility == "private" && (repository.Host.ReadAuth != "basic" || repository.Host.CredentialBroker != "default") {
+			return fmt.Errorf("repository %q: private S3 hosting requires Basic read auth and a credential broker", name)
 		}
-		if repository.Host.Path != "" || repository.Host.Bucket == "" || repository.Host.CanonicalEndpoint == "" {
+		if repository.Visibility == "public" && (repository.Host.ReadAuth != "" || repository.Host.CredentialBroker != "") {
+			return fmt.Errorf("repository %q: public S3 hosting must not configure private read credentials", name)
+		}
+		if repository.Host.Path != "" || repository.Host.Bucket == "" || repository.Host.CanonicalEndpoint == "" || repository.Host.Repository != "" || repository.Host.PreviewRepository != "" || repository.Host.PreviewEndpoint != "" || repository.Host.Branch != "" || repository.Host.PreviewBranch != "" {
 			return fmt.Errorf("repository %q S3 host requires bucket and canonical endpoint, without a local path", name)
 		}
 		prefix := strings.Trim(repository.Host.Prefix, "/")
@@ -280,9 +344,43 @@ func validateRepositoryHost(name string, repository Repository) error {
 		if err := validateHTTPURL(repository.Host.CanonicalEndpoint); err != nil {
 			return fmt.Errorf("repository %q canonical endpoint: %w", name, err)
 		}
+		parsed, _ := url.Parse(repository.Host.CanonicalEndpoint)
+		if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+			return fmt.Errorf("repository %q client endpoint must use HTTPS", name)
+		}
 		if repository.Host.Endpoint != "" {
 			if err := validateHTTPURL(repository.Host.Endpoint); err != nil {
 				return fmt.Errorf("repository %q S3 endpoint: %w", name, err)
+			}
+			parsed, _ := url.Parse(repository.Host.Endpoint)
+			if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+				return fmt.Errorf("repository %q S3 API endpoint must use HTTPS", name)
+			}
+		}
+	case "github-pages":
+		if repository.Format != "pypi" || repository.Visibility != "public" {
+			return fmt.Errorf("repository %q: GitHub Pages currently supports public PyPI only", name)
+		}
+		if repository.Host.Path != "" || repository.Host.Bucket != "" || repository.Host.Prefix != "" || repository.Host.Region != "" || repository.Host.Endpoint != "" || repository.Host.UsePathStyle || repository.Host.ReadAuth != "" || repository.Host.CredentialBroker != "" {
+			return fmt.Errorf("repository %q GitHub Pages host has incompatible configuration", name)
+		}
+		if !validGitHubRepository(repository.Host.Repository) || !validGitHubRepository(repository.Host.PreviewRepository) || strings.EqualFold(repository.Host.Repository, repository.Host.PreviewRepository) {
+			return fmt.Errorf("repository %q GitHub Pages host requires distinct production and preview owner/name repositories", name)
+		}
+		if sameConfiguredEndpoint(repository.Host.CanonicalEndpoint, repository.Host.PreviewEndpoint) {
+			return fmt.Errorf("repository %q GitHub Pages production and preview endpoints must be distinct", name)
+		}
+		if !validGitBranch(repository.Host.Branch) || !validGitBranch(repository.Host.PreviewBranch) {
+			return fmt.Errorf("repository %q GitHub Pages host has an invalid branch", name)
+		}
+		for _, configured := range []struct{ label, endpoint string }{{"canonical", repository.Host.CanonicalEndpoint}, {"preview", repository.Host.PreviewEndpoint}} {
+			label, endpoint := configured.label, configured.endpoint
+			if err := validateHTTPURL(endpoint); err != nil {
+				return fmt.Errorf("repository %q %s endpoint: %w", name, label, err)
+			}
+			parsed, _ := url.Parse(endpoint)
+			if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+				return fmt.Errorf("repository %q %s endpoint must use HTTPS", name, label)
 			}
 		}
 	default:
@@ -302,8 +400,120 @@ func validateHTTPURL(value string) error {
 	return nil
 }
 
+func isLoopbackHost(value string) bool {
+	return value == "localhost" || value == "127.0.0.1" || value == "::1"
+}
+
+func validGitHubRepository(value string) bool {
+	parts := strings.Split(value, "/")
+	return len(parts) == 2 && validGitHubName(parts[0]) && validGitHubName(parts[1]) && !strings.HasSuffix(strings.ToLower(parts[1]), ".git")
+}
+
+func sameConfiguredEndpoint(left, right string) bool {
+	leftURL, leftErr := url.Parse(left)
+	rightURL, rightErr := url.Parse(right)
+	if leftErr != nil || rightErr != nil {
+		return false
+	}
+	return strings.EqualFold(leftURL.Scheme, rightURL.Scheme) && strings.EqualFold(leftURL.Host, rightURL.Host) &&
+		strings.EqualFold(strings.TrimSuffix(leftURL.EscapedPath(), "/"), strings.TrimSuffix(rightURL.EscapedPath(), "/"))
+}
+
+func validGitBranch(value string) bool {
+	if value == "" || value == "@" || strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".") || strings.HasSuffix(value, ".lock") || strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.Contains(value, "//") {
+		return false
+	}
+	for _, component := range strings.Split(value, "/") {
+		if component == "" || strings.HasPrefix(component, ".") {
+			return false
+		}
+	}
+	for _, character := range value {
+		if character <= 0x20 || character == 0x7f || strings.ContainsRune("~^:?*[\\", character) {
+			return false
+		}
+	}
+	return true
+}
+
+func validGitHubName(value string) bool {
+	if value == "" || len(value) > 100 || strings.HasPrefix(value, ".") || strings.HasSuffix(value, ".") {
+		return false
+	}
+	for _, character := range value {
+		if !((character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '-' || character == '_' || character == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func validGate(value string) bool {
+	return value == "auto" || value == "pr" || value == "approval"
+}
+
+func validateGateConfiguration(name string, repository Repository, forgeRepository string) error {
+	if err := ValidateGateConfiguration(repository.Gate, repository.ApprovalKeys, forgeRepository); err != nil {
+		return fmt.Errorf("repository %q: %w", name, err)
+	}
+	return nil
+}
+
+func ValidateGateConfiguration(policy string, approvalKeys []string, forgeRepository string) error {
+	if !validGate(policy) {
+		return fmt.Errorf("invalid gate %q", policy)
+	}
+	if policy == "pr" && forgeRepository == "" {
+		return errors.New("PR gate requires workspace forge_repository")
+	}
+	if policy != "approval" {
+		if len(approvalKeys) != 0 {
+			return errors.New("approval keys require an approval gate")
+		}
+		return nil
+	}
+	if len(approvalKeys) == 0 {
+		return errors.New("approval gate requires at least one Ed25519 public key")
+	}
+	previous := ""
+	for _, encoded := range approvalKeys {
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil || len(decoded) != ed25519.PublicKeySize || (previous != "" && previous >= encoded) {
+			return errors.New("invalid or unsorted approval keys")
+		}
+		previous = encoded
+	}
+	return nil
+}
+
 func WriteManifest(root string, manifest Manifest) error {
 	manifest.SchemaVersion = ManifestSchema
+	if manifest.Workspace.ID == "" {
+		manifest.Workspace.ID = legacyWorkspaceID(manifest.Workspace.Name)
+	}
+	if manifest.BlobStore.Type == "" {
+		manifest.BlobStore.Type = "local"
+	}
+	if !identifierPattern.MatchString(manifest.Workspace.Name) || !validSHA256(manifest.Workspace.ID) {
+		return errors.New("invalid workspace name or identity")
+	}
+	if manifest.Workspace.ForgeRepository != "" && !validGitHubRepository(manifest.Workspace.ForgeRepository) {
+		return errors.New("invalid workspace forge repository")
+	}
+	if err := ValidateBlobStore(manifest.BlobStore); err != nil {
+		return err
+	}
+	for name, repository := range manifest.Repositories {
+		if !identifierPattern.MatchString(name) || !validGate(repository.Gate) {
+			return fmt.Errorf("repository %q has invalid name or gate", name)
+		}
+		if err := validateRepositoryHost(name, repository); err != nil {
+			return err
+		}
+		if err := validateGateConfiguration(name, repository, manifest.Workspace.ForgeRepository); err != nil {
+			return err
+		}
+	}
 	encoded, err := toml.Marshal(manifest)
 	if err != nil {
 		return fmt.Errorf("encode workspace manifest: %w", err)
@@ -313,6 +523,83 @@ func WriteManifest(root string, manifest Manifest) error {
 		return err
 	}
 	return atomicWrite(name, encoded, 0o644)
+}
+
+func ValidateBlobStore(configuration BlobStoreConfig) error {
+	switch configuration.Type {
+	case "local":
+		if configuration.Bucket != "" || configuration.Prefix != "" || configuration.Region != "" || configuration.Endpoint != "" || configuration.UsePathStyle {
+			return errors.New("local blob store has S3-only configuration")
+		}
+	case "s3":
+		if configuration.Bucket == "" || strings.ContainsAny(configuration.Bucket+configuration.Region, "\x00\r\n") {
+			return errors.New("S3 blob store requires a valid bucket")
+		}
+		prefix := strings.Trim(configuration.Prefix, "/")
+		if prefix != configuration.Prefix || strings.ContainsRune(prefix, '\\') || (prefix != "" && (path.Clean(prefix) != prefix || strings.HasPrefix(prefix, "../"))) {
+			return errors.New("S3 blob store prefix is invalid")
+		}
+		if configuration.Endpoint != "" {
+			if err := validateHTTPURL(configuration.Endpoint); err != nil {
+				return fmt.Errorf("S3 blob endpoint: %w", err)
+			}
+			parsed, _ := url.Parse(configuration.Endpoint)
+			if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+				return errors.New("S3 blob endpoint must use HTTPS")
+			}
+			if parsed.Path != "" && parsed.Path != "/" {
+				return errors.New("S3 blob endpoint must not contain a path")
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported blob store type %q", configuration.Type)
+	}
+	return nil
+}
+
+func BlobConfiguration(manifest Manifest) blob.Configuration {
+	return blob.Configuration{
+		Type: manifest.BlobStore.Type, WorkspaceID: manifest.Workspace.ID,
+		Bucket: manifest.BlobStore.Bucket, Prefix: manifest.BlobStore.Prefix, Region: manifest.BlobStore.Region,
+		Endpoint: manifest.BlobStore.Endpoint, UsePathStyle: manifest.BlobStore.UsePathStyle,
+	}
+}
+
+func BlobStoreFromOptions(options BlobStoreOptions) BlobStoreConfig {
+	storeType := options.Type
+	if storeType == "" {
+		storeType = "local"
+	}
+	return BlobStoreConfig{
+		Type: storeType, Bucket: options.Bucket, Prefix: options.Prefix, Region: options.Region,
+		Endpoint: options.Endpoint, UsePathStyle: options.UsePathStyle,
+	}
+}
+
+func randomWorkspaceID() (string, error) {
+	var value [sha256.Size]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+func NewWorkspaceID() (string, error) {
+	return randomWorkspaceID()
+}
+
+func IsLegacyWorkspaceID(name, identifier string) bool {
+	return identifier == legacyWorkspaceID(name)
+}
+
+func legacyWorkspaceID(name string) string {
+	digest := sha256.Sum256([]byte("snailmail-workspace\x00" + name))
+	return hex.EncodeToString(digest[:])
+}
+
+func validSHA256(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 }
 
 func LoadLock(root string, repository Repository) (RepositoryLock, error) {

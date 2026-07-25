@@ -75,8 +75,8 @@ func RequireCleanGit(root string) (string, error) {
 	return revision, nil
 }
 
-// ValidatePlanGit accepts the reviewed base commit or the single publication
-// ledger commit produced by this exact plan during a prior interrupted apply.
+// ValidatePlanGit accepts the reviewed base commit, its exact publication
+// ledger commit, or that ledger commit followed by this plan's deployment receipt.
 func ValidatePlanGit(root, baseRevision, planID string, repositories []string) (bool, error) {
 	if err := requireCompleteGitHistory(root); err != nil {
 		return false, err
@@ -113,15 +113,24 @@ func ValidatePlanGit(root, baseRevision, planID string, repositories []string) (
 	if _, err := RequireCleanGit(root); err != nil {
 		return false, err
 	}
-	parent, err := gitOutput(root, "rev-parse", current+"^")
+	ledgerRevision := current
+	if deployment, deploymentErr := isPlanDeploymentCommit(root, current, planID); deploymentErr != nil {
+		return false, deploymentErr
+	} else if deployment {
+		ledgerRevision, err = gitOutput(root, "rev-parse", current+"^")
+		if err != nil {
+			return false, errors.New("invalid deployment receipt commit")
+		}
+	}
+	parent, err := gitOutput(root, "rev-parse", ledgerRevision+"^")
 	if err != nil || parent != baseRevision {
 		return false, errors.New("stale plan: Git revision changed")
 	}
-	message, err := gitOutput(root, "log", "-1", "--format=%B", current)
+	message, err := gitOutput(root, "log", "-1", "--format=%B", ledgerRevision)
 	if err != nil || !hasPlanTrailer(message, planID) {
 		return false, errors.New("stale plan: Git revision changed")
 	}
-	paths, err := gitChangedPaths(root, current)
+	paths, err := gitChangedPaths(root, ledgerRevision)
 	if err != nil || len(paths) == 0 {
 		return false, errors.New("invalid publication ledger commit")
 	}
@@ -132,6 +141,39 @@ func ValidatePlanGit(root, baseRevision, planID string, repositories []string) (
 		}
 		if !inside || !strings.HasPrefix(relative, "publications/") || !strings.HasSuffix(relative, ".jsonl") {
 			return false, errors.New("publication ledger commit changed non-ledger paths")
+		}
+	}
+	return true, nil
+}
+
+func PlanLedgerRevision(root, planID string) (string, error) {
+	current, err := gitOutput(root, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	deployment, err := isPlanDeploymentCommit(root, current, planID)
+	if err != nil || !deployment {
+		return current, err
+	}
+	return gitOutput(root, "rev-parse", current+"^")
+}
+
+func isPlanDeploymentCommit(root, revision, planID string) (bool, error) {
+	message, err := gitOutput(root, "log", "-1", "--format=%B", revision)
+	if err != nil || !hasPlanTrailer(message, planID) || !strings.HasPrefix(message, "record snailmail deployments\n") {
+		return false, nil
+	}
+	paths, err := gitChangedPaths(root, revision)
+	if err != nil || len(paths) == 0 {
+		return false, errors.New("invalid deployment receipt commit")
+	}
+	for _, name := range paths {
+		relative, inside, err := workspaceRelativeGitPath(root, name)
+		if err != nil {
+			return false, err
+		}
+		if !inside || !strings.HasPrefix(relative, "deployments/") || !strings.HasSuffix(relative, ".json") {
+			return false, errors.New("deployment receipt commit changed unrelated paths")
 		}
 	}
 	return true, nil
@@ -434,6 +476,7 @@ func authoritativePaths(root string) (map[string]bool, error) {
 	for _, pattern := range []string{
 		filepath.Join(root, "repos", "*.lock.toml"),
 		filepath.Join(root, "publications", "*.jsonl"),
+		filepath.Join(root, "deployments", "*.json"),
 		filepath.Join(root, "docs", "install-*.md"),
 	} {
 		matches, err := filepath.Glob(pattern)
@@ -452,7 +495,7 @@ func authoritativePaths(root string) (map[string]bool, error) {
 }
 
 func isAuthoritativePath(name string) bool {
-	return name == ManifestFilename || strings.HasPrefix(name, "repos/") || strings.HasPrefix(name, "publications/") || strings.HasPrefix(name, "docs/install-")
+	return name == ManifestFilename || strings.HasPrefix(name, "repos/") || strings.HasPrefix(name, "publications/") || strings.HasPrefix(name, "deployments/") || strings.HasPrefix(name, "docs/install-")
 }
 
 func hasPlanTrailer(message, planID string) bool {

@@ -145,6 +145,44 @@ func TestS3HostRejectsStaleCommitAndRestore(t *testing.T) {
 	}
 }
 
+func TestS3HostRejectsRestoreToIncompletePriorRelease(t *testing.T) {
+	ctx := context.Background()
+	objects := newMemoryObjects()
+	repository := host.Repository{
+		Name: "python", Format: "pypi", Type: "s3", Visibility: "public",
+		Bucket: "packages", Prefix: "repo", CanonicalEndpoint: "https://packages.example/repo",
+	}
+	adapter := New(objects)
+	firstRequest := stageFixture(t, "restore-source", "", "", `<a href="demo/">first</a>`)
+	firstStage, err := adapter.Stage(ctx, repository, firstRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCommit, err := adapter.Commit(ctx, repository, firstStage, host.ExpectedRevision{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest := stageFixture(t, "restore-target", "", "", `<a href="demo/">second</a>`)
+	secondStage, err := adapter.Stage(ctx, repository, secondRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCommit, err := adapter.Commit(ctx, repository, secondStage, expectedRevision(firstCommit.Revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := objects.Delete(ctx, releaseKey(repository, firstCommit.Revision.TreeSHA256, pypiRootPath), Conditions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.Restore(ctx, repository, *secondCommit.RestoreRef, expectedRevision(secondCommit.Revision)); !host.IsKind(err, host.ErrorIndeterminate) {
+		t.Fatalf("restore to incomplete release error = %v", err)
+	}
+	observed, err := adapter.Observe(ctx, repository)
+	if err != nil || observed.TreeSHA256 != secondCommit.Revision.TreeSHA256 {
+		t.Fatalf("failed restore changed canonical publication: observed=%#v err=%v", observed, err)
+	}
+}
+
 func TestS3HostAbortMarksSharedStageForLifecycleCleanup(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
@@ -269,6 +307,96 @@ func TestS3HostRejectsPrivateAndNonPyPI(t *testing.T) {
 		if _, err := adapter.Capabilities(context.Background(), repository); !host.IsKind(err, host.ErrorInvalidConfiguration) {
 			t.Fatalf("configuration error = %v", err)
 		}
+	}
+}
+
+func TestS3HostIssuesScopedPrivateReadCredentials(t *testing.T) {
+	ctx := context.Background()
+	objects := newMemoryObjects()
+	broker := &recordingCredentialBroker{}
+	repository := host.Repository{
+		Name: "python", Format: "pypi", Type: "s3", Visibility: "private", Bucket: "packages", Prefix: "repo",
+		CanonicalEndpoint: "https://packages.example/repo", ReadAuth: "basic", CredentialBroker: "default",
+		WorkspaceID: strings.Repeat("b", 64), HostIdentity: strings.Repeat("c", 64),
+	}
+	adapter := New(objects, broker)
+	capabilities, err := adapter.Capabilities(ctx, repository)
+	if err != nil || !capabilities.PrivateRead {
+		t.Fatalf("private capabilities=%#v err=%v", capabilities, err)
+	}
+	request := stageFixture(t, "private-read", "", "", `<a href="demo/">content</a>`)
+	staged, err := adapter.Stage(ctx, repository, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasSimpleRoute := func(routes []host.ClientRoute) bool {
+		for _, route := range routes {
+			if strings.HasSuffix(route.URL, "/simple/") {
+				return true
+			}
+		}
+		return false
+	}
+	if staged.Access.Credential == nil || len(broker.scopes) != 1 || broker.scopes[0].StageID != staged.ID || len(broker.scopes[0].Prefixes) != 1 ||
+		!strings.Contains(broker.scopes[0].Prefixes[0], ".snailmail/stages/"+staged.ID) || broker.scopes[0].WorkspaceID != repository.WorkspaceID ||
+		broker.scopes[0].HostIdentity != repository.HostIdentity || broker.scopes[0].PlanID != request.PlanID || broker.scopes[0].ChangeID != request.ChangeID ||
+		!hasSimpleRoute(staged.Access.Routes) {
+		t.Fatalf("unexpected staged credential scope %#v", broker.scopes)
+	}
+	committed, err := adapter.Commit(ctx, repository, staged, host.ExpectedRevision{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if committed.Access.Credential == nil || len(broker.scopes) != 2 || broker.scopes[1].TreeSHA256 != request.TreeSHA256 || len(broker.scopes[1].Prefixes) != 2 ||
+		broker.scopes[1].PlanID != request.PlanID || broker.scopes[1].ChangeID != request.ChangeID || len(committed.Access.Routes) == 0 ||
+		!hasSimpleRoute(committed.Access.Routes) {
+		t.Fatalf("unexpected canonical credential scope %#v", broker.scopes)
+	}
+	wantRoot := rewrittenRoot(t, request, committed.Revision)
+	for _, route := range committed.Access.Routes {
+		if strings.HasSuffix(route.URL, "/simple/") && (route.Size != int64(len(wantRoot)) || route.SHA256 != digestBytes([]byte(wantRoot))) {
+			t.Fatalf("canonical client route does not bind rewritten root: %#v", route)
+		}
+	}
+	forged := committed.Revision
+	forged.PlanID = strings.Repeat("f", 64)
+	if _, err := adapter.ReadAccess(ctx, repository, forged); !host.IsKind(err, host.ErrorStale) || len(broker.scopes) != 2 {
+		t.Fatalf("forged canonical read access error=%v scopes=%#v", err, broker.scopes)
+	}
+	credential := staged.Access.Credential.(*recordingCredential)
+	if err := adapter.Abort(ctx, repository, staged); err != nil {
+		t.Fatal(err)
+	}
+	if !credential.destroyed {
+		t.Fatal("abort did not destroy the staged credential")
+	}
+	committed.Access.Credential.Destroy()
+}
+
+func TestS3HostCredentialFailureDoesNotPublishEffectPointer(t *testing.T) {
+	ctx := context.Background()
+	objects := newMemoryObjects()
+	broker := &recordingCredentialBroker{issueErr: errors.New("temporary broker failure")}
+	repository := host.Repository{
+		Name: "python", Format: "pypi", Type: "s3", Visibility: "private", Bucket: "packages", Prefix: "repo",
+		CanonicalEndpoint: "https://packages.example/repo", ReadAuth: "basic", CredentialBroker: "default",
+		WorkspaceID: strings.Repeat("b", 64), HostIdentity: strings.Repeat("c", 64),
+	}
+	adapter := New(objects, broker)
+	request := stageFixture(t, "credential-retry", "", "", `<a href="demo/">content</a>`)
+	if _, err := adapter.Stage(ctx, repository, request); err == nil {
+		t.Fatal("expected credential issuance failure")
+	}
+	if _, err := adapter.loadStagePointer(ctx, repository, effectIdentifier(request.PlanID, request.ChangeID)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed credential issuance published effect pointer: %v", err)
+	}
+	broker.issueErr = nil
+	staged, err := adapter.Stage(ctx, repository, request)
+	if err != nil {
+		t.Fatalf("same effect was not retryable: %v", err)
+	}
+	if err := adapter.Abort(ctx, repository, staged); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -768,6 +896,39 @@ func assertHTTPContent(t *testing.T, address, expected string) {
 type memoryObject struct {
 	content []byte
 	info    ObjectInfo
+}
+
+type recordingCredentialBroker struct {
+	scopes   []host.ReadScope
+	issueErr error
+}
+
+func (broker *recordingCredentialBroker) Identity() string {
+	return strings.Repeat("a", 64)
+}
+
+func (broker *recordingCredentialBroker) Issue(_ context.Context, scope host.ReadScope) (host.BasicCredential, error) {
+	broker.scopes = append(broker.scopes, scope)
+	if broker.issueErr != nil {
+		return nil, broker.issueErr
+	}
+	return &recordingCredential{username: "reader", password: "secret"}, nil
+}
+
+type recordingCredential struct {
+	username  string
+	password  string
+	destroyed bool
+}
+
+func (credential *recordingCredential) Basic(context.Context) (string, string, error) {
+	return credential.username, credential.password, nil
+}
+
+func (credential *recordingCredential) Destroy() {
+	credential.destroyed = true
+	credential.username = ""
+	credential.password = ""
 }
 
 type memoryObjects struct {

@@ -1,9 +1,14 @@
 package engine
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shellcell/snailmail/blob"
+	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/state"
@@ -43,7 +50,7 @@ func TestWorkspacePlanApplyAllFormats(t *testing.T) {
 				t.Fatalf("planned %d changes, want 1", planned.Changes)
 			}
 			applied, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-				Root: root, Plan: planName, Now: createdAt.Add(time.Minute), StructuralOnly: true,
+				Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -70,7 +77,7 @@ func TestWorkspacePlanApplyAllFormats(t *testing.T) {
 				t.Fatalf("unexpected publication records: %#v", records)
 			}
 			retried, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-				Root: root, Plan: planName, Now: createdAt.Add(2 * time.Minute), StructuralOnly: true,
+				Root: root, Plan: planName, now: createdAt.Add(2 * time.Minute), StructuralOnly: true,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -138,7 +145,7 @@ func TestWorkspacePlanApplyRemoteHost(t *testing.T) {
 		t.Fatalf("unexpected install document %q", document)
 	}
 	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-		Root: root, Plan: planName, Now: createdAt.Add(time.Minute), StructuralOnly: true, Hosts: resolver,
+		Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true, Hosts: resolver,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -147,7 +154,7 @@ func TestWorkspacePlanApplyRemoteHost(t *testing.T) {
 		t.Fatalf("unexpected remote apply result %#v stage=%d commit=%d revision=%#v", result, remote.stageCalls, remote.commitCalls, remote.revision)
 	}
 	retried, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-		Root: root, Plan: planName, Now: createdAt.Add(2 * time.Minute), StructuralOnly: true, Hosts: resolver,
+		Root: root, Plan: planName, now: createdAt.Add(2 * time.Minute), StructuralOnly: true, Hosts: resolver,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +164,7 @@ func TestWorkspacePlanApplyRemoteHost(t *testing.T) {
 	}
 	remote.revision.ManifestSHA256 = strings.Repeat("f", 64)
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-		Root: root, Plan: planName, Now: createdAt.Add(3 * time.Minute), StructuralOnly: true, Hosts: resolver,
+		Root: root, Plan: planName, now: createdAt.Add(3 * time.Minute), StructuralOnly: true, Hosts: resolver,
 	}); err == nil || !strings.Contains(err.Error(), "desired tree was published by another change") {
 		t.Fatalf("apply accepted a different desired manifest: %v", err)
 	}
@@ -185,9 +192,348 @@ func TestWorkspacePlanApplyRemoteHost(t *testing.T) {
 		t.Fatalf("same-tree manifest change was not planned as an update: %#v", secondPlan.Payload.Repositories[0])
 	}
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-		Root: root, Plan: secondPlanName, Now: createdAt.Add(11 * time.Minute), StructuralOnly: true, Hosts: resolver,
+		Root: root, Plan: secondPlanName, now: createdAt.Add(11 * time.Minute), StructuralOnly: true, Hosts: resolver,
 	}); err != nil {
 		t.Fatalf("apply same-tree manifest update: %v", err)
+	}
+}
+
+func TestWorkspacePlanApplyGitHubPagesHost(t *testing.T) {
+	root := t.TempDir()
+	command := exec.Command("git", "init", "-b", "main")
+	command.Dir = root
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := InitWorkspace(InitWorkspaceRequest{Root: root, Name: "pages-workspace"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetupRepository(SetupRepositoryRequest{
+		Root: root, Name: "python", Format: "pypi", HostType: "github-pages", Visibility: "public",
+		RemoteRepository: "shellcell/packages", Branch: "gh-pages", CanonicalEndpoint: "https://packages.example",
+		PreviewRepository: "shellcell/packages-preview", PreviewBranch: "gh-pages", PreviewEndpoint: "https://preview.example",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := workspaceArtifact(t, root, "pypi", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "python", Artifacts: []string{artifact}}); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "configure Pages repository")
+	remote := &recordingHost{}
+	resolver := staticHostResolver{host: remote}
+	createdAt := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	planName := filepath.Join(root, "pages.json")
+	planResult, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour, Hosts: resolver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true, Hosts: resolver,
+	})
+	if err != nil || result.Applied != 1 || remote.stageCalls != 1 || remote.commitCalls != 1 || remote.staged.PreviousRevision != "" {
+		t.Fatalf("Pages apply result=%#v plan=%#v stage=%#v err=%v", result, planResult, remote.staged, err)
+	}
+	secondPlanName := filepath.Join(root, "pages-second.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: secondPlanName, CreatedAt: createdAt.Add(10 * time.Minute), GeneratedAt: createdAt.Add(10 * time.Minute), ExpiresIn: time.Hour, Hosts: resolver,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondPlan, err := state.LoadPlan(secondPlanName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondPlan.Payload.Repositories[0].Action != "update" || secondPlan.Payload.Repositories[0].ObservedTreeSHA256 != secondPlan.Payload.Repositories[0].DesiredTreeSHA256 || secondPlan.Payload.Repositories[0].ObservedManifestSHA256 == secondPlan.Payload.Repositories[0].DesiredManifestSHA256 {
+		t.Fatalf("Pages same-tree manifest update was not planned: %#v", secondPlan.Payload.Repositories[0])
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: secondPlanName, now: createdAt.Add(11 * time.Minute), StructuralOnly: true, Hosts: resolver,
+	}); err != nil || remote.staged.PreviousRevision != "revision-1" {
+		t.Fatalf("apply Pages same-tree manifest update previous=%q err=%v", remote.staged.PreviousRevision, err)
+	}
+}
+
+func TestAutoGateRechecksExpiryBeforePublicationEffects(t *testing.T) {
+	root := t.TempDir()
+	initializeRepository(t, root, "pypi")
+	artifact := workspaceArtifact(t, root, "pypi", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "pypi", Artifacts: []string{artifact}}); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "add expiry fixture")
+	createdAt := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	planName := filepath.Join(root, "expiring.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Minute,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	times := []time.Time{createdAt.Add(30 * time.Second), createdAt.Add(2 * time.Minute)}
+	clock := func() time.Time {
+		value := times[0]
+		if len(times) > 1 {
+			times = times[1:]
+		}
+		return value
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, StructuralOnly: true, clock: clock}); err == nil || !strings.Contains(err.Error(), "expired before publication effect") {
+		t.Fatalf("delayed auto apply error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "public", "pypi")); !os.IsNotExist(err) {
+		t.Fatalf("expired auto plan published output: %v", err)
+	}
+}
+
+func TestApprovalGateBlocksBeforeStageAndAcceptsBoundEvidence(t *testing.T) {
+	root := t.TempDir()
+	command := exec.Command("git", "init", "-b", "main")
+	command.Dir = root
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := InitWorkspace(InitWorkspaceRequest{Root: root, Name: "approval-workspace"}); err != nil {
+		t.Fatal(err)
+	}
+	keyFile := filepath.Join(t.TempDir(), "approval-key.json")
+	publicKey, err := gate.GenerateApprovalKey(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SetupRepository(SetupRepositoryRequest{Root: root, Name: "python", Format: "pypi", Output: "public/python", Gate: "approval", ApprovalKeys: []string{publicKey}}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := workspaceArtifact(t, root, "pypi", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "python", Artifacts: []string{artifact}}); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "request approval")
+	now := time.Now().UTC().Truncate(time.Second)
+	planName := filepath.Join(root, "approval.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: now, GeneratedAt: now, ExpiresIn: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, now: now.Add(time.Minute), StructuralOnly: true}); err == nil || !strings.Contains(err.Error(), "requires approval gate evidence") {
+		t.Fatalf("approval gate did not block apply: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "public", "python")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("approval-gated target changed before evidence: %v", err)
+	}
+	approvalName := filepath.Join(root, "approval-evidence.json")
+	approved, err := ApprovePlan(ApprovePlanRequest{
+		Root: root, Plan: planName, Output: approvalName, Repository: "python", KeyFile: keyFile,
+		Now: now.Add(time.Minute), ExpiresIn: 30 * time.Minute,
+	})
+	if err != nil || approved.PlanID == "" {
+		t.Fatalf("approve plan result=%#v err=%v", approved, err)
+	}
+	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, now: now.Add(2 * time.Minute), StructuralOnly: true,
+		Gates: gate.NewDefaultEvaluator(approvalName),
+	})
+	if err != nil || result.Applied != 1 {
+		t.Fatalf("approved apply result=%#v err=%v", result, err)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, StructuralOnly: true,
+	}); err == nil || !strings.Contains(err.Error(), "requires approval gate evidence") {
+		t.Fatalf("current gated publication bypassed approval: %v", err)
+	}
+}
+
+func TestRenderStatusWritesDeterministicManagedSite(t *testing.T) {
+	root := t.TempDir()
+	initializeRepository(t, root, "pypi")
+	artifact := workspaceArtifact(t, root, "pypi", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "pypi", Artifacts: []string{artifact}}); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "publish status fixture")
+	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	planName := filepath.Join(root, "render-plan.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: now, GeneratedAt: now, ExpiresIn: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, now: now.Add(time.Minute), StructuralOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(t.TempDir(), "site")
+	if _, err := RenderStatus(RenderStatusRequest{Root: root, Output: output}); err != nil {
+		t.Fatal(err)
+	}
+	firstJSON, err := os.ReadFile(filepath.Join(output, "status.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RenderStatus(RenderStatusRequest{Root: root, Output: output}); err != nil {
+		t.Fatal(err)
+	}
+	secondJSON, err := os.ReadFile(filepath.Join(output, "status.json"))
+	if err != nil || !bytes.Equal(firstJSON, secondJSON) {
+		t.Fatalf("status rerender changed bytes: %v", err)
+	}
+	if !bytes.Contains(secondJSON, []byte(`"state": "current"`)) {
+		t.Fatalf("rendered status did not include publication: %s", secondJSON)
+	}
+}
+
+func TestMissingDeploymentReceiptForcesRecoverableReconciliation(t *testing.T) {
+	root := t.TempDir()
+	initializeRepository(t, root, "pypi")
+	artifact := workspaceArtifact(t, root, "pypi", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "pypi", Artifacts: []string{artifact}}); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "publish recovery fixture")
+	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	firstPlan := filepath.Join(root, "first-recovery.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: firstPlan, CreatedAt: now, GeneratedAt: now, ExpiresIn: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: firstPlan, now: now.Add(time.Minute), StructuralOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	deployment := filepath.Join(root, "deployments", "pypi.json")
+	if err := os.Remove(deployment); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", root, "add", "-u", "--", "deployments/pypi.json").CombinedOutput(); err != nil {
+		t.Fatalf("stage missing receipt: %v: %s", err, output)
+	}
+	command := exec.Command("git", "-C", root, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "simulate missing deployment receipt")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("commit missing receipt: %v: %s", err, output)
+	}
+	secondPlan := filepath.Join(root, "second-recovery.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: secondPlan, CreatedAt: now.Add(2 * time.Hour), GeneratedAt: now.Add(2 * time.Hour), ExpiresIn: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	planned, err := state.LoadPlan(secondPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planned.Payload.Repositories[0].Action != "update" {
+		t.Fatalf("missing receipt produced action %q", planned.Payload.Repositories[0].Action)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: secondPlan, now: now.Add(2*time.Hour + time.Minute), StructuralOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.LoadDeployment(root, "pypi"); err != nil {
+		t.Fatalf("reconciliation did not restore deployment receipt: %v", err)
+	}
+}
+
+func TestDeploymentReceiptRequiresMatchingPublicationIdentity(t *testing.T) {
+	tree := strings.Repeat("b", 64)
+	deployment := state.DeploymentRecord{
+		Repository: "python", PlanID: strings.Repeat("a", 64), ChangeID: "python:" + tree[:12],
+		TreeSHA256: tree, ManifestSHA256: strings.Repeat("c", 64), NativeRevision: "native",
+	}
+	observed := host.PublishedRevision{NativeRevision: "native"}
+	wrongLedger := []state.PublicationRecord{{
+		Repository: "python", PlanID: strings.Repeat("d", 64), ChangeID: deployment.ChangeID, TreeSHA256: tree,
+	}}
+	if deploymentMatchesDesired(deployment, observed, tree, deployment.ManifestSHA256, wrongLedger) {
+		t.Fatal("deployment with unrelated publication plan was accepted")
+	}
+	wrongLedger[0].PlanID = deployment.PlanID
+	if !deploymentMatchesDesired(deployment, observed, tree, deployment.ManifestSHA256, wrongLedger) {
+		t.Fatal("deployment with matching publication identity was rejected")
+	}
+}
+
+func TestWorkspaceFetchesMissingBlobFromSharedStore(t *testing.T) {
+	root := t.TempDir()
+	command := exec.Command("git", "init", "-b", "main")
+	command.Dir = root
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := InitWorkspace(InitWorkspaceRequest{Root: root, Name: "shared-workspace"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetupRepository(SetupRepositoryRequest{Root: root, Name: "python", Format: "pypi", Output: "public/python"}); err != nil {
+		t.Fatal(err)
+	}
+	store := &memoryBlobStore{objects: make(map[string][]byte)}
+	archive := &memoryBlobStore{objects: make(map[string][]byte)}
+	resolver := routingBlobResolver{stores: map[string]blob.Store{"artifacts": store, "archive": archive}}
+	if err := ConfigureBlobStore(context.Background(), ConfigureBlobStoreRequest{
+		Root: root, Type: "s3", Bucket: "artifacts", Prefix: "cas", Blobs: resolver,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := workspaceArtifact(t, root, "pypi", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{
+		Context: context.Background(), Root: root, Repository: "python", Artifacts: []string{artifact}, Blobs: resolver,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := state.LoadLock(root, manifest.Repositories["python"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := lock.PackageVersion[0].Blobs[0]
+	if len(store.objects[locked.SHA256]) == 0 {
+		t.Fatal("add did not upload the artifact to shared storage")
+	}
+	cacheName, err := state.WorkspacePath(root, filepath.ToSlash(filepath.Join(".snailmail", "cas", "sha256", locked.SHA256[:2], locked.SHA256)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(cacheName); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "configure shared blobs")
+	createdAt := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	planName := filepath.Join(root, "shared.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour, Blobs: resolver,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(cacheName); err != nil {
+		t.Fatalf("plan did not restore the local blob cache: %v", err)
+	}
+	plan, err := state.LoadPlan(planName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Payload.BlobStore.Type != "s3" || plan.Payload.WorkspaceID != manifest.Workspace.ID || plan.Payload.BlobStoreIdentitySHA256 == "" {
+		t.Fatalf("plan did not bind shared blob storage: %#v", plan.Payload)
+	}
+	if err := os.Remove(cacheName); err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigureBlobStore(context.Background(), ConfigureBlobStoreRequest{
+		Root: root, Type: "s3", Bucket: "archive", Prefix: "cas", Blobs: resolver,
+	}); err != nil {
+		t.Fatalf("remote-to-remote migration: %v", err)
+	}
+	if len(archive.objects[locked.SHA256]) == 0 {
+		t.Fatal("remote-to-remote migration did not copy the locked blob")
+	}
+	if err := os.Remove(cacheName); err != nil {
+		t.Fatal(err)
+	}
+	if err := ConfigureBlobStore(context.Background(), ConfigureBlobStoreRequest{Root: root, Type: "local", Blobs: resolver}); err != nil {
+		t.Fatalf("remote-to-local migration: %v", err)
+	}
+	manifest, err = state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.BlobStore.Type != "local" {
+		t.Fatalf("blob store type = %q, want local", manifest.BlobStore.Type)
+	}
+	if _, err := os.Lstat(cacheName); err != nil {
+		t.Fatalf("remote-to-local migration did not materialize the cache: %v", err)
 	}
 }
 
@@ -208,7 +554,7 @@ func TestApplyRejectsLockChangedAfterPlan(t *testing.T) {
 	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "helm", Artifacts: []string{second}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, Now: createdAt.Add(time.Minute), StructuralOnly: true}); err == nil {
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true}); err == nil {
 		t.Fatal("expected changed lock to make plan stale")
 	}
 }
@@ -290,7 +636,7 @@ func TestPublishedChartCannotChangeBytes(t *testing.T) {
 	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, Now: createdAt.Add(time.Minute), StructuralOnly: true}); err != nil {
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true}); err != nil {
 		t.Fatal(err)
 	}
 	metadata := "apiVersion: v2\nname: snail-demo\nversion: 1.2.3\ndescription: changed bytes\n"
@@ -383,7 +729,7 @@ func TestWorkspaceSupportsNestedGitDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-		Root: root, Plan: planName, Now: createdAt.Add(time.Minute), StructuralOnly: true,
+		Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -391,8 +737,12 @@ func TestWorkspaceSupportsNestedGitDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(paths) != "workspace/publications/pypi.jsonl\n" {
+	if string(paths) != "workspace/deployments/pypi.json\n" {
 		t.Fatalf("unexpected nested publication path %q", paths)
+	}
+	ledgerPaths, err := exec.Command("git", "-C", top, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD^").Output()
+	if err != nil || string(ledgerPaths) != "workspace/publications/pypi.jsonl\n" {
+		t.Fatalf("unexpected nested ledger path %q err=%v", ledgerPaths, err)
 	}
 }
 
@@ -445,7 +795,7 @@ func TestWorkspaceUsesConfiguredGitIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-		Root: root, Plan: planName, Now: createdAt.Add(time.Minute), StructuralOnly: true,
+		Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +817,7 @@ func TestNoopPlanDoesNotWritePublicationLedger(t *testing.T) {
 	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: firstPlan, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: firstPlan, Now: createdAt.Add(time.Minute), StructuralOnly: true}); err != nil {
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: firstPlan, now: createdAt.Add(time.Minute), StructuralOnly: true}); err != nil {
 		t.Fatal(err)
 	}
 	headBefore, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
@@ -488,7 +838,7 @@ func TestNoopPlanDoesNotWritePublicationLedger(t *testing.T) {
 	if planned.Changes != 0 {
 		t.Fatalf("planned %d changes, want no-op", planned.Changes)
 	}
-	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: secondPlan, Now: secondCreatedAt.Add(time.Minute), StructuralOnly: true})
+	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: secondPlan, now: secondCreatedAt.Add(time.Minute), StructuralOnly: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +932,7 @@ func TestApplyRejectsForgedLedgerRetryCommit(t *testing.T) {
 	}
 	commitGitPaths(t, root, "forged publication\n\nSnailmail-Plan: "+planned.PlanID, "publications/helm.jsonl")
 	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-		Root: root, Plan: planName, Now: createdAt.Add(time.Minute), StructuralOnly: true,
+		Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true,
 	}); err == nil {
 		t.Fatal("expected forged publication commit to be rejected")
 	}
@@ -699,13 +1049,71 @@ func TestApplyResumesAfterLedgerCommitBeforePublication(t *testing.T) {
 		t.Fatal("ledger-only transaction unexpectedly published the target")
 	}
 	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
-		Root: root, Plan: planName, Now: createdAt.Add(time.Minute), StructuralOnly: true,
+		Root: root, Plan: planName, now: createdAt.Add(time.Minute), StructuralOnly: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Applied != 1 {
 		t.Fatalf("resumed apply result %#v", result)
+	}
+}
+
+func TestApplyRecoversReceiptForExactRemoteEffectWithoutRestaging(t *testing.T) {
+	root := t.TempDir()
+	command := exec.Command("git", "init", "-b", "main")
+	command.Dir = root
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := InitWorkspace(InitWorkspaceRequest{Root: root, Name: "receipt-retry"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetupRepository(SetupRepositoryRequest{
+		Root: root, Name: "python", Format: "pypi", HostType: "s3", Visibility: "public",
+		Bucket: "packages", CanonicalEndpoint: "https://packages.example/python",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	artifact := workspaceArtifact(t, root, "pypi", "1.2.3")
+	if _, err := AddArtifacts(AddArtifactsRequest{Root: root, Repository: "python", Artifacts: []string{artifact}}); err != nil {
+		t.Fatal(err)
+	}
+	commitWorkspace(t, root, "add receipt retry wheel")
+	remote := &recordingHost{}
+	resolver := staticHostResolver{host: remote}
+	now := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	planName := filepath.Join(root, "receipt-retry.json")
+	planned, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: planName, CreatedAt: now, GeneratedAt: now, ExpiresIn: time.Hour, Hosts: resolver})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := state.LoadPlan(planName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := plan.Payload.Repositories[0]
+	manifest, err := state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := state.LoadLock(root, manifest.Repositories["python"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.PreparePublicationRecords(root, plan.Payload.GitRevision, "python", planned.PlanID, repository.ChangeID, repository.DesiredTreeSHA256, plan.Payload.CreatedAt, activeLock(lock)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.CommitPublicationLedgers(root, planned.PlanID, plan.Payload.GitRevision, []string{"python"}); err != nil {
+		t.Fatal(err)
+	}
+	remote.revision = host.PublishedRevision{
+		NativeRevision: "remote-revision", TreeSHA256: repository.DesiredTreeSHA256,
+		PlanID: planned.PlanID, ChangeID: repository.ChangeID, ManifestSHA256: repository.DesiredManifestSHA256,
+	}
+	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: planName, now: now.Add(time.Minute), StructuralOnly: true, Hosts: resolver})
+	if err != nil || result.Current != 1 || remote.stageCalls != 0 || remote.commitCalls != 0 {
+		t.Fatalf("receipt recovery result=%#v stages=%d commits=%d err=%v", result, remote.stageCalls, remote.commitCalls, err)
 	}
 }
 
@@ -722,7 +1130,7 @@ func TestLedgerCommitStagesAssumeUnchangedLedger(t *testing.T) {
 	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{Root: root, Output: firstPlan, CreatedAt: createdAt, GeneratedAt: createdAt, ExpiresIn: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: firstPlan, Now: createdAt.Add(time.Minute), StructuralOnly: true}); err != nil {
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: firstPlan, now: createdAt.Add(time.Minute), StructuralOnly: true}); err != nil {
 		t.Fatal(err)
 	}
 	second := workspaceArtifact(t, root, "pypi", "2.0.0")
@@ -738,7 +1146,7 @@ func TestLedgerCommitStagesAssumeUnchangedLedger(t *testing.T) {
 	if output, err := exec.Command("git", "-C", root, "update-index", "--assume-unchanged", "publications/pypi.jsonl").CombinedOutput(); err != nil {
 		t.Fatalf("git update-index: %v: %s", err, output)
 	}
-	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: secondPlan, Now: secondCreatedAt.Add(time.Minute), StructuralOnly: true}); err != nil {
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{Root: root, Plan: secondPlan, now: secondCreatedAt.Add(time.Minute), StructuralOnly: true}); err != nil {
 		t.Fatal(err)
 	}
 	records, err := state.LoadLedger(root, "pypi")
@@ -944,6 +1352,58 @@ func (resolver staticHostResolver) Resolve(context.Context, host.Repository) (ho
 	return resolver.host, nil
 }
 
+type staticBlobResolver struct {
+	store blob.Store
+}
+
+type routingBlobResolver struct {
+	stores map[string]blob.Store
+}
+
+func (resolver routingBlobResolver) Resolve(_ context.Context, configuration blob.Configuration) (blob.Store, error) {
+	store := resolver.stores[configuration.Bucket]
+	if store == nil {
+		return nil, fmt.Errorf("no blob store for bucket %q", configuration.Bucket)
+	}
+	return store, nil
+}
+
+func (resolver staticBlobResolver) Resolve(context.Context, blob.Configuration) (blob.Store, error) {
+	return resolver.store, nil
+}
+
+type memoryBlobStore struct {
+	objects map[string][]byte
+}
+
+func (store *memoryBlobStore) Put(_ context.Context, ref blob.Ref, reader io.Reader) error {
+	content, err := io.ReadAll(io.LimitReader(reader, ref.Size+1))
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(content)
+	if int64(len(content)) != ref.Size || hex.EncodeToString(digest[:]) != ref.SHA256 {
+		return errors.New("blob upload does not match reference")
+	}
+	if existing, exists := store.objects[ref.SHA256]; exists && string(existing) != string(content) {
+		return errors.New("immutable blob conflict")
+	}
+	store.objects[ref.SHA256] = append([]byte(nil), content...)
+	return nil
+}
+
+func (store *memoryBlobStore) Fetch(_ context.Context, ref blob.Ref, writer io.Writer) error {
+	content, exists := store.objects[ref.SHA256]
+	if !exists {
+		return blob.ErrNotFound
+	}
+	if int64(len(content)) != ref.Size {
+		return errors.New("stored blob size mismatch")
+	}
+	_, err := writer.Write(content)
+	return err
+}
+
 type recordingHost struct {
 	revision    host.PublishedRevision
 	staged      host.StagedPublication
@@ -959,12 +1419,16 @@ func (remote *recordingHost) Observe(context.Context, host.Repository) (host.Pub
 	return remote.revision, nil
 }
 
+func (remote *recordingHost) ReadAccess(_ context.Context, repository host.Repository, _ host.PublishedRevision) (host.ClientAccess, error) {
+	return host.ClientAccess{Endpoint: repository.CanonicalEndpoint}, nil
+}
+
 func (remote *recordingHost) Stage(_ context.Context, _ host.Repository, request host.StageRequest) (host.StagedPublication, error) {
 	remote.stageCalls++
 	remote.staged = host.StagedPublication{
 		ID: request.PlanID + ":" + request.ChangeID, PlanID: request.PlanID, ChangeID: request.ChangeID,
-		PreviewEndpoint: "https://preview.example/python",
-		TreeSHA256:      request.TreeSHA256, Files: request.Files, CommitPaths: request.CommitPaths,
+		PreviousRevision: request.PreviousRevision, PreviewEndpoint: "https://preview.example/python",
+		TreeSHA256: request.TreeSHA256, Files: request.Files, CommitPaths: request.CommitPaths,
 	}
 	return remote.staged, nil
 }

@@ -684,6 +684,13 @@ specific forge.
 Approval is bound to the plan ID, target, approver identity, and expiry. Editing
 or regenerating a plan invalidates prior approval.
 
+The Phase 2 plain-Git approval record is an Ed25519 signature. Allowed public
+keys are reviewed in the manifest and executable plan; private keys remain
+outside the workspace. GitHub PR gates bind the configured state repository,
+merged review, default branch, and exact reachable Git revision. Apply evaluates
+all non-noop gates before staging and re-evaluates immediately before each
+stage, commit, or compensating restore.
+
 ### 9.2 Workspace concurrency
 
 Local mutations use an advisory workspace lock, write-temp-and-rename, and an
@@ -731,6 +738,14 @@ Audit dates and identities come from Git commits, plan approvals, target APIs,
 and apply results. If a durable rollout object becomes necessary later, it must
 be committed as event data in Git rather than introduced as a hidden database.
 
+Publication ledgers are committed before host effects to preserve immutable
+package-version bindings and permit exact retries; they are not deployment
+proof. After every canonical probe succeeds, apply commits a separate
+repository-level deployment receipt. The static status renderer reports
+`current` only when desired lock bytes, ledger binding, and deployment receipt
+agree. Missing or stale receipts remain `unknown` or `lagging` rather than being
+collapsed into success.
+
 Every status cell is one of `current`, `lagging`, `missing`, `pending`,
 `failed`, or `unknown`. Cached observations carry age and origin. `unknown` can
 never be collapsed into `missing`.
@@ -765,11 +780,13 @@ credentials are never exposed to verification containers.
 
 Private-repository verification uses a one-time, read-only credential scoped to
 the staged revision. `Host.Stage` obtains it through a credential broker and
-returns an opaque secret handle, not token bytes. `Runner` injects the handle
-through its secret channel as an in-memory client credential, masks derived
-values from output, and destroys it with the container. The token has no publish
-permission and expires with the stage. A host that cannot issue such a scoped
-credential is unsupported for pre-publication verification of private content.
+returns an opaque secret handle, not token bytes. The current PyPI S3 slice
+injects Basic credentials through a mode-0600 netrc under pip's isolated
+temporary home, scrubs that file when pip exits, masks derived values from
+output, and destroys the handle. Containerized clients use the runner's
+in-memory secret channel instead. The token has no publish permission and
+expires with the stage. A host that cannot issue such a scoped credential is
+unsupported for pre-publication verification of private content.
 
 Adapters request the narrowest credential for one operation. OIDC federation is
 preferred over long-lived cloud credentials. The key backend returns signatures
@@ -942,7 +959,9 @@ The phase numbers below use the canonical roadmap in `PLAN.md` §14:
 3. **Phase 2:** add the provider-neutral host port and owned remote hosting.
    Public S3-compatible PyPI is the first slice; private-capable S3, public
    GitHub Pages, shared remote blob storage, publication gates, the public
-   status renderer, and containerized CI distribution complete the phase.
+   status renderer, and containerized CI distribution complete the phase. The
+   implemented slice includes all of these components for the current PyPI
+   remote-host scope.
 4. **Phase 3:** add explicit signing and key operations, operational status and
    adoption commands, the knowledge bundle, and additional Tier 1 formats.
 5. **Phase 4:** add read-only foreign observation before irreversible remote

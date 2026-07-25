@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
 )
@@ -168,13 +170,38 @@ func VerifyPyPIClient(ctx context.Context, root, python string) (buildgraph.Repo
 	}
 	server := httptest.NewServer(http.FileServer(http.Dir(snapshot)))
 	defer server.Close()
-	installed, err := verifyPyPICases(ctx, manifest, blobs, server.URL, python)
+	installed, err := verifyPyPICases(ctx, manifest, blobs, server.URL, python, "", "", false)
 	return manifest, installed, err
 }
 
 // VerifyPyPIClientEndpoint verifies the local immutable tree but installs from
 // the host-served endpoint, proving staged or canonical HTTP behavior.
 func VerifyPyPIClientEndpoint(ctx context.Context, root, endpoint, python string) (buildgraph.RepositoryManifest, int, error) {
+	return VerifyPyPIClientEndpointAccess(ctx, root, host.ClientAccess{Endpoint: endpoint}, python)
+}
+
+func VerifyPyPIClientEndpointAccess(ctx context.Context, root string, access host.ClientAccess, python string) (buildgraph.RepositoryManifest, int, error) {
+	if access.Credential != nil {
+		defer access.Credential.Destroy()
+	}
+	parsed, err := url.Parse(access.Endpoint)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return buildgraph.RepositoryManifest{}, 0, errors.New("PyPI verification endpoint must be an HTTP(S) URL")
+	}
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+		return buildgraph.RepositoryManifest{}, 0, errors.New("PyPI verification endpoint must use HTTPS")
+	}
+	username, password := "", ""
+	private := access.Credential != nil
+	if private {
+		username, password, err = access.Credential.Basic(ctx)
+		if err != nil {
+			return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("resolve private repository credential: %w", err)
+		}
+		if !validNetrcValue(username) || !validNetrcValue(password) {
+			return buildgraph.RepositoryManifest{}, 0, errors.New("private repository credential is not safe for netrc injection")
+		}
+	}
 	manifest, blobs, err := verifyRepository(root)
 	if err != nil {
 		return buildgraph.RepositoryManifest{}, 0, err
@@ -182,15 +209,34 @@ func VerifyPyPIClientEndpoint(ctx context.Context, root, endpoint, python string
 	if manifest.Format != pypi.FormatID {
 		return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("repository format is %q, not %q", manifest.Format, pypi.FormatID)
 	}
-	parsed, err := url.Parse(endpoint)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return buildgraph.RepositoryManifest{}, 0, errors.New("PyPI verification endpoint must be an HTTP(S) URL")
+	if len(access.Routes) == 0 {
+		access.Routes, err = defaultPyPIClientRoutes(access.Endpoint, manifest.Files)
+		if err != nil {
+			return buildgraph.RepositoryManifest{}, 0, err
+		}
 	}
-	installed, err := verifyPyPICases(ctx, manifest, blobs, strings.TrimSuffix(endpoint, "/"), python)
+	deadline := time.Now().Add(access.PropagationTimeout)
+	for {
+		err = verifyHostedPyPIBytes(ctx, access, username, password, private)
+		if err == nil {
+			break
+		}
+		if access.PropagationTimeout <= 0 || !time.Now().Before(deadline) {
+			return buildgraph.RepositoryManifest{}, 0, err
+		}
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return buildgraph.RepositoryManifest{}, 0, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	installed, err := verifyPyPICases(ctx, manifest, blobs, strings.TrimSuffix(access.Endpoint, "/"), python, username, password, private)
 	return manifest, installed, err
 }
 
-func verifyPyPICases(ctx context.Context, manifest buildgraph.RepositoryManifest, blobs []domain.Blob, endpoint, python string) (int, error) {
+func verifyPyPICases(ctx context.Context, manifest buildgraph.RepositoryManifest, blobs []domain.Blob, endpoint, python, username, password string, private bool) (int, error) {
 	parsedEndpoint, err := url.Parse(endpoint)
 	if err != nil || parsedEndpoint.Hostname() == "" {
 		return 0, errors.New("invalid PyPI verification endpoint")
@@ -236,6 +282,13 @@ func verifyPyPICases(ctx context.Context, manifest buildgraph.RepositoryManifest
 			_ = os.RemoveAll(sandbox)
 			return 0, err
 		}
+		if private {
+			netrc := []byte("machine " + parsedEndpoint.Hostname() + "\nlogin " + username + "\npassword " + password + "\n")
+			if err := os.WriteFile(filepath.Join(home, ".netrc"), netrc, 0o600); err != nil {
+				_ = os.RemoveAll(sandbox)
+				return 0, err
+			}
+		}
 		arguments := []string{
 			"-I", "-m", "pip", "install",
 			"--disable-pip-version-check",
@@ -265,15 +318,131 @@ func verifyPyPICases(ctx context.Context, manifest buildgraph.RepositoryManifest
 			"no_proxy=" + noProxy,
 		}
 		output, commandErr := command.CombinedOutput()
+		credentialCleanupErr := error(nil)
+		if private {
+			netrcPath := filepath.Join(home, ".netrc")
+			if err := os.WriteFile(netrcPath, nil, 0o600); err != nil {
+				credentialCleanupErr = err
+			} else if err := os.Remove(netrcPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				credentialCleanupErr = err
+			}
+		}
 		removeErr := os.RemoveAll(sandbox)
 		if commandErr != nil {
-			return 0, fmt.Errorf("pip install %s==%s: %w\n%s", verification.Project, verification.Version, commandErr, strings.TrimSpace(string(output)))
+			if credentialCleanupErr != nil || removeErr != nil {
+				return 0, fmt.Errorf("pip install %s==%s: %w\n%s\ncredential cleanup: %v; sandbox cleanup: %v", verification.Project, verification.Version, commandErr, redactCredential(strings.TrimSpace(string(output)), username, password), credentialCleanupErr, removeErr)
+			}
+			return 0, fmt.Errorf("pip install %s==%s: %w\n%s", verification.Project, verification.Version, commandErr, redactCredential(strings.TrimSpace(string(output)), username, password))
+		}
+		if credentialCleanupErr != nil {
+			return 0, fmt.Errorf("remove pip credential: %w", credentialCleanupErr)
 		}
 		if removeErr != nil {
 			return 0, fmt.Errorf("remove pip target: %w", removeErr)
 		}
 	}
 	return len(manifest.VerificationCases), nil
+}
+
+func verifyHostedPyPIBytes(ctx context.Context, access host.ClientAccess, username, password string, private bool) error {
+	endpoint, err := url.Parse(access.Endpoint)
+	if err != nil {
+		return errors.New("invalid PyPI verification endpoint")
+	}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return errors.New("repository verification does not follow redirects")
+		},
+	}
+	verifyURL := func(address string, expectedSize int64, expectedSHA256 string) ([]byte, error) {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
+		if err != nil {
+			return nil, err
+		}
+		if private {
+			request.SetBasicAuth(username, password)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, err
+		}
+		content, readErr := io.ReadAll(io.LimitReader(response.Body, expectedSize+1))
+		closeErr := response.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		digest := sha256.Sum256(content)
+		if response.StatusCode != http.StatusOK || int64(len(content)) != expectedSize || hex.EncodeToString(digest[:]) != expectedSHA256 {
+			return nil, errors.New("host-served repository bytes do not match the reviewed tree")
+		}
+		return content, nil
+	}
+	for _, route := range access.Routes {
+		parsed, err := url.Parse(route.URL)
+		if err != nil || parsed.Scheme != endpoint.Scheme || parsed.Host != endpoint.Host || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || route.Size < 0 {
+			return errors.New("host supplied an invalid client verification route")
+		}
+		if _, err := verifyURL(route.URL, route.Size, route.SHA256); err != nil {
+			return fmt.Errorf("verify host-served route %q: %w", parsed.EscapedPath(), err)
+		}
+	}
+	return nil
+}
+
+func defaultPyPIClientRoutes(endpoint string, files []buildgraph.ManifestFile) ([]host.ClientRoute, error) {
+	routes := make([]host.ClientRoute, 0, len(files))
+	for _, file := range files {
+		routePath := file.Path
+		if strings.HasSuffix(routePath, "/index.html") {
+			routePath = strings.TrimSuffix(routePath, "index.html")
+		}
+		address, err := url.JoinPath(strings.TrimSuffix(endpoint, "/")+"/", routePath)
+		if err != nil {
+			return nil, err
+		}
+		if strings.HasSuffix(routePath, "/") && !strings.HasSuffix(address, "/") {
+			address += "/"
+		}
+		routes = append(routes, host.ClientRoute{URL: address, Size: file.Size, SHA256: file.SHA256})
+	}
+	return routes, nil
+}
+
+func validNetrcValue(value string) bool {
+	if value == "" {
+		return false
+	}
+	if strings.ContainsAny(value, `\"'#`) {
+		return false
+	}
+	for _, character := range value {
+		if character <= 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func isLoopbackHost(value string) bool {
+	return value == "localhost" || value == "127.0.0.1" || value == "::1"
+}
+
+func redactCredential(value, username, password string) string {
+	secrets := []string{
+		username, password, url.QueryEscape(username), url.QueryEscape(password),
+		base64.StdEncoding.EncodeToString([]byte(username + ":" + password)),
+	}
+	sort.Slice(secrets, func(left, right int) bool { return len(secrets[left]) > len(secrets[right]) })
+	for _, secret := range secrets {
+		if secret != "" {
+			value = strings.ReplaceAll(value, secret, "[REDACTED]")
+		}
+	}
+	return value
 }
 
 // VerifyDebClient resolves and extracts each planned package version in its own
@@ -642,6 +811,12 @@ func requireJSONEOF(decoder *json.Decoder) error {
 func verifyPyPIStructure(root string, manifest buildgraph.RepositoryManifest) ([]domain.Blob, error) {
 	var blobs []domain.Blob
 	for _, file := range manifest.Files {
+		if file.Path == ".nojekyll" {
+			if file.Size != 0 {
+				return nil, errors.New("PyPI .nojekyll marker must be empty")
+			}
+			continue
+		}
 		if strings.HasPrefix(file.Path, "simple/") {
 			if path.Base(file.Path) != "index.html" {
 				return nil, fmt.Errorf("unexpected PyPI index path %q", file.Path)

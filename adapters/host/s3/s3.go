@@ -38,21 +38,30 @@ const (
 
 type Adapter struct {
 	client ObjectClient
+	broker host.CredentialBroker
 }
 
-func New(client ObjectClient) *Adapter {
-	return &Adapter{client: client}
+func New(client ObjectClient, brokers ...host.CredentialBroker) *Adapter {
+	adapter := &Adapter{client: client}
+	if len(brokers) != 0 {
+		adapter.broker = brokers[0]
+	}
+	return adapter
 }
 
 func (adapter *Adapter) Capabilities(_ context.Context, repository host.Repository) (host.Capabilities, error) {
-	if err := validateRepository(repository); err != nil {
+	if err := adapter.validateRepository(repository); err != nil {
 		return host.Capabilities{}, err
 	}
-	return host.Capabilities{FaithfulPreview: true, ConditionalCommit: true, ConditionalRestore: true}, nil
+	capabilities := host.Capabilities{FaithfulPreview: true, ConditionalCommit: true, ConditionalRestore: true, PrivateRead: adapter.broker != nil}
+	if adapter.broker != nil {
+		capabilities.CredentialBrokerIdentity = adapter.broker.Identity()
+	}
+	return capabilities, nil
 }
 
 func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository) (host.PublishedRevision, error) {
-	if err := validateRepository(repository); err != nil {
+	if err := adapter.validateRepository(repository); err != nil {
 		return host.PublishedRevision{}, err
 	}
 	root, err := adapter.client.Head(ctx, objectKey(repository, pypiRootPath))
@@ -171,8 +180,45 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 	return revision, nil
 }
 
+func (adapter *Adapter) ReadAccess(ctx context.Context, repository host.Repository, revision host.PublishedRevision) (host.ClientAccess, error) {
+	if err := adapter.validateRepository(repository); err != nil {
+		return host.ClientAccess{}, err
+	}
+	if revision.TreeSHA256 == "" {
+		return host.ClientAccess{}, &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "issue S3 read access", Err: errors.New("published revision has no tree identity")}
+	}
+	observed, err := adapter.Observe(ctx, repository)
+	if err != nil {
+		return host.ClientAccess{}, err
+	}
+	if observed != revision {
+		return host.ClientAccess{}, &host.Error{Kind: host.ErrorStale, Operation: "issue S3 read access", Err: errors.New("requested revision is no longer canonical")}
+	}
+	descriptor, _, err := adapter.loadRelease(ctx, repository, revision.TreeSHA256)
+	if err != nil {
+		return host.ClientAccess{}, err
+	}
+	releaseRoot, _, err := adapter.client.Get(ctx, releaseKey(repository, revision.TreeSHA256, pypiRootPath), maximumMetadataSize)
+	if err != nil {
+		return host.ClientAccess{}, infrastructure("read immutable S3 root", err)
+	}
+	canonicalRoot, err := rewritePyPIRoot(releaseRoot, rootBindingFromRevision(revision))
+	if err != nil {
+		return host.ClientAccess{}, err
+	}
+	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, revision.TreeSHA256, descriptor.Files, canonicalRoot)
+	if err != nil {
+		return host.ClientAccess{}, err
+	}
+	return adapter.issueAccess(ctx, repository, host.ReadScope{
+		WorkspaceID: repository.WorkspaceID, Repository: repository.Name, HostIdentity: repository.HostIdentity,
+		Bucket: repository.Bucket, Endpoint: repository.CanonicalEndpoint, PlanID: revision.PlanID, ChangeID: revision.ChangeID, TreeSHA256: revision.TreeSHA256,
+		Prefixes: []string{objectKey(repository, pypiRootPath), releaseKey(repository, revision.TreeSHA256, "")},
+	}, routes)
+}
+
 func (adapter *Adapter) Stage(ctx context.Context, repository host.Repository, request host.StageRequest) (result host.StagedPublication, resultErr error) {
-	if err := validateRepository(repository); err != nil {
+	if err := adapter.validateRepository(repository); err != nil {
 		return host.StagedPublication{}, err
 	}
 	descriptor, _, err := descriptorFromRequest(request)
@@ -188,7 +234,7 @@ func (adapter *Adapter) Stage(ctx context.Context, repository host.Repository, r
 	if pointer, pointerErr := adapter.loadStagePointer(ctx, repository, effectID); pointerErr == nil {
 		existing, loadErr := adapter.loadStage(ctx, repository, pointer.ID)
 		if loadErr == nil && pointer.DescriptorSHA256 == descriptorDigest && reflect.DeepEqual(existing, descriptor) {
-			return stagedPublication(repository, pointer.ID, existing), nil
+			return adapter.stageResult(ctx, repository, pointer.ID, existing)
 		}
 		if loadErr != nil {
 			return host.StagedPublication{}, loadErr
@@ -261,6 +307,16 @@ func (adapter *Adapter) Stage(ctx context.Context, repository host.Repository, r
 	}); err != nil {
 		return host.StagedPublication{}, infrastructure("write S3 stage descriptor", err)
 	}
+	stagedResult, err := adapter.stageResult(ctx, repository, identifier, descriptor)
+	if err != nil {
+		return host.StagedPublication{}, err
+	}
+	candidateCredential := stagedResult.Access.Credential
+	defer func() {
+		if resultErr != nil && candidateCredential != nil {
+			candidateCredential.Destroy()
+		}
+	}()
 	pointerContent, err := json.Marshal(stagePointer{ID: identifier, DescriptorSHA256: descriptorDigest})
 	if err != nil {
 		return host.StagedPublication{}, err
@@ -285,22 +341,27 @@ func (adapter *Adapter) Stage(ctx context.Context, repository host.Repository, r
 		}
 		cancelCleanup()
 		uploaded = nil
-		return stagedPublication(repository, pointer.ID, existing), nil
+		if candidateCredential != nil {
+			candidateCredential.Destroy()
+			candidateCredential = nil
+		}
+		return adapter.stageResult(ctx, repository, pointer.ID, existing)
 	} else if err != nil {
 		pointer, readErr := adapter.loadStagePointer(ctx, repository, effectID)
 		if readErr == nil && pointer.ID == identifier && pointer.DescriptorSHA256 == descriptorDigest {
-			return stagedPublication(repository, identifier, descriptor), nil
+			return stagedResult, nil
 		}
 		if readErr != nil && !errors.Is(readErr, ErrNotFound) {
+			uploaded = nil
 			return host.StagedPublication{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "publish S3 stage pointer", EffectMayHaveOccurred: true, Err: readErr}
 		}
 		return host.StagedPublication{}, infrastructure("publish S3 stage pointer", err)
 	}
-	return stagedPublication(repository, identifier, descriptor), nil
+	return stagedResult, nil
 }
 
 func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, staged host.StagedPublication, expected host.ExpectedRevision) (host.CommitResult, error) {
-	if err := validateRepository(repository); err != nil {
+	if err := adapter.validateRepository(repository); err != nil {
 		return host.CommitResult{}, err
 	}
 	descriptor, err := adapter.loadStage(ctx, repository, staged.ID)
@@ -327,7 +388,11 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 	if observed.TreeSHA256 == descriptor.TreeSHA256 && observed.PlanID == descriptor.PlanID && observed.ChangeID == descriptor.ChangeID &&
 		observed.ReleaseSHA256 == expectedReleaseDigest && observed.ManifestSHA256 == expectedManifestDigest {
 		if observed.RestoreID == staged.ID {
-			return commitResult(repository, observed), nil
+			access, err := adapter.ReadAccess(ctx, repository, observed)
+			if err != nil {
+				return host.CommitResult{}, err
+			}
+			return commitResult(repository, observed, access), nil
 		}
 		return host.CommitResult{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "commit S3 repository", Err: errors.New("publication effect is already bound to different restore state")}
 	}
@@ -359,6 +424,24 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 	if err != nil {
 		return host.CommitResult{}, err
 	}
+	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, descriptor.TreeSHA256, descriptor.Files, rootContent)
+	if err != nil {
+		return host.CommitResult{}, err
+	}
+	access, err := adapter.issueAccess(ctx, repository, host.ReadScope{
+		WorkspaceID: repository.WorkspaceID, Repository: repository.Name, HostIdentity: repository.HostIdentity,
+		Bucket: repository.Bucket, Endpoint: repository.CanonicalEndpoint, PlanID: descriptor.PlanID, ChangeID: descriptor.ChangeID, TreeSHA256: descriptor.TreeSHA256,
+		Prefixes: []string{objectKey(repository, pypiRootPath), releaseKey(repository, descriptor.TreeSHA256, "")},
+	}, routes)
+	if err != nil {
+		return host.CommitResult{}, err
+	}
+	accessReturned := false
+	defer func() {
+		if !accessReturned && access.Credential != nil {
+			access.Credential.Destroy()
+		}
+	}()
 	conditions := Conditions{IfMatch: expected.NativeRevision, IfNoneMatch: expected.NativeRevision == ""}
 	rootMetadata := map[string]string{
 		"tree-sha256": descriptor.TreeSHA256, "plan-id": descriptor.PlanID,
@@ -377,7 +460,8 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 	if err != nil {
 		postcondition, observeErr := adapter.Observe(ctx, repository)
 		if observeErr == nil && revisionMatchesBinding(postcondition, binding) {
-			return commitResult(repository, postcondition), nil
+			accessReturned = true
+			return commitResult(repository, postcondition, access), nil
 		}
 		if observeErr != nil {
 			return host.CommitResult{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "commit S3 root metadata", EffectMayHaveOccurred: true, Err: observeErr}
@@ -393,11 +477,12 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 		ReleaseSHA256: releaseDigest, ManifestSHA256: manifestDigest,
 		RestoreSHA256: restoreDigest, RestoreRootSHA256: restoreRootDigest,
 	}
-	return commitResult(repository, revision), nil
+	accessReturned = true
+	return commitResult(repository, revision, access), nil
 }
 
 func (adapter *Adapter) Restore(ctx context.Context, repository host.Repository, restore host.RestoreRef, expected host.ExpectedRevision) (host.PublishedRevision, error) {
-	if err := validateRepository(repository); err != nil {
+	if err := adapter.validateRepository(repository); err != nil {
 		return host.PublishedRevision{}, err
 	}
 	if !validIdentifier(restore.ID) || restore.PlanID == "" || restore.ChangeID == "" || !validSHA256(restore.FailedTree) ||
@@ -457,6 +542,9 @@ func (adapter *Adapter) Restore(ctx context.Context, repository host.Repository,
 	if digestBytes(content) != restore.RootSHA256 {
 		return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "read retained S3 root", Err: errors.New("retained root digest does not match restore reference")}
 	}
+	if err := adapter.validateRestoreTarget(ctx, repository, descriptor, content); err != nil {
+		return host.PublishedRevision{}, err
+	}
 	root, err := adapter.client.Put(ctx, PutRequest{
 		Key: rootKey, Body: bytes.NewReader(content), Size: int64(len(content)), SHA256: digestBytes(content),
 		ContentType: contentType(pypiRootPath), Metadata: descriptor.BeforeMetadata,
@@ -473,15 +561,26 @@ func (adapter *Adapter) Restore(ctx context.Context, repository host.Repository,
 		}
 		return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "restore S3 root", EffectMayHaveOccurred: true, Err: err}
 	}
-	return revisionFromRestore(root.ETag, descriptor), nil
+	observed, observeErr := adapter.Observe(ctx, repository)
+	expectedRestored := revisionFromRestore(root.ETag, descriptor)
+	if observeErr != nil || observed != expectedRestored {
+		if observeErr == nil {
+			observeErr = errors.New("restored publication does not match retained state")
+		}
+		return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "verify restored S3 root", EffectMayHaveOccurred: true, Err: observeErr}
+	}
+	return observed, nil
 }
 
 func (adapter *Adapter) Abort(ctx context.Context, repository host.Repository, staged host.StagedPublication) error {
-	if err := validateRepository(repository); err != nil {
+	if err := adapter.validateRepository(repository); err != nil {
 		return err
 	}
 	if !validIdentifier(staged.ID) {
 		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "abort S3 stage", Err: errors.New("invalid stage identifier")}
+	}
+	if staged.Access.Credential != nil {
+		staged.Access.Credential.Destroy()
 	}
 	descriptor, err := adapter.loadStage(ctx, repository, staged.ID)
 	if err != nil {
@@ -875,8 +974,14 @@ func validateRepository(repository host.Repository) error {
 	if repository.Type != "s3" || repository.Format != "pypi" {
 		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("the first S3 slice supports PyPI only")}
 	}
-	if repository.Visibility != "public" {
-		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("private S3 reads require a scoped credential broker and are not implemented")}
+	if repository.Visibility != "public" && repository.Visibility != "private" {
+		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("S3 visibility must be public or private")}
+	}
+	if repository.Visibility == "private" && (repository.ReadAuth != "basic" || repository.CredentialBroker == "") {
+		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("private S3 reads require a Basic credential broker")}
+	}
+	if repository.Visibility == "private" && (!validSHA256(repository.WorkspaceID) || !validSHA256(repository.HostIdentity)) {
+		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("private S3 reads require workspace and host identities")}
 	}
 	if repository.Path != "" || repository.Bucket == "" || repository.CanonicalEndpoint == "" {
 		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("bucket and canonical endpoint are required")}
@@ -891,10 +996,28 @@ func validateRepository(repository host.Repository) error {
 	if err := validateHTTPURL(repository.CanonicalEndpoint); err != nil {
 		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: fmt.Errorf("canonical endpoint: %w", err)}
 	}
+	parsed, _ := url.Parse(repository.CanonicalEndpoint)
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("client endpoint must use HTTPS")}
+	}
 	if repository.Endpoint != "" {
 		if err := validateHTTPURL(repository.Endpoint); err != nil {
 			return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: fmt.Errorf("S3 endpoint: %w", err)}
 		}
+		parsed, _ := url.Parse(repository.Endpoint)
+		if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
+			return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("S3 API endpoint must use HTTPS")}
+		}
+	}
+	return nil
+}
+
+func (adapter *Adapter) validateRepository(repository host.Repository) error {
+	if err := validateRepository(repository); err != nil {
+		return err
+	}
+	if repository.Visibility == "private" && adapter.broker == nil {
+		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("private S3 credential broker is unavailable")}
 	}
 	return nil
 }
@@ -908,6 +1031,10 @@ func validateHTTPURL(value string) error {
 		return errors.New("must be an HTTP(S) URL without credentials, query, or fragment")
 	}
 	return nil
+}
+
+func isLoopbackHost(value string) bool {
+	return value == "localhost" || value == "127.0.0.1" || value == "::1"
 }
 
 func validateFile(file host.File) error {
@@ -1074,9 +1201,9 @@ func revisionMatchesExpected(revision host.PublishedRevision, expected host.Expe
 		revision.RestoreID == expected.RestoreID && revision.RestoreSHA256 == expected.RestoreSHA256 && revision.RestoreRootSHA256 == expected.RestoreRootSHA256
 }
 
-func commitResult(repository host.Repository, revision host.PublishedRevision) host.CommitResult {
+func commitResult(repository host.Repository, revision host.PublishedRevision, access host.ClientAccess) host.CommitResult {
 	return host.CommitResult{
-		Revision: revision, CanonicalEndpoint: repository.CanonicalEndpoint,
+		Revision: revision, CanonicalEndpoint: repository.CanonicalEndpoint, Access: access,
 		RestoreRef: &host.RestoreRef{
 			ID: revision.RestoreID, PlanID: revision.PlanID, ChangeID: revision.ChangeID, FailedTree: revision.TreeSHA256,
 			DescriptorSHA256: revision.RestoreSHA256, RootSHA256: revision.RestoreRootSHA256,
@@ -1097,6 +1224,56 @@ func revisionFromRestore(nativeRevision string, descriptor restoreDescriptor) ho
 		RestoreSHA256:     descriptor.BeforeMetadata["restore-sha256"],
 		RestoreRootSHA256: descriptor.BeforeMetadata["restore-root-sha256"],
 	}
+}
+
+func (adapter *Adapter) validateRestoreTarget(ctx context.Context, repository host.Repository, descriptor restoreDescriptor, rootContent []byte) error {
+	if descriptor.BeforeTreeSHA256 == "" {
+		return nil
+	}
+	revision := revisionFromRestore("", descriptor)
+	release, releaseDigest, err := adapter.loadRelease(ctx, repository, revision.TreeSHA256)
+	if err != nil {
+		return err
+	}
+	if releaseDigest != revision.ReleaseSHA256 {
+		return &host.Error{Kind: host.ErrorIndeterminate, Operation: "validate S3 restore target", Err: errors.New("retained release descriptor is corrupt")}
+	}
+	manifestContent, manifestInfo, err := adapter.client.Get(ctx, publicationManifestKey(repository, revision.ManifestSHA256), maximumMetadataSize)
+	if errors.Is(err, ErrNotFound) {
+		return &host.Error{Kind: host.ErrorIndeterminate, Operation: "validate S3 restore target", Err: errors.New("retained publication manifest is missing")}
+	}
+	if err != nil {
+		return infrastructure("read retained S3 publication manifest", err)
+	}
+	var manifest buildgraph.RepositoryManifest
+	if manifestInfo.SHA256 != revision.ManifestSHA256 || digestBytes(manifestContent) != revision.ManifestSHA256 ||
+		json.Unmarshal(manifestContent, &manifest) != nil || validatePublishedManifest(manifestContent, manifest, release) != nil {
+		return &host.Error{Kind: host.ErrorIndeterminate, Operation: "validate S3 restore target", Err: errors.New("retained publication manifest is corrupt")}
+	}
+	for _, file := range release.Files {
+		info, err := adapter.client.Head(ctx, releaseKey(repository, revision.TreeSHA256, file.Path))
+		if errors.Is(err, ErrNotFound) || (err == nil && (info.Size != file.Size || info.SHA256 != file.SHA256 || info.Metadata["sha256"] != file.SHA256)) {
+			return &host.Error{Kind: host.ErrorIndeterminate, Operation: "validate S3 restore target", Err: fmt.Errorf("retained release object %q is missing or corrupt", file.Path)}
+		}
+		if err != nil {
+			return infrastructure("inspect retained S3 release object", err)
+		}
+	}
+	immutableRoot, _, err := adapter.client.Get(ctx, releaseKey(repository, revision.TreeSHA256, pypiRootPath), maximumMetadataSize)
+	if errors.Is(err, ErrNotFound) {
+		return &host.Error{Kind: host.ErrorIndeterminate, Operation: "validate S3 restore target", Err: errors.New("retained immutable root is missing")}
+	}
+	if err != nil {
+		return infrastructure("read retained immutable S3 root", err)
+	}
+	expectedRoot, err := rewritePyPIRoot(immutableRoot, rootBindingFromRevision(revision))
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(rootContent, expectedRoot) {
+		return &host.Error{Kind: host.ErrorIndeterminate, Operation: "validate S3 restore target", Err: errors.New("retained canonical root does not match its immutable release")}
+	}
+	return nil
 }
 
 func (adapter *Adapter) restorePostcondition(ctx context.Context, repository host.Repository, descriptor restoreDescriptor, restore host.RestoreRef) (bool, host.PublishedRevision, error) {
@@ -1120,7 +1297,11 @@ func (adapter *Adapter) restorePostcondition(ctx context.Context, repository hos
 	if digestBytes(content) != restore.RootSHA256 || !reflect.DeepEqual(info.Metadata, descriptor.BeforeMetadata) {
 		return false, host.PublishedRevision{}, nil
 	}
-	return true, revisionFromRestore(info.ETag, descriptor), nil
+	observed, err := adapter.Observe(ctx, repository)
+	if err != nil {
+		return false, host.PublishedRevision{}, err
+	}
+	return true, observed, nil
 }
 
 func hasControl(value string) bool {
@@ -1145,13 +1326,96 @@ func effectIdentifier(planID, changeID string) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func stagedPublication(repository host.Repository, identifier string, descriptor publicationDescriptor) host.StagedPublication {
+func (adapter *Adapter) stageResult(ctx context.Context, repository host.Repository, identifier string, descriptor publicationDescriptor) (host.StagedPublication, error) {
+	routes, err := clientRoutes(strings.TrimSuffix(repository.CanonicalEndpoint, "/")+"/.snailmail/stages/"+identifier, descriptor.Files, nil)
+	if err != nil {
+		return host.StagedPublication{}, err
+	}
+	access, err := adapter.issueAccess(ctx, repository, host.ReadScope{
+		WorkspaceID: repository.WorkspaceID, Repository: repository.Name, HostIdentity: repository.HostIdentity,
+		Bucket: repository.Bucket, Endpoint: repository.CanonicalEndpoint, PlanID: descriptor.PlanID, ChangeID: descriptor.ChangeID,
+		StageID: identifier, TreeSHA256: descriptor.TreeSHA256, Prefixes: []string{stageKey(repository, identifier, "")},
+	}, routes)
+	if err != nil {
+		return host.StagedPublication{}, err
+	}
 	return host.StagedPublication{
 		ID: identifier, PlanID: descriptor.PlanID, ChangeID: descriptor.ChangeID,
 		PreviewEndpoint: strings.TrimSuffix(repository.CanonicalEndpoint, "/") + "/.snailmail/stages/" + identifier,
 		TreeSHA256:      descriptor.TreeSHA256, Files: append([]host.File(nil), descriptor.Files...),
-		CommitPaths: append([]string(nil), descriptor.CommitPaths...),
+		CommitPaths: append([]string(nil), descriptor.CommitPaths...), Access: access,
+	}, nil
+}
+
+func (adapter *Adapter) issueAccess(ctx context.Context, repository host.Repository, scope host.ReadScope, routes []host.ClientRoute) (host.ClientAccess, error) {
+	access := host.ClientAccess{Endpoint: repository.CanonicalEndpoint, Routes: routes}
+	if scope.StageID != "" {
+		access.Endpoint = strings.TrimSuffix(repository.CanonicalEndpoint, "/") + "/.snailmail/stages/" + scope.StageID
 	}
+	if repository.Visibility == "public" {
+		return access, nil
+	}
+	credential, err := adapter.broker.Issue(ctx, scope)
+	if err != nil {
+		return host.ClientAccess{}, &host.Error{Kind: host.ErrorInfrastructure, Operation: "issue private S3 read credential", Retryable: true, Err: err}
+	}
+	access.Credential = credential
+	return access, nil
+}
+
+func canonicalClientRoutes(endpoint, treeSHA256 string, files []host.File, rootContent []byte) ([]host.ClientRoute, error) {
+	releaseEndpoint := strings.TrimSuffix(endpoint, "/") + "/.snailmail/releases/" + treeSHA256
+	routes := make([]host.ClientRoute, 0, len(files))
+	for _, file := range files {
+		base := releaseEndpoint
+		content := []byte(nil)
+		if file.Path == pypiRootPath {
+			base = endpoint
+			content = rootContent
+		}
+		route, err := clientRoute(base, file, content)
+		if err != nil {
+			return nil, err
+		}
+		routes = append(routes, route)
+	}
+	return routes, nil
+}
+
+func clientRoutes(endpoint string, files []host.File, rootContent []byte) ([]host.ClientRoute, error) {
+	routes := make([]host.ClientRoute, 0, len(files))
+	for _, file := range files {
+		content := []byte(nil)
+		if file.Path == pypiRootPath {
+			content = rootContent
+		}
+		route, err := clientRoute(endpoint, file, content)
+		if err != nil {
+			return nil, err
+		}
+		routes = append(routes, route)
+	}
+	return routes, nil
+}
+
+func clientRoute(endpoint string, file host.File, content []byte) (host.ClientRoute, error) {
+	routePath := file.Path
+	if strings.HasSuffix(routePath, "/index.html") {
+		routePath = strings.TrimSuffix(routePath, "index.html")
+	}
+	address, err := url.JoinPath(strings.TrimSuffix(endpoint, "/")+"/", routePath)
+	if err != nil {
+		return host.ClientRoute{}, err
+	}
+	if strings.HasSuffix(routePath, "/") && !strings.HasSuffix(address, "/") {
+		address += "/"
+	}
+	route := host.ClientRoute{URL: address, Size: file.Size, SHA256: file.SHA256}
+	if content != nil {
+		route.Size = int64(len(content))
+		route.SHA256 = digestBytes(content)
+	}
+	return route, nil
 }
 
 func objectKey(repository host.Repository, name string) string {

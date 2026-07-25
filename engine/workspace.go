@@ -10,22 +10,27 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
 
 	localhost "github.com/shellcell/snailmail/adapters/host/local"
+	"github.com/shellcell/snailmail/blob"
 	"github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/state"
+	statusrenderer "github.com/shellcell/snailmail/internal/status"
 )
 
 const phase1EngineVersion = "phase2-v1"
 
 type InitWorkspaceRequest struct {
-	Root string
-	Name string
+	Root            string
+	Name            string
+	ForgeRepository string
 }
 
 type SetupRepositoryRequest struct {
@@ -34,6 +39,8 @@ type SetupRepositoryRequest struct {
 	Format            string
 	Output            string
 	HostType          string
+	Gate              string
+	ApprovalKeys      []string
 	Visibility        string
 	Bucket            string
 	Prefix            string
@@ -41,16 +48,37 @@ type SetupRepositoryRequest struct {
 	Endpoint          string
 	CanonicalEndpoint string
 	UsePathStyle      bool
+	ReadAuth          string
+	CredentialBroker  string
+	RemoteRepository  string
+	Branch            string
+	PreviewRepository string
+	PreviewBranch     string
+	PreviewEndpoint   string
 	Suite             string
 	Component         string
 	Architectures     []string
 }
 
 type AddArtifactsRequest struct {
+	Context    context.Context
 	Root       string
 	Repository string
 	Artifacts  []string
 	Track      string
+	Blobs      blob.Resolver
+}
+
+type ConfigureBlobStoreRequest struct {
+	Context      context.Context
+	Root         string
+	Type         string
+	Bucket       string
+	Prefix       string
+	Region       string
+	Endpoint     string
+	UsePathStyle bool
+	Blobs        blob.Resolver
 }
 
 type AddArtifactsResult struct {
@@ -68,6 +96,7 @@ type PlanWorkspaceRequest struct {
 	ExpiresIn        time.Duration
 	VerificationMode string
 	Hosts            host.Resolver
+	Blobs            blob.Resolver
 }
 
 type PlanWorkspaceResult struct {
@@ -76,10 +105,39 @@ type PlanWorkspaceResult struct {
 	Changes int
 }
 
+type ApprovePlanRequest struct {
+	Root       string
+	Plan       string
+	Output     string
+	Repository string
+	KeyFile    string
+	Now        time.Time
+	ExpiresIn  time.Duration
+}
+
+type ApprovePlanResult struct {
+	PlanID   string
+	Output   string
+	Approver string
+}
+
+type RenderStatusRequest struct {
+	Root   string
+	Output string
+	Plan   string
+	Now    time.Time
+}
+
+type RenderStatusResult struct {
+	Output       string
+	Repositories int
+}
+
 type ApplyWorkspaceRequest struct {
 	Root              string
 	Plan              string
-	Now               time.Time
+	now               time.Time
+	clock             func() time.Time
 	StructuralOnly    bool
 	Python            string
 	Runner            string
@@ -87,6 +145,8 @@ type ApplyWorkspaceRequest struct {
 	HelmImage         string
 	MaxWorkspaceBytes int64
 	Hosts             host.Resolver
+	Blobs             blob.Resolver
+	Gates             gate.Evaluator
 }
 
 type ApplyWorkspaceResult struct {
@@ -108,7 +168,7 @@ func InitWorkspace(request InitWorkspaceRequest) error {
 		return err
 	}
 	defer unlock()
-	return state.Init(root, state.InitOptions{Name: request.Name})
+	return state.Init(root, state.InitOptions{Name: request.Name, ForgeRepository: request.ForgeRepository})
 }
 
 func SetupRepository(request SetupRepositoryRequest) error {
@@ -127,8 +187,12 @@ func SetupRepository(request SetupRepositoryRequest) error {
 	return state.Setup(root, state.SetupOptions{
 		Name: request.Name, Format: request.Format, Output: request.Output,
 		HostType: request.HostType, Visibility: request.Visibility, Bucket: request.Bucket,
+		Gate: request.Gate, ApprovalKeys: append([]string(nil), request.ApprovalKeys...),
 		Prefix: request.Prefix, Region: request.Region, Endpoint: request.Endpoint,
 		CanonicalEndpoint: request.CanonicalEndpoint, UsePathStyle: request.UsePathStyle,
+		ReadAuth: request.ReadAuth, CredentialBroker: request.CredentialBroker,
+		Repository: request.RemoteRepository, Branch: request.Branch, PreviewRepository: request.PreviewRepository,
+		PreviewBranch: request.PreviewBranch, PreviewEndpoint: request.PreviewEndpoint,
 		Suite: request.Suite, Component: request.Component, Architectures: request.Architectures,
 	})
 }
@@ -171,12 +235,39 @@ func AddArtifacts(request AddArtifactsRequest) (AddArtifactsResult, error) {
 	if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
 		return AddArtifactsResult{}, err
 	}
+	ctx := request.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	blobStore, err := resolveBlobStore(ctx, manifest, request.Blobs)
+	if err != nil {
+		return AddArtifactsResult{}, err
+	}
 	result := AddArtifactsResult{Repository: request.Repository}
 	packages := make(map[string]bool)
 	for _, artifact := range request.Artifacts {
 		blob, err := state.PutArtifact(root, repository.Format, artifact)
 		if err != nil {
 			return AddArtifactsResult{}, err
+		}
+		if blobStore != nil {
+			locked := state.ToLockedBlob(blob)
+			_, name, err := state.LoadBlob(root, repository.Format, locked)
+			if err != nil {
+				return AddArtifactsResult{}, err
+			}
+			file, err := os.Open(name)
+			if err != nil {
+				return AddArtifactsResult{}, err
+			}
+			putErr := blobStore.Put(ctx, blobref(locked), file)
+			closeErr := file.Close()
+			if putErr != nil {
+				return AddArtifactsResult{}, putErr
+			}
+			if closeErr != nil {
+				return AddArtifactsResult{}, closeErr
+			}
 		}
 		distro := ""
 		if repository.Format == "deb" {
@@ -209,6 +300,92 @@ func AddArtifacts(request AddArtifactsRequest) (AddArtifactsResult, error) {
 	return result, nil
 }
 
+func ConfigureBlobStore(ctx context.Context, request ConfigureBlobStoreRequest) error {
+	root, err := workspaceRoot(request.Root)
+	if err != nil {
+		return err
+	}
+	if err := state.RequireGitRepository(root); err != nil {
+		return err
+	}
+	unlock, err := state.AcquireWorkspaceLock(root)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	manifest, err := state.LoadManifest(root)
+	if err != nil {
+		return err
+	}
+	configuration := state.BlobStoreFromOptions(state.BlobStoreOptions{
+		Type: request.Type, Bucket: request.Bucket, Prefix: request.Prefix, Region: request.Region,
+		Endpoint: request.Endpoint, UsePathStyle: request.UsePathStyle,
+	})
+	if err := state.ValidateBlobStore(configuration); err != nil {
+		return err
+	}
+	sourceStore, err := resolveBlobStore(ctx, manifest, request.Blobs)
+	if err != nil {
+		return err
+	}
+	candidate := manifest
+	candidate.BlobStore = configuration
+	if configuration.Type == "s3" && manifest.BlobStore.Type == "local" && state.IsLegacyWorkspaceID(candidate.Workspace.Name, candidate.Workspace.ID) {
+		candidate.Workspace.ID, err = state.NewWorkspaceID()
+		if err != nil {
+			return err
+		}
+		identityManifest := manifest
+		identityManifest.Workspace.ID = candidate.Workspace.ID
+		if err := state.WriteManifest(root, identityManifest); err != nil {
+			return fmt.Errorf("persist workspace identity before blob migration: %w", err)
+		}
+		manifest.Workspace.ID = candidate.Workspace.ID
+	}
+	store, err := resolveBlobStore(ctx, candidate, request.Blobs)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]bool)
+	for _, name := range state.RepositoryNames(manifest) {
+		repository := manifest.Repositories[name]
+		lock, err := state.LoadLock(root, repository)
+		if err != nil {
+			return err
+		}
+		if err := state.ValidateLock(lock, name, repository.Format); err != nil {
+			return err
+		}
+		for _, packageVersion := range lock.PackageVersion {
+			for _, locked := range packageVersion.Blobs {
+				if seen[locked.SHA256] {
+					continue
+				}
+				seen[locked.SHA256] = true
+				_, blobName, err := state.EnsureBlob(ctx, root, repository.Format, locked, sourceStore)
+				if err != nil {
+					return err
+				}
+				if store != nil {
+					file, err := os.Open(blobName)
+					if err != nil {
+						return err
+					}
+					putErr := store.Put(ctx, blobref(locked), file)
+					closeErr := file.Close()
+					if putErr != nil {
+						return putErr
+					}
+					if closeErr != nil {
+						return closeErr
+					}
+				}
+			}
+		}
+	}
+	return state.WriteManifest(root, candidate)
+}
+
 func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorkspaceResult, error) {
 	root, err := workspaceRoot(request.Root)
 	if err != nil {
@@ -224,6 +401,14 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		return PlanWorkspaceResult{}, err
 	}
 	manifest, err := state.LoadManifest(root)
+	if err != nil {
+		return PlanWorkspaceResult{}, err
+	}
+	blobStore, err := resolveBlobStore(ctx, manifest, request.Blobs)
+	if err != nil {
+		return PlanWorkspaceResult{}, err
+	}
+	blobStoreIdentity, err := blobStoreIdentity(manifest)
 	if err != nil {
 		return PlanWorkspaceResult{}, err
 	}
@@ -252,6 +437,8 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 	}
 	payload := state.PlanPayload{
 		EngineVersion: phase1EngineVersion, GitRevision: gitRevision, ManifestSHA256: manifestDigest,
+		WorkspaceID: manifest.Workspace.ID, ForgeRepository: manifest.Workspace.ForgeRepository,
+		BlobStore: manifest.BlobStore, BlobStoreIdentitySHA256: blobStoreIdentity,
 		GeneratedAt: generatedAt.UTC().Format(time.RFC3339), CreatedAt: createdAt.UTC().Format(time.RFC3339),
 		ExpiresAt: createdAt.Add(expiresIn).UTC().Format(time.RFC3339),
 	}
@@ -283,6 +470,10 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
 			return PlanWorkspaceResult{}, err
 		}
+		deployment, err := state.LoadDeployment(root, name)
+		if err != nil {
+			return PlanWorkspaceResult{}, err
+		}
 		lockPath, err := state.WorkspacePath(root, repository.Lock)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
@@ -291,11 +482,15 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
-		desired, err := buildLockedRepository(ctx, root, name, repository, lock, generatedAt, "")
+		desired, err := buildLockedRepository(ctx, root, name, repository, lock, generatedAt, "", blobStore)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
-		hostRepository := toHostRepository(root, name, repository)
+		hostIdentity, err := repositoryHostIdentity(repository)
+		if err != nil {
+			return PlanWorkspaceResult{}, err
+		}
+		hostRepository := toHostRepository(root, manifest.Workspace.ID, hostIdentity, name, repository)
 		selectedHost, err := hosts.Resolve(ctx, hostRepository)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
@@ -304,7 +499,7 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
-		if !capabilities.FaithfulPreview || !capabilities.ConditionalCommit {
+		if !capabilities.FaithfulPreview || !capabilities.ConditionalCommit || (repository.Visibility == "private" && !capabilities.PrivateRead) {
 			return PlanWorkspaceResult{}, fmt.Errorf("repository %q host cannot provide verified conditional publication", name)
 		}
 		observed, err := selectedHost.Observe(ctx, hostRepository)
@@ -312,33 +507,32 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 			return PlanWorkspaceResult{}, err
 		}
 		action := "noop"
-		if observed.TreeSHA256 != desired.TreeSHA256 || (hostRepository.Type == "s3" && observed.ManifestSHA256 != desired.ManifestSHA256) {
+		if observed.TreeSHA256 != desired.TreeSHA256 || ((hostRepository.Type == "s3" || hostRepository.Type == "github-pages") && observed.ManifestSHA256 != desired.ManifestSHA256) || !publicationBindingsComplete(lock, ledger) || !deploymentMatchesDesired(deployment, observed, desired.TreeSHA256, desired.ManifestSHA256, ledger) {
 			action = "update"
 			if observed.NativeRevision == "" {
 				action = "create"
 			}
 			changes++
 		}
-		hostIdentity, err := repositoryHostIdentity(repository)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
 		installDocDigest, err := repositoryInstallDocDigest(root, name, repository)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
 		payload.Repositories = append(payload.Repositories, state.PlanRepository{
-			Name: name, Format: repository.Format, LockSHA256: lockDigest,
+			Name: name, Gate: repository.Gate, ApprovalKeys: append([]string(nil), repository.ApprovalKeys...), Format: repository.Format, LockSHA256: lockDigest,
 			Host: repository.Host, Visibility: repository.Visibility, HostIdentitySHA256: hostIdentity,
 			CanonicalEndpoint: hostRepository.CanonicalEndpoint, ObservedRevision: observed.NativeRevision,
 			ObservedPlanID: observed.PlanID, ObservedChangeID: observed.ChangeID,
 			ObservedReleaseSHA256: observed.ReleaseSHA256, ObservedManifestSHA256: observed.ManifestSHA256,
 			ObservedRestoreID: observed.RestoreID, ObservedRestoreSHA256: observed.RestoreSHA256,
 			ObservedRestoreRootSHA256: observed.RestoreRootSHA256,
+			ObservedDeployment:        deployment,
 			FaithfulPreview:           capabilities.FaithfulPreview, ConditionalCommit: capabilities.ConditionalCommit,
-			ConditionalRestore: capabilities.ConditionalRestore,
-			InstallDocSHA256:   installDocDigest,
-			ObservedTreeSHA256: observed.TreeSHA256, DesiredTreeSHA256: desired.TreeSHA256, DesiredManifestSHA256: desired.ManifestSHA256,
+			ConditionalRestore:       capabilities.ConditionalRestore,
+			PrivateRead:              capabilities.PrivateRead,
+			CredentialBrokerIdentity: capabilities.CredentialBrokerIdentity,
+			InstallDocSHA256:         installDocDigest,
+			ObservedTreeSHA256:       observed.TreeSHA256, DesiredTreeSHA256: desired.TreeSHA256, DesiredManifestSHA256: desired.ManifestSHA256,
 			ChangeID: name + ":" + desired.TreeSHA256[:12], Action: action,
 		})
 	}
@@ -379,10 +573,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	if plan.Payload.EngineVersion != phase1EngineVersion {
 		return ApplyWorkspaceResult{}, errors.New("plan engine version is incompatible")
 	}
-	now := request.Now
-	if now.IsZero() {
-		now = time.Now().UTC()
-	}
+	now := request.currentTime()
 	expiresAt, err := time.Parse(time.RFC3339, plan.Payload.ExpiresAt)
 	if err != nil || !now.Before(expiresAt) {
 		return ApplyWorkspaceResult{}, errors.New("plan has expired")
@@ -419,6 +610,14 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	if len(plan.Payload.Repositories) != len(manifest.Repositories) {
 		return ApplyWorkspaceResult{}, errors.New("plan does not cover every configured repository")
 	}
+	blobIdentity, err := blobStoreIdentity(manifest)
+	if err != nil || plan.Payload.WorkspaceID != manifest.Workspace.ID || plan.Payload.ForgeRepository != manifest.Workspace.ForgeRepository || plan.Payload.BlobStore != manifest.BlobStore || plan.Payload.BlobStoreIdentitySHA256 != blobIdentity {
+		return ApplyWorkspaceResult{}, errors.New("stale plan: blob store changed")
+	}
+	blobStore, err := resolveBlobStore(ctx, manifest, request.Blobs)
+	if err != nil {
+		return ApplyWorkspaceResult{}, err
+	}
 	generatedAt, err := time.Parse(time.RFC3339, plan.Payload.GeneratedAt)
 	if err != nil {
 		return ApplyWorkspaceResult{}, err
@@ -447,14 +646,14 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		}
 		seenRepositories[planned.Name] = true
 		repository, exists := manifest.Repositories[planned.Name]
-		if !exists || repository.Format != planned.Format {
+		if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q configuration changed", planned.Name)
 		}
 		hostIdentity, err := repositoryHostIdentity(repository)
 		if err != nil || hostIdentity != planned.HostIdentitySHA256 || repository.Host != planned.Host || repository.Visibility != planned.Visibility {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q host changed", planned.Name)
 		}
-		hostRepository := toHostRepository(root, planned.Name, repository)
+		hostRepository := toHostRepository(root, manifest.Workspace.ID, hostIdentity, planned.Name, repository)
 		if hostRepository.CanonicalEndpoint != planned.CanonicalEndpoint {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q canonical endpoint changed", planned.Name)
 		}
@@ -470,7 +669,8 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
-		if capabilities.FaithfulPreview != planned.FaithfulPreview || capabilities.ConditionalCommit != planned.ConditionalCommit || capabilities.ConditionalRestore != planned.ConditionalRestore {
+		if capabilities.FaithfulPreview != planned.FaithfulPreview || capabilities.ConditionalCommit != planned.ConditionalCommit || capabilities.ConditionalRestore != planned.ConditionalRestore ||
+			capabilities.PrivateRead != planned.PrivateRead || capabilities.CredentialBrokerIdentity != planned.CredentialBrokerIdentity {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q host capabilities changed", planned.Name)
 		}
 		lockPath, err := state.WorkspacePath(root, repository.Lock)
@@ -495,13 +695,23 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
+		deployment, err := state.LoadDeployment(root, planned.Name)
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
 		observed, err := selectedHost.Observe(ctx, hostRepository)
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
 		matchesObserved := revisionMatchesPlanObservation(observed, planned)
+		managedRemote := repository.Host.Type == "s3" || repository.Host.Type == "github-pages"
 		matchesApplied := planned.Action != "noop" && observed.TreeSHA256 == planned.DesiredTreeSHA256 &&
-			(repository.Host.Type != "s3" || (observed.PlanID == plan.PlanID && observed.ChangeID == planned.ChangeID && observed.ManifestSHA256 == planned.DesiredManifestSHA256))
+			(!managedRemote || (observed.PlanID == plan.PlanID && observed.ChangeID == planned.ChangeID && observed.ManifestSHA256 == planned.DesiredManifestSHA256))
+		deploymentApplied := deployment.PlanID == plan.PlanID && deployment.ChangeID == planned.ChangeID && deployment.TreeSHA256 == planned.DesiredTreeSHA256 && deployment.ManifestSHA256 == planned.DesiredManifestSHA256 && deployment.NativeRevision == observed.NativeRevision
+		deploymentCurrent := deploymentMatchesDesired(deployment, observed, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, ledger)
+		if deployment != planned.ObservedDeployment && !deploymentApplied {
+			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q deployment receipt changed", planned.Name)
+		}
 		if !matchesObserved && !matchesApplied {
 			if observed.TreeSHA256 == planned.ObservedTreeSHA256 {
 				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q native revision changed", planned.Name)
@@ -512,7 +722,8 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q target changed", planned.Name)
 		}
 		expectedAction := "noop"
-		if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 || (repository.Host.Type == "s3" && planned.ObservedManifestSHA256 != planned.DesiredManifestSHA256) {
+		plannedObserved := publishedFromPlanObservation(planned)
+		if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 || (managedRemote && planned.ObservedManifestSHA256 != planned.DesiredManifestSHA256) || !publicationBindingsComplete(lock, ledger) || !deploymentMatchesDesired(planned.ObservedDeployment, plannedObserved, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, ledger) {
 			expectedAction = "update"
 			if planned.ObservedRevision == "" {
 				expectedAction = "create"
@@ -521,7 +732,8 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if planned.Action != expectedAction || planned.ChangeID != planned.Name+":"+planned.DesiredTreeSHA256[:12] {
 			return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q has inconsistent action metadata", planned.Name)
 		}
-		current := observed.TreeSHA256 == planned.DesiredTreeSHA256 && (repository.Host.Type != "s3" || observed.ManifestSHA256 == planned.DesiredManifestSHA256)
+		receiptRecovery := matchesApplied && deployment == planned.ObservedDeployment
+		current := observed.TreeSHA256 == planned.DesiredTreeSHA256 && (!managedRemote || observed.ManifestSHA256 == planned.DesiredManifestSHA256) && (deploymentApplied || (planned.Action == "noop" && deploymentCurrent) || receiptRecovery)
 		item := applyRepository{
 			planned: planned, repository: repository, lock: lock, host: selectedHost,
 			hostRepository: hostRepository, observed: observed, current: current,
@@ -535,7 +747,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return ApplyWorkspaceResult{}, err
 		}
 		stageOutput := filepath.Join(stage, "repository")
-		staged, buildErr := buildLockedRepository(ctx, root, planned.Name, repository, lock, generatedAt, stageOutput)
+		staged, buildErr := buildLockedRepository(ctx, root, planned.Name, repository, lock, generatedAt, stageOutput, blobStore)
 		if buildErr == nil && (staged.TreeSHA256 != planned.DesiredTreeSHA256 || staged.ManifestSHA256 != planned.DesiredManifestSHA256) {
 			buildErr = errors.New("stale plan: rebuilt tree digest changed")
 		}
@@ -559,6 +771,34 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			_ = os.RemoveAll(item.stageRoot)
 		}
 	}()
+	authorize := func(item applyRepository) error {
+		if item.planned.Action == "noop" {
+			return nil
+		}
+		effectNow := request.currentTime()
+		if !effectNow.Before(expiresAt) {
+			return errors.New("plan expired before publication effect")
+		}
+		if item.repository.Gate == "auto" {
+			return nil
+		}
+		if request.Gates == nil {
+			return fmt.Errorf("repository %q requires %s gate evidence", item.planned.Name, item.repository.Gate)
+		}
+		if err := request.Gates.Authorize(ctx, gate.Requirement{
+			Policy: item.repository.Gate, PlanID: plan.PlanID, Repository: item.planned.Name,
+			GitRevision: plan.Payload.GitRevision, Root: root, Now: effectNow,
+			ForgeRepository: plan.Payload.ForgeRepository, ApprovalKeys: item.planned.ApprovalKeys,
+		}); err != nil {
+			return fmt.Errorf("repository %q gate: %w", item.planned.Name, err)
+		}
+		return nil
+	}
+	for _, item := range prepared {
+		if err := authorize(item); err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
+	}
 	defer func() {
 		for _, item := range prepared {
 			if item.hostStage.ID != "" {
@@ -577,8 +817,11 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
+		if err := authorize(*item); err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
 		item.hostStage, err = item.host.Stage(ctx, item.hostRepository, host.StageRequest{
-			PlanID: plan.PlanID, ChangeID: item.planned.ChangeID, Directory: item.stage,
+			PlanID: plan.PlanID, ChangeID: item.planned.ChangeID, PreviousRevision: item.planned.ObservedRevision, Directory: item.stage,
 			TreeSHA256: item.planned.DesiredTreeSHA256, Files: files,
 			CommitPaths: repositoryCommitPaths(item.repository),
 		})
@@ -597,16 +840,25 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if item.repository.Format != "pypi" {
 			return ApplyWorkspaceResult{}, fmt.Errorf("host preview verification is not implemented for format %q", item.repository.Format)
 		}
-		if _, _, err := app.VerifyPyPIClientEndpoint(ctx, item.stage, item.hostStage.PreviewEndpoint, request.Python); err != nil {
+		access := item.hostStage.Access
+		if access.Endpoint == "" {
+			access.Endpoint = item.hostStage.PreviewEndpoint
+		}
+		if _, _, err := app.VerifyPyPIClientEndpointAccess(ctx, item.stage, access, request.Python); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
 	}
 	ledgerRepositories := plannedLedgerRepositories
 	ledgerRevision := ""
+	applyGitRevision := ""
 	if ledgerCommitted {
-		ledgerRevision, err = state.RequireCleanGit(root)
+		applyGitRevision, err = state.RequireCleanGit(root)
 		if err != nil {
 			return ApplyWorkspaceResult{}, errors.New("committed publication ledgers do not match the plan")
+		}
+		ledgerRevision, err = state.PlanLedgerRevision(root, plan.PlanID)
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
 		}
 		if err := state.ValidatePublicationCommitPaths(root, ledgerRevision, ledgerRepositories); err != nil {
 			return ApplyWorkspaceResult{}, err
@@ -640,6 +892,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err != nil {
 			return ApplyWorkspaceResult{}, fmt.Errorf("commit publication ledgers for %v: %w", ledgerRepositories, err)
 		}
+		applyGitRevision = ledgerRevision
 		if err := state.ValidatePublicationCommitPaths(root, ledgerRevision, ledgerRepositories); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
@@ -656,6 +909,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		}
 	} else if !ledgerCommitted {
 		ledgerRevision = plan.Payload.GitRevision
+		applyGitRevision = ledgerRevision
 	}
 	needsPublication := false
 	for _, item := range prepared {
@@ -664,22 +918,35 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			break
 		}
 	}
+	var unlockGit func()
 	if needsPublication {
-		unlockGit, err := state.AcquireGitRevisionLock(root, ledgerRevision)
+		unlockGit, err = state.AcquireGitRevisionLock(root, applyGitRevision)
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
-		defer unlockGit()
-	} else if err := state.AssertGitRevision(root, ledgerRevision); err != nil {
+		defer func() {
+			if unlockGit != nil {
+				unlockGit()
+			}
+		}()
+	} else if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
 		return ApplyWorkspaceResult{}, err
 	}
 	result := ApplyWorkspaceResult{PlanID: plan.PlanID}
+	deployments := make([]state.DeploymentRecord, 0, len(prepared))
 	for _, item := range prepared {
 		if item.current {
 			result.Current++
 			if !request.StructuralOnly && item.planned.Action != "noop" {
-				if err := verifyCanonicalClient(ctx, root, item.repository, item.stage, item.hostRepository.CanonicalEndpoint, request); err != nil {
-					if item.hostRepository.Type == "s3" && item.observed.RestoreID != "" {
+				access, accessErr := item.host.ReadAccess(ctx, item.hostRepository, item.observed)
+				if accessErr != nil {
+					return result, accessErr
+				}
+				if err := verifyCanonicalClient(ctx, root, item.repository, item.stage, access, request); err != nil {
+					if item.observed.RestoreID != "" {
+						if gateErr := authorize(item); gateErr != nil {
+							return result, gateErr
+						}
 						restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 						_, restoreErr := item.host.Restore(restoreCtx, item.hostRepository, host.RestoreRef{
 							ID: item.observed.RestoreID, PlanID: item.observed.PlanID,
@@ -695,14 +962,27 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 					return result, err
 				}
 			}
+			if item.planned.Action != "noop" {
+				deployments = append(deployments, state.DeploymentRecord{
+					Repository: item.planned.Name, PlanID: plan.PlanID, ChangeID: item.planned.ChangeID,
+					TreeSHA256: item.planned.DesiredTreeSHA256, ManifestSHA256: item.planned.DesiredManifestSHA256,
+					NativeRevision: item.observed.NativeRevision, DeployedAt: plan.Payload.CreatedAt,
+				})
+			}
 			continue
 		}
-		if err := state.AssertGitRevision(root, ledgerRevision); err != nil {
+		if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
+			return result, err
+		}
+		if err := authorize(item); err != nil {
 			return result, err
 		}
 		committed, err := item.host.Commit(ctx, item.hostRepository, item.hostStage, expectedRevisionFromPlan(item.planned))
 		if err != nil {
 			return result, err
+		}
+		if committed.Access.Credential != nil {
+			defer committed.Access.Credential.Destroy()
 		}
 		result.Applied++
 		canonical, observeErr := item.host.Observe(ctx, item.hostRepository)
@@ -713,6 +993,9 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 				probeErr = errors.New("canonical host observation does not match committed tree")
 			}
 			if committed.RestoreRef != nil {
+				if gateErr := authorize(item); gateErr != nil {
+					return result, fmt.Errorf("canonical probe failed: %v; restore gate failed: %w", probeErr, gateErr)
+				}
 				restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 				_, restoreErr := item.host.Restore(restoreCtx, item.hostRepository, *committed.RestoreRef, expectedRevisionFromPublished(committed.Revision))
 				cancelRestore()
@@ -724,8 +1007,15 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return result, fmt.Errorf("canonical probe failed: %w", probeErr)
 		}
 		if !request.StructuralOnly {
-			if probeErr := verifyCanonicalClient(ctx, root, item.repository, item.stage, committed.CanonicalEndpoint, request); probeErr != nil {
+			access := committed.Access
+			if access.Endpoint == "" {
+				access.Endpoint = committed.CanonicalEndpoint
+			}
+			if probeErr := verifyCanonicalClient(ctx, root, item.repository, item.stage, access, request); probeErr != nil {
 				if committed.RestoreRef != nil {
+					if gateErr := authorize(item); gateErr != nil {
+						return result, fmt.Errorf("canonical client probe failed: %v; restore gate failed: %w", probeErr, gateErr)
+					}
 					restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 					_, restoreErr := item.host.Restore(restoreCtx, item.hostRepository, *committed.RestoreRef, expectedRevisionFromPublished(committed.Revision))
 					cancelRestore()
@@ -737,14 +1027,269 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 				return result, fmt.Errorf("canonical client probe failed: %w", probeErr)
 			}
 		}
-		if err := state.AssertGitRevision(root, ledgerRevision); err != nil {
+		if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
 			return result, err
 		}
+		deployments = append(deployments, state.DeploymentRecord{
+			Repository: item.planned.Name, PlanID: plan.PlanID, ChangeID: item.planned.ChangeID,
+			TreeSHA256: item.planned.DesiredTreeSHA256, ManifestSHA256: item.planned.DesiredManifestSHA256,
+			NativeRevision: committed.Revision.NativeRevision, DeployedAt: plan.Payload.CreatedAt,
+		})
+	}
+	if unlockGit != nil {
+		unlockGit()
+		unlockGit = nil
+	}
+	if _, err := state.CommitDeployments(root, plan.PlanID, applyGitRevision, deployments); err != nil {
+		return result, fmt.Errorf("record successful deployments: %w", err)
 	}
 	return result, nil
 }
 
-func verifyCanonicalClient(ctx context.Context, root string, repository state.Repository, staged, endpoint string, request ApplyWorkspaceRequest) error {
+func (request ApplyWorkspaceRequest) currentTime() time.Time {
+	if request.clock != nil {
+		return request.clock().UTC()
+	}
+	if !request.now.IsZero() {
+		return request.now.UTC()
+	}
+	return time.Now().UTC()
+}
+
+func ApprovePlan(request ApprovePlanRequest) (ApprovePlanResult, error) {
+	root, err := workspaceRoot(request.Root)
+	if err != nil {
+		return ApprovePlanResult{}, err
+	}
+	if request.Repository == "" || request.KeyFile == "" {
+		return ApprovePlanResult{}, errors.New("repository and approval private key are required")
+	}
+	unlock, err := state.AcquireWorkspaceLock(root)
+	if err != nil {
+		return ApprovePlanResult{}, err
+	}
+	defer unlock()
+	planName := request.Plan
+	if planName == "" {
+		planName = "snailmail.snailmail-plan.json"
+	}
+	if !filepath.IsAbs(planName) {
+		planName = filepath.Join(root, planName)
+	}
+	plan, err := state.LoadPlan(planName)
+	if err != nil {
+		return ApprovePlanResult{}, err
+	}
+	if err := validateApplyPlan(plan); err != nil {
+		return ApprovePlanResult{}, err
+	}
+	found := false
+	var allowedKeys []string
+	for _, repository := range plan.Payload.Repositories {
+		if repository.Name == request.Repository && repository.Gate == "approval" && repository.Action != "noop" {
+			found = true
+			allowedKeys = repository.ApprovalKeys
+			break
+		}
+	}
+	if !found {
+		return ApprovePlanResult{}, fmt.Errorf("repository %q has no pending approval gate in this plan", request.Repository)
+	}
+	now := request.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	expiresIn := request.ExpiresIn
+	if expiresIn <= 0 {
+		expiresIn = 30 * time.Minute
+	}
+	planExpires, err := time.Parse(time.RFC3339, plan.Payload.ExpiresAt)
+	if err != nil || !now.Before(planExpires) {
+		return ApprovePlanResult{}, errors.New("plan has expired")
+	}
+	expiresAt := now.Add(expiresIn)
+	if expiresAt.After(planExpires) {
+		expiresAt = planExpires
+	}
+	output := request.Output
+	if output == "" {
+		output = planName + ".approvals.json"
+	} else if !filepath.IsAbs(output) {
+		output, err = state.WorkspacePath(root, filepath.ToSlash(output))
+		if err != nil {
+			return ApprovePlanResult{}, err
+		}
+	}
+	evidence := gate.ApprovalFile{SchemaVersion: gate.ApprovalSchema}
+	if existing, loadErr := gate.LoadApprovals(output); loadErr == nil {
+		evidence = existing
+	} else if !errors.Is(loadErr, os.ErrNotExist) {
+		return ApprovePlanResult{}, loadErr
+	}
+	filtered := evidence.Approvals[:0]
+	for _, approval := range evidence.Approvals {
+		if approval.PlanID != plan.PlanID || approval.Repository != request.Repository {
+			filtered = append(filtered, approval)
+		}
+	}
+	approval, publicKey, err := gate.SignApproval(request.KeyFile, plan.PlanID, request.Repository, expiresAt.UTC().Format(time.RFC3339))
+	if err != nil {
+		return ApprovePlanResult{}, err
+	}
+	allowed := false
+	for _, candidate := range allowedKeys {
+		allowed = allowed || candidate == publicKey
+	}
+	if !allowed {
+		return ApprovePlanResult{}, errors.New("approval private key is not authorized by the reviewed plan")
+	}
+	evidence.Approvals = append(filtered, approval)
+	sort.Slice(evidence.Approvals, func(left, right int) bool {
+		if evidence.Approvals[left].PlanID != evidence.Approvals[right].PlanID {
+			return evidence.Approvals[left].PlanID < evidence.Approvals[right].PlanID
+		}
+		return evidence.Approvals[left].Repository < evidence.Approvals[right].Repository
+	})
+	if err := gate.WriteApprovals(output, evidence); err != nil {
+		return ApprovePlanResult{}, err
+	}
+	return ApprovePlanResult{PlanID: plan.PlanID, Output: output, Approver: approval.Approver}, nil
+}
+
+func RenderStatus(request RenderStatusRequest) (RenderStatusResult, error) {
+	root, err := workspaceRoot(request.Root)
+	if err != nil {
+		return RenderStatusResult{}, err
+	}
+	revision, err := state.RequireCleanGit(root)
+	if err != nil {
+		return RenderStatusResult{}, err
+	}
+	manifest, err := state.LoadManifest(root)
+	if err != nil {
+		return RenderStatusResult{}, err
+	}
+	manifestPath, err := state.WorkspacePath(root, state.ManifestFilename)
+	if err != nil {
+		return RenderStatusResult{}, err
+	}
+	manifestDigest, err := state.HashFile(manifestPath)
+	if err != nil {
+		return RenderStatusResult{}, err
+	}
+	names := make([]string, 0, len(manifest.Repositories))
+	for name := range manifest.Repositories {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	inputs := make([]statusrenderer.InputRepository, 0, len(names))
+	pending := make(map[string]bool)
+	planName := request.Plan
+	if planName == "" {
+		planName = "snailmail.snailmail-plan.json"
+	}
+	if !filepath.IsAbs(planName) {
+		planName = filepath.Join(root, planName)
+	}
+	if planned, planErr := state.LoadPlan(planName); planErr == nil {
+		now := request.Now
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		expiresAt, expiryErr := time.Parse(time.RFC3339, planned.Payload.ExpiresAt)
+		if validateApplyPlan(planned) == nil && expiryErr == nil && now.Before(expiresAt) && planned.Payload.GitRevision == revision && planned.Payload.ManifestSHA256 == manifestDigest && planned.Payload.WorkspaceID == manifest.Workspace.ID {
+			for _, repository := range planned.Payload.Repositories {
+				if repository.Action != "noop" && repository.Gate != "auto" {
+					pending[repository.Name] = true
+				}
+			}
+		}
+	} else if !errors.Is(planErr, os.ErrNotExist) {
+		return RenderStatusResult{}, fmt.Errorf("load pending status plan: %w", planErr)
+	}
+	for _, name := range names {
+		repository := manifest.Repositories[name]
+		lock, err := state.LoadLock(root, repository)
+		if err != nil {
+			return RenderStatusResult{}, err
+		}
+		records, err := state.LoadLedger(root, name)
+		if err != nil {
+			return RenderStatusResult{}, err
+		}
+		deployment, err := state.LoadDeployment(root, name)
+		if err != nil {
+			return RenderStatusResult{}, err
+		}
+		inputs = append(inputs, statusrenderer.InputRepository{Name: name, Config: repository, Lock: lock, Records: records, Deployment: deployment, Pending: pending[name]})
+	}
+	output, err := statusrenderer.Render(manifest.Workspace.Name, revision, inputs)
+	if err != nil {
+		return RenderStatusResult{}, err
+	}
+	destination := request.Output
+	if destination == "" {
+		destination = "site"
+	}
+	if !filepath.IsAbs(destination) {
+		destination, err = state.WorkspacePath(root, filepath.ToSlash(destination))
+		if err != nil {
+			return RenderStatusResult{}, err
+		}
+	}
+	if err := publishStatusDirectory(destination, output); err != nil {
+		return RenderStatusResult{}, err
+	}
+	return RenderStatusResult{Output: destination, Repositories: len(inputs)}, nil
+}
+
+func publishStatusDirectory(destination string, output statusrenderer.Output) error {
+	parent := filepath.Dir(destination)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	staging, err := os.MkdirTemp(parent, ".snailmail-status-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(staging)
+	for name, content := range map[string][]byte{"index.html": output.HTML, "status.json": output.JSON, ".snailmail-status": []byte("v1\n")} {
+		if err := os.WriteFile(filepath.Join(staging, name), content, 0o644); err != nil {
+			return err
+		}
+	}
+	backup := ""
+	if _, err := os.Lstat(destination); err == nil {
+		marker := filepath.Join(destination, ".snailmail-status")
+		if content, markerErr := os.ReadFile(marker); markerErr != nil || string(content) != "v1\n" {
+			return fmt.Errorf("refusing to replace unmanaged status directory %q", destination)
+		}
+		backup, err = os.MkdirTemp(parent, ".snailmail-status-backup-*")
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(backup); err != nil {
+			return err
+		}
+		if err := os.Rename(destination, backup); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Rename(staging, destination); err != nil {
+		if _, backupErr := os.Lstat(backup); backupErr == nil {
+			_ = os.Rename(backup, destination)
+		}
+		return err
+	}
+	if backup != "" {
+		return os.RemoveAll(backup)
+	}
+	return nil
+}
+
+func verifyCanonicalClient(ctx context.Context, root string, repository state.Repository, staged string, access host.ClientAccess, request ApplyWorkspaceRequest) error {
 	if repository.Host.Type == "local" {
 		output, err := state.WorkspacePath(root, repository.Host.Path)
 		if err != nil {
@@ -755,11 +1300,11 @@ func verifyCanonicalClient(ctx context.Context, root string, repository state.Re
 	if repository.Format != "pypi" {
 		return fmt.Errorf("canonical client verification is not implemented for format %q", repository.Format)
 	}
-	_, _, err := app.VerifyPyPIClientEndpoint(ctx, staged, endpoint, request.Python)
+	_, _, err := app.VerifyPyPIClientEndpointAccess(ctx, staged, access, request.Python)
 	return err
 }
 
-func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt time.Time, output string) (BuildResult, error) {
+func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt time.Time, output string, blobStore blob.Store) (BuildResult, error) {
 	input, err := os.MkdirTemp("", ".snailmail-locked-input-*")
 	if err != nil {
 		return BuildResult{}, err
@@ -768,7 +1313,7 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	active := activePackageVersions(lock)
 	for _, packageVersion := range active {
 		for _, locked := range packageVersion.Blobs {
-			blob, source, err := state.LoadBlob(root, repository.Format, locked)
+			blob, source, err := state.EnsureBlob(ctx, root, repository.Format, locked, blobStore)
 			if err != nil {
 				return BuildResult{}, err
 			}
@@ -827,6 +1372,26 @@ func activePackageVersions(lock state.RepositoryLock) []state.PackageVersion {
 func activeLock(lock state.RepositoryLock) state.RepositoryLock {
 	lock.PackageVersion = activePackageVersions(lock)
 	return lock
+}
+
+func publicationBindingsComplete(lock state.RepositoryLock, records []state.PublicationRecord) bool {
+	published := make(map[string][]string)
+	for _, record := range records {
+		digests := append([]string(nil), record.BlobSHA256...)
+		sort.Strings(digests)
+		published[record.Package+"\x00"+record.Version] = digests
+	}
+	for _, version := range activePackageVersions(lock) {
+		digests := make([]string, 0, len(version.Blobs))
+		for _, artifact := range version.Blobs {
+			digests = append(digests, artifact.SHA256)
+		}
+		sort.Strings(digests)
+		if !reflect.DeepEqual(published[version.Package+"\x00"+version.Version], digests) {
+			return false
+		}
+	}
+	return true
 }
 
 func verifyStaged(ctx context.Context, format, repository string, request ApplyWorkspaceRequest) error {
@@ -900,17 +1465,21 @@ func (localHostResolver) Resolve(_ context.Context, repository host.Repository) 
 	return localhost.New(), nil
 }
 
-func toHostRepository(root, name string, repository state.Repository) host.Repository {
+func toHostRepository(root, workspaceID, hostIdentity, name string, repository state.Repository) host.Repository {
 	canonicalEndpoint := repository.Host.CanonicalEndpoint
 	if repository.Host.Type == "local" {
 		canonicalEndpoint = repository.Host.Path
 	}
 	return host.Repository{
-		Name: name, Format: repository.Format, Type: repository.Host.Type,
+		Name: name, WorkspaceID: workspaceID, HostIdentity: hostIdentity, Format: repository.Format, Type: repository.Host.Type,
 		Visibility: repository.Visibility, WorkspaceRoot: root, Path: repository.Host.Path,
 		Bucket: repository.Host.Bucket, Prefix: repository.Host.Prefix, Region: repository.Host.Region,
 		Endpoint: repository.Host.Endpoint, CanonicalEndpoint: canonicalEndpoint,
 		UsePathStyle: repository.Host.UsePathStyle,
+		ReadAuth:     repository.Host.ReadAuth, CredentialBroker: repository.Host.CredentialBroker,
+		RemoteRepository: repository.Host.Repository, Branch: repository.Host.Branch,
+		PreviewRepository: repository.Host.PreviewRepository, PreviewBranch: repository.Host.PreviewBranch,
+		PreviewEndpoint: repository.Host.PreviewEndpoint,
 	}
 }
 
@@ -928,7 +1497,7 @@ func repositoryHostIdentity(repository state.Repository) (string, error) {
 }
 
 func repositoryInstallDocDigest(root, name string, repository state.Repository) (string, error) {
-	if repository.Host.Type != "s3" || repository.Format != "pypi" {
+	if (repository.Host.Type != "s3" && repository.Host.Type != "github-pages") || repository.Format != "pypi" {
 		return "", nil
 	}
 	if err := state.ValidateInstallDocument(root, name, repository); err != nil {
@@ -981,6 +1550,13 @@ func validateApplyPlan(plan state.Plan) error {
 	if !validSHA256(plan.Payload.ManifestSHA256) {
 		return errors.New("plan has an invalid manifest digest")
 	}
+	if !validSHA256(plan.Payload.WorkspaceID) || !validSHA256(plan.Payload.BlobStoreIdentitySHA256) || state.ValidateBlobStore(plan.Payload.BlobStore) != nil {
+		return errors.New("plan has an invalid blob store binding")
+	}
+	plannedBlobIdentity, err := blobIdentity(plan.Payload.WorkspaceID, plan.Payload.BlobStore)
+	if err != nil || plannedBlobIdentity != plan.Payload.BlobStoreIdentitySHA256 {
+		return errors.New("plan blob store identity does not match its configuration")
+	}
 	if plan.Payload.VerificationMode != "structural" && plan.Payload.VerificationMode != "client" {
 		return errors.New("plan has an invalid verification mode")
 	}
@@ -1007,22 +1583,36 @@ func validateApplyPlan(plan state.Plan) error {
 		if repository.Action != "create" && repository.Action != "update" && repository.Action != "noop" {
 			return fmt.Errorf("plan repository %q has invalid action %q", repository.Name, repository.Action)
 		}
+		if err := state.ValidateGateConfiguration(repository.Gate, repository.ApprovalKeys, plan.Payload.ForgeRepository); err != nil {
+			return fmt.Errorf("plan repository %q gate: %w", repository.Name, err)
+		}
+		if deployment := repository.ObservedDeployment; deployment.NativeRevision != "" &&
+			(deployment.SchemaVersion != state.DeploymentSchema || deployment.Repository != repository.Name || !validSHA256(deployment.PlanID) || !validSHA256(deployment.TreeSHA256) ||
+				(deployment.ManifestSHA256 != "" && !validSHA256(deployment.ManifestSHA256)) || deployment.ChangeID != deployment.Repository+":"+deployment.TreeSHA256[:12] || deployment.DeployedAt == "") {
+			return fmt.Errorf("plan repository %q has invalid deployment observation", repository.Name)
+		}
 		if !validSHA256(repository.LockSHA256) || !validSHA256(repository.DesiredTreeSHA256) ||
 			!validSHA256(repository.HostIdentitySHA256) ||
 			(repository.ObservedTreeSHA256 != "" && !validSHA256(repository.ObservedTreeSHA256)) {
 			return fmt.Errorf("plan repository %q has an invalid digest", repository.Name)
 		}
-		if repository.Host.Type != "local" && repository.Host.Type != "s3" {
+		if repository.Host.Type != "local" && repository.Host.Type != "s3" && repository.Host.Type != "github-pages" {
 			return fmt.Errorf("plan repository %q has unsupported host type %q", repository.Name, repository.Host.Type)
 		}
 		if repository.CanonicalEndpoint == "" {
 			return fmt.Errorf("plan repository %q has no canonical endpoint", repository.Name)
 		}
-		if repository.Host.Type == "s3" && !validSHA256(repository.InstallDocSHA256) {
+		if (repository.Host.Type == "s3" || repository.Host.Type == "github-pages") && !validSHA256(repository.InstallDocSHA256) {
 			return fmt.Errorf("plan repository %q has an invalid install document digest", repository.Name)
 		}
-		if repository.Host.Type == "s3" && !validSHA256(repository.DesiredManifestSHA256) {
+		if (repository.Host.Type == "s3" || repository.Host.Type == "github-pages") && !validSHA256(repository.DesiredManifestSHA256) {
 			return fmt.Errorf("plan repository %q has an invalid desired manifest digest", repository.Name)
+		}
+		if repository.Visibility == "private" && !repository.PrivateRead {
+			return fmt.Errorf("plan repository %q lacks private read capability", repository.Name)
+		}
+		if repository.Visibility == "private" && !validSHA256(repository.CredentialBrokerIdentity) {
+			return fmt.Errorf("plan repository %q has an invalid credential broker identity", repository.Name)
 		}
 		for _, digest := range []string{repository.ObservedReleaseSHA256, repository.ObservedManifestSHA256, repository.ObservedRestoreSHA256, repository.ObservedRestoreRootSHA256} {
 			if digest != "" && !validSHA256(digest) {
@@ -1051,6 +1641,61 @@ func validateApplyPlan(plan state.Plan) error {
 func validSHA256(value string) bool {
 	decoded, err := hex.DecodeString(value)
 	return err == nil && len(decoded) == 32 && value == strings.ToLower(value)
+}
+
+func resolveBlobStore(ctx context.Context, manifest state.Manifest, resolver blob.Resolver) (blob.Store, error) {
+	configuration := state.BlobConfiguration(manifest)
+	if configuration.Type == "local" {
+		return nil, nil
+	}
+	if resolver == nil {
+		return nil, errors.New("remote blob store resolver is required")
+	}
+	return resolver.Resolve(ctx, configuration)
+}
+
+func blobStoreIdentity(manifest state.Manifest) (string, error) {
+	return blobIdentity(manifest.Workspace.ID, manifest.BlobStore)
+}
+
+func blobIdentity(workspaceID string, configuration state.BlobStoreConfig) (string, error) {
+	encoded, err := json.Marshal(struct {
+		WorkspaceID string                `json:"workspace_id"`
+		BlobStore   state.BlobStoreConfig `json:"blob_store"`
+	}{WorkspaceID: workspaceID, BlobStore: configuration})
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func blobref(locked state.LockedBlob) blob.Ref {
+	return blob.Ref{SHA256: locked.SHA256, Size: locked.Size}
+}
+
+func deploymentMatchesDesired(deployment state.DeploymentRecord, observed host.PublishedRevision, treeSHA256, manifestSHA256 string, ledger []state.PublicationRecord) bool {
+	if !validSHA256(treeSHA256) || deployment.TreeSHA256 != treeSHA256 || deployment.ManifestSHA256 != manifestSHA256 ||
+		deployment.NativeRevision == "" || deployment.NativeRevision != observed.NativeRevision ||
+		deployment.ChangeID != deployment.Repository+":"+treeSHA256[:12] {
+		return false
+	}
+	for _, record := range ledger {
+		if record.Repository == deployment.Repository && record.PlanID == deployment.PlanID && record.ChangeID == deployment.ChangeID && record.TreeSHA256 == treeSHA256 {
+			return true
+		}
+	}
+	return false
+}
+
+func publishedFromPlanObservation(planned state.PlanRepository) host.PublishedRevision {
+	return host.PublishedRevision{
+		NativeRevision: planned.ObservedRevision, TreeSHA256: planned.ObservedTreeSHA256,
+		PlanID: planned.ObservedPlanID, ChangeID: planned.ObservedChangeID,
+		ReleaseSHA256: planned.ObservedReleaseSHA256, ManifestSHA256: planned.ObservedManifestSHA256,
+		RestoreID: planned.ObservedRestoreID, RestoreSHA256: planned.ObservedRestoreSHA256,
+		RestoreRootSHA256: planned.ObservedRestoreRootSHA256,
+	}
 }
 
 func revisionMatchesPlanObservation(revision host.PublishedRevision, planned state.PlanRepository) bool {

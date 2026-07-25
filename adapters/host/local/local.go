@@ -39,6 +39,14 @@ func (adapter *Adapter) Observe(_ context.Context, repository host.Repository) (
 	return host.PublishedRevision{NativeRevision: manifest.TreeSHA256, TreeSHA256: manifest.TreeSHA256}, nil
 }
 
+func (adapter *Adapter) ReadAccess(_ context.Context, repository host.Repository, _ host.PublishedRevision) (host.ClientAccess, error) {
+	output, err := localPath(repository)
+	if err != nil {
+		return host.ClientAccess{}, err
+	}
+	return host.ClientAccess{Endpoint: output}, nil
+}
+
 func (adapter *Adapter) Stage(_ context.Context, _ host.Repository, request host.StageRequest) (host.StagedPublication, error) {
 	manifest, err := app.VerifyRepository(request.Directory)
 	if err != nil {
