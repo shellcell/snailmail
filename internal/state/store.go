@@ -24,6 +24,7 @@ import (
 )
 
 const ManifestFilename = "snailmail.toml"
+const MinimumSigningRefreshSeconds = int64(7 * 24 * 60 * 60)
 
 var identifierPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
 var fingerprintPattern = regexp.MustCompile(`^[a-f0-9]{40}$`)
@@ -127,9 +128,6 @@ func Setup(root string, options SetupOptions) error {
 	if err := validateGateConfiguration(options.Name, repository, manifest.Workspace.ForgeRepository); err != nil {
 		return err
 	}
-	if err := validateRepositorySigning(options.Name, repository, manifest.Keys); err != nil {
-		return err
-	}
 	if options.Format == "deb" {
 		repository.Suite = options.Suite
 		repository.Component = options.Component
@@ -143,6 +141,12 @@ func Setup(root string, options SetupOptions) error {
 		if len(repository.Architectures) == 0 {
 			repository.Architectures = []string{"amd64"}
 		}
+		if len(repository.SigningKeys) == 1 {
+			repository.SigningKeyring = filepath.ToSlash(filepath.Join("keys", options.Name+"-archive-keyring.gpg"))
+		}
+	}
+	if err := validateRepositorySigning(options.Name, repository, manifest.Keys); err != nil {
+		return err
 	}
 	manifest.Repositories[options.Name] = repository
 	resolvedLock, err := WorkspacePath(root, repository.Lock)
@@ -243,11 +247,19 @@ func LoadManifest(root string) (Manifest, error) {
 		if err := decoder.Decode(&manifest); err != nil {
 			return Manifest{}, fmt.Errorf("decode %q: %w", name, err)
 		}
-		if header.SchemaVersion == 2 || header.SchemaVersion == 3 || header.SchemaVersion == 4 {
+		if header.SchemaVersion == 2 || header.SchemaVersion == 3 || header.SchemaVersion == 4 || header.SchemaVersion == 5 {
 			manifest.SchemaVersion = ManifestSchema
 			if header.SchemaVersion == 2 {
 				manifest.Workspace.ID = legacyWorkspaceID(manifest.Workspace.Name)
 				manifest.BlobStore = BlobStoreConfig{Type: "local"}
+			}
+			if header.SchemaVersion == 5 {
+				for name, repository := range manifest.Repositories {
+					if len(repository.SigningKeys) == 1 && repository.SigningKeyring == "" {
+						repository.SigningKeyring = manifest.Keys[repository.SigningKeys[0]].PublicKeyPath
+						manifest.Repositories[name] = repository
+					}
+				}
 			}
 		}
 	}
@@ -504,6 +516,7 @@ func ValidateGateConfiguration(policy string, approvalKeys []string, forgeReposi
 }
 
 func validateSigningKeys(manifest Manifest) error {
+	fingerprints := make(map[string]string)
 	for name, key := range manifest.Keys {
 		if !identifierPattern.MatchString(name) || key.Algorithm != "openpgp-rsa4096" || key.Usage != "sign" || !fingerprintPattern.MatchString(key.Fingerprint) ||
 			!validSHA256(key.PublicKeySHA256) || !validSHA256(key.PublicArmorSHA256) || key.PublicKeyPath != filepath.ToSlash(filepath.Join("keys", name+".gpg")) ||
@@ -515,19 +528,26 @@ func validateSigningKeys(manifest Manifest) error {
 		if createdErr != nil || expiresErr != nil || !expiresAt.After(createdAt) {
 			return fmt.Errorf("signing key %q has invalid validity", name)
 		}
+		if previous, exists := fingerprints[key.Fingerprint]; exists {
+			return fmt.Errorf("signing keys %q and %q have the same fingerprint", previous, name)
+		}
+		fingerprints[key.Fingerprint] = name
 	}
 	return nil
 }
 
 func validateRepositorySigning(name string, repository Repository, keys map[string]SigningKey) error {
 	if len(repository.SigningKeys) == 0 {
+		if repository.SigningKeyring != "" || repository.SigningRotation != nil {
+			return fmt.Errorf("repository %q has signing trust without an active key", name)
+		}
 		return nil
 	}
 	if repository.Format != "deb" {
 		return fmt.Errorf("repository %q: repository signing is currently implemented for Debian only", name)
 	}
-	if len(repository.SigningKeys) > 1 {
-		return fmt.Errorf("repository %q: dual-sign rotation is not implemented yet", name)
+	if len(repository.SigningKeys) != 1 {
+		return fmt.Errorf("repository %q must have exactly one active signing key", name)
 	}
 	previous := ""
 	for _, signingKey := range repository.SigningKeys {
@@ -538,6 +558,17 @@ func validateRepositorySigning(name string, repository Repository, keys map[stri
 			return fmt.Errorf("repository %q signing keys must be unique and sorted", name)
 		}
 		previous = signingKey
+	}
+	if err := validateRelativePath(repository.SigningKeyring); err != nil || !strings.HasPrefix(repository.SigningKeyring, "keys/") || !strings.HasSuffix(repository.SigningKeyring, ".gpg") {
+		return fmt.Errorf("repository %q has invalid signing keyring path", name)
+	}
+	if rotation := repository.SigningRotation; rotation != nil {
+		if rotation.SuccessorKey == repository.SigningKeys[0] || (rotation.Phase != "introducing" && rotation.Phase != "activated") || rotation.MinimumRefreshSeconds < MinimumSigningRefreshSeconds {
+			return fmt.Errorf("repository %q has invalid signing rotation", name)
+		}
+		if _, exists := keys[rotation.SuccessorKey]; !exists {
+			return fmt.Errorf("repository %q rotation references unknown successor key %q", name, rotation.SuccessorKey)
+		}
 	}
 	return nil
 }

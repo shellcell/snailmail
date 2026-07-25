@@ -972,6 +972,15 @@ The phase numbers below use the canonical roadmap in `PLAN.md` §14:
    identity and plan state are list-shaped for future overlap rotation, while
    the first backend currently permits one active key. Apply replays those
    public responses and never resolves private key references.
+
+   Debian key rotation is a receipt-backed state machine. `introducing` keeps
+   the old active signer and publishes an ordered old-plus-successor binary
+   keyring at a stable path. `activated` signs with the successor while retaining
+   both public identities. Retirement rewrites trust to successor-only. Each
+   transition requires the exact prior trust tuple in a canonical deployment
+   receipt and a minimum seven-day refresh interval measured from that receipt's
+   `trust_since`; manifest, plan, and staging timestamps grant no transition
+   authority.
 5. **Phase 4:** add read-only foreign observation before irreversible remote
    publication targets.
 6. **Phase 5:** add optional server, console, forge-app, attestation, and

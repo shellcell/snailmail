@@ -9,7 +9,7 @@ RUN CGO_ENABLED=0 go test -c -o /out/openpgp.test ./signer/openpgp
 
 FROM debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS signing-test
 COPY --from=build /out/openpgp.test /usr/local/bin/openpgp.test
-RUN openpgp.test -test.run TestGenerateLoadAndDeterministicallySign
+RUN openpgp.test -test.run 'Test(Generate|Combined)'
 RUN touch /signed-debian-passed
 
 FROM build AS test

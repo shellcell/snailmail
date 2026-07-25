@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"reflect"
 	"sort"
 	"time"
 
@@ -44,7 +46,22 @@ type KeyAuditFinding struct {
 }
 
 type KeyAuditResult struct {
-	Findings []KeyAuditFinding
+	Findings  []KeyAuditFinding
+	Rotations []KeyRotationStatus
+}
+
+type KeyRotationStatus struct {
+	Repository      string
+	Phase           string
+	Deployed        bool
+	Ready           bool
+	EarliestAdvance string
+}
+
+type preparedSigningKey struct {
+	key            state.SigningKey
+	generated      signer.Generated
+	createdPrivate bool
 }
 
 func NewKey(ctx context.Context, request NewKeyRequest) (NewKeyResult, error) {
@@ -88,31 +105,33 @@ func NewKey(ctx context.Context, request NewKeyRequest) (NewKeyResult, error) {
 	if _, exists := manifest.Keys[request.Name]; exists {
 		return NewKeyResult{}, fmt.Errorf("signing key %q already exists", request.Name)
 	}
-	ref := signer.Ref{Backend: "file", ID: manifest.Workspace.ID + "/" + request.Name}
-	generated, err := request.Keys.Public(ctx, ref)
-	createdPrivate := false
-	if errors.Is(err, signer.ErrNotFound) {
-		generated, err = request.Keys.Generate(ctx, ref, request.Name, request.CreatedAt, request.ExpiresIn)
-		createdPrivate = err == nil
-	}
+	prepared, err := prepareSigningKey(ctx, manifest, request.Name, request.CreatedAt, request.ExpiresIn, request.Keys)
 	if err != nil {
 		return NewKeyResult{}, err
 	}
-	key, err := signingKeyFromGenerated(request.Name, ref, generated)
+	rollback, err := persistPreparedSigningKey(root, prepared)
 	if err != nil {
-		if createdPrivate {
-			_ = request.Keys.Delete(context.WithoutCancel(ctx), ref)
+		if prepared.createdPrivate {
+			_ = request.Keys.Delete(context.WithoutCancel(ctx), signer.Ref{Backend: prepared.key.Ref.Backend, ID: prepared.key.Ref.ID})
 		}
 		return NewKeyResult{}, err
 	}
-	if err := state.WriteSigningPublic(root, key, generated.PublicBinary, generated.PublicArmor); err != nil {
-		return NewKeyResult{}, err
-	}
-	manifest.Keys[request.Name] = key
+	committed := false
+	defer func() {
+		if !committed {
+			rollback()
+			if prepared.createdPrivate {
+				_ = request.Keys.Delete(context.WithoutCancel(ctx), signer.Ref{Backend: prepared.key.Ref.Backend, ID: prepared.key.Ref.ID})
+			}
+		}
+	}()
+	manifest.Keys[request.Name] = prepared.key
 	if err := state.WriteManifest(root, manifest); err != nil {
+		committed = manifestMatches(root, manifest)
 		return NewKeyResult{}, err
 	}
-	return NewKeyResult{Name: request.Name, Fingerprint: key.Fingerprint, ExpiresAt: key.ExpiresAt, Reference: key.Ref.ID}, nil
+	committed = true
+	return keyResult(request.Name, prepared.key), nil
 }
 
 func PublishKey(ctx context.Context, request PublishKeyRequest) (NewKeyResult, error) {
@@ -171,7 +190,21 @@ func AuditKeys(request PublishKeyRequest, now time.Time) (KeyAuditResult, error)
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	usedKeys := make(map[string]bool)
+	for _, repository := range manifest.Repositories {
+		_, trusted, _, _, _ := repositorySigningState(repository)
+		for _, name := range trusted {
+			usedKeys[name] = true
+		}
+	}
 	var findings []KeyAuditFinding
+	var rotationAuthorityErr error
+	for _, repository := range manifest.Repositories {
+		if repository.SigningRotation != nil {
+			_, rotationAuthorityErr = state.RequireCleanGit(root)
+			break
+		}
+	}
 	for _, name := range sortedSigningKeyNames(manifest.Keys) {
 		key := manifest.Keys[name]
 		binary, armored, loadErr := state.LoadSigningPublic(root, key)
@@ -187,23 +220,57 @@ func AuditKeys(request PublishKeyRequest, now time.Time) (KeyAuditResult, error)
 		}
 		expiresAt, _ := time.Parse(time.RFC3339, key.ExpiresAt)
 		switch {
+		case !now.Before(expiresAt) && usedKeys[name]:
+			findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "key/" + name, Message: "active or trusted signing key has expired"})
 		case !now.Before(expiresAt):
-			findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "key/" + name, Message: "signing key has expired"})
-		case expiresAt.Sub(now) < 30*24*time.Hour:
+			findings = append(findings, KeyAuditFinding{Severity: "warning", Subject: "key/" + name, Message: "unused historical signing key has expired"})
+		case usedKeys[name] && expiresAt.Sub(now) < 30*24*time.Hour:
 			findings = append(findings, KeyAuditFinding{Severity: "warning", Subject: "key/" + name, Message: "signing key expires in less than 30 days"})
 		}
 	}
+	var rotations []KeyRotationStatus
 	for _, name := range state.RepositoryNames(manifest) {
 		repository := manifest.Repositories[name]
 		if repository.Format == "deb" && len(repository.SigningKeys) == 0 {
 			findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "repo/" + name, Message: "Debian repository is unsigned"})
 			continue
 		}
-		for _, signingKey := range repository.SigningKeys {
+		_, trustedKeys, _, _, _ := repositorySigningState(repository)
+		for _, signingKey := range trustedKeys {
 			key := manifest.Keys[signingKey]
 			if !knowledge.Compatible(repository.Format, key.Algorithm) {
 				findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "repo/" + name, Message: "signing algorithm is incompatible with repository format"})
 			}
+		}
+		if repository.SigningRotation != nil {
+			status := KeyRotationStatus{Repository: name, Phase: repository.SigningRotation.Phase}
+			if validityErr := validateRotationKeyValidity(repository, manifest.Keys, now); validityErr != nil {
+				findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "repo/" + name, Message: validityErr.Error()})
+			}
+			if rotationAuthorityErr != nil {
+				findings = append(findings, KeyAuditFinding{Severity: "warning", Subject: "repo/" + name, Message: "rotation readiness is unavailable until authoritative state is committed"})
+				rotations = append(rotations, status)
+				continue
+			}
+			deployment, err := state.LoadDeployment(root, name)
+			if err != nil {
+				findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "repo/" + name, Message: err.Error()})
+			} else if desired, desiredErr := repositoryDeploymentSigningState(repository, manifest.Keys); desiredErr != nil {
+				findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "repo/" + name, Message: desiredErr.Error()})
+			} else if !deploymentSigningMatches(deployment, desired) {
+				findings = append(findings, KeyAuditFinding{Severity: "warning", Subject: "repo/" + name, Message: "rotation state has not been successfully deployed"})
+			} else if trustSince, parseErr := time.Parse(time.RFC3339, deployment.TrustSince); parseErr != nil {
+				findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "repo/" + name, Message: "deployment trust timestamp is invalid"})
+			} else {
+				status.Deployed = true
+				earliest := trustSince.Add(time.Duration(deployment.SigningMinimumRefreshSeconds) * time.Second)
+				status.EarliestAdvance = earliest.UTC().Format(time.RFC3339)
+				status.Ready = !now.Before(earliest)
+				if status.Ready {
+					findings = append(findings, KeyAuditFinding{Severity: "warning", Subject: "repo/" + name, Message: "rotation is ready to advance"})
+				}
+			}
+			rotations = append(rotations, status)
 		}
 	}
 	sort.Slice(findings, func(left, right int) bool {
@@ -215,7 +282,7 @@ func AuditKeys(request PublishKeyRequest, now time.Time) (KeyAuditResult, error)
 		}
 		return findings[left].Message < findings[right].Message
 	})
-	return KeyAuditResult{Findings: findings}, nil
+	return KeyAuditResult{Findings: findings, Rotations: rotations}, nil
 }
 
 func signingKeyFromGenerated(name string, ref signer.Ref, generated signer.Generated) (state.SigningKey, error) {
@@ -239,6 +306,61 @@ func signingKeyFromGenerated(name string, ref signer.Ref, generated signer.Gener
 		PublicArmorPath: "keys/" + name + ".asc", PublicArmorSHA256: hex.EncodeToString(armorDigest[:]),
 		Ref: state.KeyRef{Backend: ref.Backend, ID: ref.ID},
 	}, nil
+}
+
+func prepareSigningKey(ctx context.Context, manifest state.Manifest, name string, createdAt time.Time, expiresIn time.Duration, keys signer.Generator) (preparedSigningKey, error) {
+	ref := signer.Ref{Backend: "file", ID: manifest.Workspace.ID + "/" + name}
+	generated, err := keys.Public(ctx, ref)
+	createdPrivate := false
+	if errors.Is(err, signer.ErrNotFound) {
+		generated, err = keys.Generate(ctx, ref, name, createdAt, expiresIn)
+		createdPrivate = err == nil
+	}
+	if err != nil {
+		return preparedSigningKey{}, err
+	}
+	key, err := signingKeyFromGenerated(name, ref, generated)
+	if err != nil {
+		if createdPrivate {
+			_ = keys.Delete(context.WithoutCancel(ctx), ref)
+		}
+		return preparedSigningKey{}, err
+	}
+	return preparedSigningKey{key: key, generated: generated, createdPrivate: createdPrivate}, nil
+}
+
+func persistPreparedSigningKey(root string, prepared preparedSigningKey) (func(), error) {
+	var created []string
+	for _, relative := range []string{prepared.key.PublicKeyPath, prepared.key.PublicArmorPath} {
+		name, err := state.WorkspacePath(root, relative)
+		if err != nil {
+			return func() {}, err
+		}
+		if _, err := os.Lstat(name); errors.Is(err, os.ErrNotExist) {
+			created = append(created, name)
+		} else if err != nil {
+			return func() {}, err
+		}
+	}
+	rollback := func() {
+		for _, name := range created {
+			_ = os.Remove(name)
+		}
+	}
+	if err := state.WriteSigningPublic(root, prepared.key, prepared.generated.PublicBinary, prepared.generated.PublicArmor); err != nil {
+		rollback()
+		return func() {}, err
+	}
+	return rollback, nil
+}
+
+func keyResult(name string, key state.SigningKey) NewKeyResult {
+	return NewKeyResult{Name: name, Fingerprint: key.Fingerprint, ExpiresAt: key.ExpiresAt, Reference: key.Ref.ID}
+}
+
+func manifestMatches(root string, expected state.Manifest) bool {
+	actual, err := state.LoadManifest(root)
+	return err == nil && reflect.DeepEqual(actual, expected)
 }
 
 func sortedSigningKeyNames(keys map[string]state.SigningKey) []string {

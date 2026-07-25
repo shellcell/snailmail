@@ -92,11 +92,69 @@ func TestGenerateLoadAndDeterministicallySign(t *testing.T) {
 		}
 	}
 	if aptGet, err := exec.LookPath("apt-get"); err == nil {
-		verifyAPT(t, aptGet, local, generated, createdAt.Add(2*time.Hour))
+		verifyAPT(t, aptGet, local, generated.PublicBinary, createdAt.Add(2*time.Hour))
 	}
 }
 
-func verifyAPT(t *testing.T, aptGet string, local *Local, generated Generated, signatureTime time.Time) {
+func TestCombinedKeyringSupportsRotationSigners(t *testing.T) {
+	gpgv, err := exec.LookPath("gpgv")
+	if err != nil {
+		t.Skip("gpgv is unavailable")
+	}
+	createdAt := time.Date(2026, time.July, 25, 1, 2, 3, 0, time.UTC)
+	passphrase := []byte("rotation interoperability secret")
+	oldGenerated, err := Generate("archive-old", createdAt, 365*24*time.Hour, passphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newGenerated, err := Generate("archive-new", createdAt.Add(time.Hour), 365*24*time.Hour, passphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldLocal, err := Load(oldGenerated.PrivateArmor, passphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldLocal.Close()
+	newLocal, err := Load(newGenerated.PrivateArmor, passphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newLocal.Close()
+	combined := append(append([]byte(nil), oldGenerated.PublicBinary...), newGenerated.PublicBinary...)
+	identities, err := InspectPublicKeyring(combined)
+	if err != nil || len(identities) != 2 || identities[0].Fingerprint != oldGenerated.Identity.Fingerprint || identities[1].Fingerprint != newGenerated.Identity.Fingerprint {
+		t.Fatalf("combined keyring identities=%#v err=%v", identities, err)
+	}
+	payload := []byte("Origin: snailmail\nSuite: stable\n")
+	directory := t.TempDir()
+	for label, fixture := range map[string]struct {
+		local *Local
+		time  time.Time
+	}{"old": {oldLocal, createdAt.Add(2 * time.Hour)}, "new": {newLocal, createdAt.Add(2 * time.Hour)}} {
+		response, err := fixture.local.Sign(context.Background(), signer.Request{Scheme: signer.SchemeOpenPGPDetached, Payload: payload, CreatedAt: fixture.time})
+		if err != nil {
+			t.Fatal(err)
+		}
+		keyringName := filepath.Join(directory, "combined.gpg")
+		payloadName := filepath.Join(directory, "Release")
+		signatureName := filepath.Join(directory, label+".gpg")
+		for name, content := range map[string][]byte{keyringName: combined, payloadName: payload, signatureName: response.Content} {
+			if err := os.WriteFile(name, content, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if output, err := exec.Command(gpgv, "--keyring", keyringName, signatureName, payloadName).CombinedOutput(); err != nil {
+			t.Fatalf("combined keyring rejected %s signer: %v: %s", label, err, output)
+		}
+	}
+	if aptGet, err := exec.LookPath("apt-get"); err == nil {
+		verifyAPT(t, aptGet, oldLocal, combined, createdAt.Add(3*time.Hour))
+		verifyAPT(t, aptGet, newLocal, combined, createdAt.Add(3*time.Hour))
+	}
+}
+
+func verifyAPT(t *testing.T, aptGet string, local *Local, publicKeyring []byte, signatureTime time.Time) {
 	t.Helper()
 	directory := t.TempDir()
 	repository := filepath.Join(directory, "repository")
@@ -127,7 +185,7 @@ func verifyAPT(t *testing.T, aptGet string, local *Local, generated Generated, s
 		filepath.Join(repository, "dists", "stable", "Release"):     release,
 		filepath.Join(repository, "dists", "stable", "InRelease"):   responses[signer.SchemeOpenPGPCleartext].Content,
 		filepath.Join(repository, "dists", "stable", "Release.gpg"): responses[signer.SchemeOpenPGPDetached].Content,
-		filepath.Join(directory, "archive.gpg"):                     generated.PublicBinary,
+		filepath.Join(directory, "archive.gpg"):                     publicKeyring,
 	}
 	for name, content := range files {
 		if err := os.WriteFile(name, content, 0o600); err != nil {

@@ -19,6 +19,7 @@ import (
 	"github.com/shellcell/snailmail/engine"
 	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/internal/wire"
+	"github.com/shellcell/snailmail/signer"
 )
 
 const defaultGeneratedAt = "1970-01-01T00:00:00Z"
@@ -156,7 +157,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 
 func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail keys <new|publish|audit> [options]")
+		return errors.New("usage: snailmail keys <new|publish|rotate|audit> [options]")
 	}
 	switch args[0] {
 	case "new":
@@ -214,6 +215,56 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fmt.Fprintf(stdout, "📦  published public forms for %s\n", result.Name)
 		fmt.Fprintf(stdout, "✉️   fingerprint %s\n", result.Fingerprint)
 		return nil
+	case "rotate":
+		if len(args) < 2 {
+			return errors.New("usage: snailmail keys rotate REPOSITORY --successor KEY [--minimum-refresh 720h] | --advance --yes")
+		}
+		repository := args[1]
+		flags := flag.NewFlagSet("keys rotate", flag.ContinueOnError)
+		flags.SetOutput(stderr)
+		workspace := flags.String("workspace", ".", "workspace root")
+		successor := flags.String("successor", "", "successor signing key name")
+		advance := flags.Bool("advance", false, "advance the deployed rotation to its next phase")
+		minimumRefresh := flags.Duration("minimum-refresh", 30*24*time.Hour, "minimum client keyring refresh window")
+		expiresIn := flags.Duration("expires-in", 2*365*24*time.Hour, "new successor key validity")
+		confirmed := flags.Bool("yes", false, "confirm an advance transition")
+		if err := flags.Parse(args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 {
+			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
+		}
+		if *advance && !*confirmed {
+			return errors.New("keys rotate --advance requires --yes")
+		}
+		if !*advance && *successor == "" {
+			return errors.New("keys rotate requires --successor when starting a rotation")
+		}
+		var keyGenerator signer.Generator
+		var err error
+		if !*advance {
+			keyGenerator, err = wire.NewSignerStore()
+			if err != nil {
+				return err
+			}
+		}
+		result, err := engine.RotateKey(ctx, engine.RotateKeyRequest{
+			Root: *workspace, Repository: repository, Successor: *successor, Advance: *advance,
+			MinimumRefresh: *minimumRefresh, ExpiresIn: *expiresIn, Keys: keyGenerator,
+		})
+		if err != nil {
+			return err
+		}
+		printBrand(stdout)
+		fmt.Fprintf(stdout, "📦  signing rotation for %s is %s\n", result.Repository, result.Phase)
+		fmt.Fprintf(stdout, "✉️   active %s; trusted %s\n", result.ActiveKey, strings.Join(result.TrustedKeys, ", "))
+		if result.EarliestAdvance != "" {
+			fmt.Fprintf(stdout, "    earliest next transition %s\n", result.EarliestAdvance)
+		}
+		if result.RequiresDeploy {
+			fmt.Fprintln(stdout, "    commit this state, then run plan and apply")
+		}
+		return nil
 	case "audit":
 		flags := flag.NewFlagSet("keys audit", flag.ContinueOnError)
 		flags.SetOutput(stderr)
@@ -231,7 +282,15 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		printBrand(stdout)
 		if len(result.Findings) == 0 {
 			fmt.Fprintln(stdout, "📦  signing keys and repository compatibility are valid")
-			return nil
+		}
+		for _, rotation := range result.Rotations {
+			state := "awaiting deployment"
+			if rotation.Deployed && rotation.Ready {
+				state = "ready to advance"
+			} else if rotation.Deployed {
+				state = "waiting until " + rotation.EarliestAdvance
+			}
+			fmt.Fprintf(stdout, "📦  rotation %s is %s: %s\n", rotation.Repository, rotation.Phase, state)
 		}
 		hasErrors := false
 		for _, finding := range result.Findings {
@@ -766,6 +825,8 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")
 	fmt.Fprintln(output, "  snailmail keys new NAME [--algo openpgp-rsa4096]")
 	fmt.Fprintln(output, "  snailmail keys publish NAME")
+	fmt.Fprintln(output, "  snailmail keys rotate REPOSITORY --successor KEY [--minimum-refresh 720h]")
+	fmt.Fprintln(output, "  snailmail keys rotate REPOSITORY --advance --yes")
 	fmt.Fprintln(output, "  snailmail keys audit")
 	fmt.Fprintln(output, "  snailmail approve --plan PLAN --repository NAME --key FILE --yes")
 	fmt.Fprintln(output, "  snailmail render [--output site]")

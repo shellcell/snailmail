@@ -653,12 +653,13 @@ snailmail keys new apt-signing --algo rsa4096 --usage sign
 snailmail keys publish    # every public form: binary .gpg (apt), armored .asc
                           # (dnf), <name>.rsa.pub at the exact filename apk needs
 snailmail keys audit      # expiry, usage, per-format compatibility
-snailmail keys rotate apt-signing
+snailmail keys rotate debian --successor apt-signing-2027 --minimum-refresh 720h
 ```
 
-`rotate` is a workflow, not a swap: generate, dual-sign through the overlap
-window where the format permits it, republish public material, emit user-facing
-re-fetch instructions, retire the old key.
+`rotate` is a workflow, not a swap: generate, overlap trust and signatures where
+the format permits them, republish public material, emit user-facing re-fetch
+instructions, and retire the old key. Debian keeps one active `InRelease` signer
+while its stable keyring carries both identities during overlap.
 
 Private material sits behind `KeyRef` with pluggable backends — Actions secret,
 `pass`/1Password, age/SOPS in-repo, KMS, hardware token. Where the backend can
@@ -1180,12 +1181,13 @@ are needed.
 
 The first Phase 3 slice is implemented: encrypted file-backed RSA4096 OpenPGP
 identities, committed binary and armored public forms, the versioned signing
-compatibility table, `keys new|publish|audit`, deterministic plan-resolved
+compatibility table, `keys new|publish|audit|rotate`, deterministic plan-resolved
 signature responses, and Debian `InRelease` plus `Release.gpg` verified through
 apt `signed-by`. The persisted key and signing-effect collections are
-rotation-ready, although overlap execution and `keys rotate` remain deferred.
-Additional backends, operational commands, and format expansion remain
-subsequent Phase 3 slices.
+rotation-ready. Debian `keys rotate` now implements receipt-backed successor
+introduction, activation, overlap, and retirement with a stable multi-identity
+keyring and one active `InRelease` signer. Additional backends, operational
+commands, and format expansion remain subsequent Phase 3 slices.
 
 **Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
 drift detection, then irreversible `target` operations for AUR, Homebrew,

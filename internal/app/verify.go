@@ -31,6 +31,7 @@ import (
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
+	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
 const (
@@ -919,7 +920,7 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 			path.Clean(manifest.Install.SigningKeyPath) != manifest.Install.SigningKeyPath || !strings.HasPrefix(manifest.Install.SigningKeyPath, "keys/") {
 			return nil, errors.New("signed Debian repository has incomplete signature metadata")
 		}
-		keyContent, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(manifest.Install.SigningKeyPath)))
+		keyringContent, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(manifest.Install.SigningKeyPath)))
 		if err != nil {
 			return nil, fmt.Errorf("read Debian public signing key: %w", err)
 		}
@@ -935,9 +936,17 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 		if err != nil || manifest.Signatures[1].CreatedAt != manifest.Signatures[0].CreatedAt {
 			return nil, errors.New("Debian signature metadata has inconsistent creation times")
 		}
-		keyName := strings.TrimSuffix(path.Base(manifest.Install.SigningKeyPath), ".gpg")
+		trustedFingerprints := append([]string(nil), manifest.Install.TrustedSigningFingerprints...)
+		if len(trustedFingerprints) == 0 {
+			trustedFingerprints = []string{manifest.Install.SigningFingerprint}
+		}
+		activePublic, err := openpgpsigner.ExtractPublicKey(keyringContent, manifest.Install.SigningFingerprint)
+		if err != nil {
+			return nil, fmt.Errorf("extract active Debian signing key: %w", err)
+		}
 		expectedArtifact, err = deb.ApplySigning(expectedArtifact, manifest.Install.Suite, deb.SigningMaterial{
-			KeyName: keyName, Fingerprint: manifest.Install.SigningFingerprint, PublicKey: keyContent,
+			Fingerprint: manifest.Install.SigningFingerprint, PublicKey: activePublic,
+			KeyringPath: manifest.Install.SigningKeyPath, PublicKeyring: keyringContent, TrustedFingerprints: trustedFingerprints,
 			SignatureTime: signatureTime, InRelease: inRelease, ReleaseGPG: releaseGPG,
 		})
 		if err != nil {
@@ -951,6 +960,9 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 		return nil, fmt.Errorf("finalize expected Debian structure: %w", err)
 	}
 	expectedManifest.SchemaVersion = manifest.SchemaVersion
+	if manifest.SchemaVersion < 3 {
+		expectedManifest.Install.TrustedSigningFingerprints = nil
+	}
 	if !reflect.DeepEqual(expectedManifest, manifest) {
 		return nil, errors.New("Debian indexes or verification metadata do not match package bytes")
 	}

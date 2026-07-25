@@ -40,6 +40,21 @@ func TestUsageUsesSnailIcon(t *testing.T) {
 	}
 }
 
+func TestKeysRotateRequiresExplicitTransitionArguments(t *testing.T) {
+	for name, arguments := range map[string][]string{
+		"repository":   {"keys", "rotate"},
+		"successor":    {"keys", "rotate", "debian"},
+		"confirmation": {"keys", "rotate", "debian", "--advance"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			if err := run(context.Background(), arguments, &stdout, &stderr); err == nil {
+				t.Fatalf("rotation arguments unexpectedly accepted: %v", arguments)
+			}
+		})
+	}
+}
+
 func TestDebBuildAndVerifyOutputUsesProductIcons(t *testing.T) {
 	input := t.TempDir()
 	if _, err := testutil.WriteDeb(input, "snail-demo", "1.2.3-1", "amd64", nil); err != nil {

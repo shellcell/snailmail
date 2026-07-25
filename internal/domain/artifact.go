@@ -45,13 +45,14 @@ type VerificationCase struct {
 // InstallSpec captures ecosystem operations independently of a deployment
 // endpoint. Phase 0 only needs the PyPI simple-index path.
 type InstallSpec struct {
-	Kind               string   `json:"kind"`
-	IndexPath          string   `json:"index_path,omitempty"`
-	Suite              string   `json:"suite,omitempty"`
-	Component          string   `json:"component,omitempty"`
-	Architectures      []string `json:"architectures,omitempty"`
-	SigningKeyPath     string   `json:"signing_key_path,omitempty"`
-	SigningFingerprint string   `json:"signing_fingerprint,omitempty"`
+	Kind                       string   `json:"kind"`
+	IndexPath                  string   `json:"index_path,omitempty"`
+	Suite                      string   `json:"suite,omitempty"`
+	Component                  string   `json:"component,omitempty"`
+	Architectures              []string `json:"architectures,omitempty"`
+	SigningKeyPath             string   `json:"signing_key_path,omitempty"`
+	SigningFingerprint         string   `json:"signing_fingerprint,omitempty"`
+	TrustedSigningFingerprints []string `json:"trusted_signing_fingerprints,omitempty"`
 }
 
 type Signature struct {

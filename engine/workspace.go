@@ -140,19 +140,20 @@ type RenderStatusResult struct {
 }
 
 type ApplyWorkspaceRequest struct {
-	Root              string
-	Plan              string
-	now               time.Time
-	clock             func() time.Time
-	StructuralOnly    bool
-	Python            string
-	Runner            string
-	DebianImage       string
-	HelmImage         string
-	MaxWorkspaceBytes int64
-	Hosts             host.Resolver
-	Blobs             blob.Resolver
-	Gates             gate.Evaluator
+	Root                   string
+	Plan                   string
+	now                    time.Time
+	clock                  func() time.Time
+	StructuralOnly         bool
+	Python                 string
+	Runner                 string
+	DebianImage            string
+	HelmImage              string
+	MaxWorkspaceBytes      int64
+	Hosts                  host.Resolver
+	Blobs                  blob.Resolver
+	Gates                  gate.Evaluator
+	beforeDeploymentCommit func() error
 }
 
 type ApplyWorkspaceResult struct {
@@ -478,6 +479,9 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
 			return PlanWorkspaceResult{}, err
 		}
+		if err := validateRotationKeyValidity(repository, manifest.Keys, createdAt); err != nil {
+			return PlanWorkspaceResult{}, fmt.Errorf("repository %q: %w", name, err)
+		}
 		deployment, err := state.LoadDeployment(root, name)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
@@ -495,8 +499,9 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 			return PlanWorkspaceResult{}, err
 		}
 		if len(desired.Signing) != 0 {
-			keyExpiresAt, err := time.Parse(time.RFC3339, manifest.Keys[repository.SigningKeys[0]].ExpiresAt)
-			if err != nil || createdAt.Add(expiresIn).After(keyExpiresAt) {
+			activeKey, _, _, _, signingErr := repositorySigningState(repository)
+			keyExpiresAt, err := time.Parse(time.RFC3339, manifest.Keys[activeKey].ExpiresAt)
+			if signingErr != nil || err != nil || createdAt.Add(expiresIn).After(keyExpiresAt) {
 				return PlanWorkspaceResult{}, fmt.Errorf("repository %q plan expires after its signing key", name)
 			}
 		}
@@ -520,8 +525,15 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
+		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, observed, createdAt); err != nil {
+			return PlanWorkspaceResult{}, fmt.Errorf("repository %q: %w", name, err)
+		}
+		desiredSigningState, err := repositoryDeploymentSigningState(repository, manifest.Keys)
+		if err != nil {
+			return PlanWorkspaceResult{}, err
+		}
 		action := "noop"
-		if observed.TreeSHA256 != desired.TreeSHA256 || ((hostRepository.Type == "s3" || hostRepository.Type == "github-pages") && observed.ManifestSHA256 != desired.ManifestSHA256) || !publicationBindingsComplete(lock, ledger) || !deploymentMatchesDesired(deployment, observed, desired.TreeSHA256, desired.ManifestSHA256, ledger) {
+		if observed.TreeSHA256 != desired.TreeSHA256 || ((hostRepository.Type == "s3" || hostRepository.Type == "github-pages") && observed.ManifestSHA256 != desired.ManifestSHA256) || !publicationBindingsComplete(lock, ledger) || !deploymentMatchesDesired(deployment, observed, desired.TreeSHA256, desired.ManifestSHA256, ledger, desiredSigningState) {
 			action = "update"
 			if observed.NativeRevision == "" {
 				action = "create"
@@ -652,6 +664,8 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		stageRoot      string
 		stage          string
 		current        bool
+		deployment     state.DeploymentRecord
+		signingState   deploymentSigningState
 	}
 	var prepared []applyRepository
 	hosts := request.Hosts
@@ -665,11 +679,15 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		}
 		seenRepositories[planned.Name] = true
 		repository, exists := manifest.Repositories[planned.Name]
-		if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) || len(planned.Signing) != len(repository.SigningKeys) {
+		if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) || len(planned.Signing) > 1 || (len(planned.Signing) == 0) != (len(repository.SigningKeys) == 0) {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q configuration changed", planned.Name)
 		}
+		activeSigningKey, _, _, _, signingStateErr := repositorySigningState(repository)
+		if signingStateErr != nil {
+			return ApplyWorkspaceResult{}, signingStateErr
+		}
 		for index, signing := range planned.Signing {
-			if signing.KeyName != repository.SigningKeys[index] {
+			if index != 0 || signing.KeyName != activeSigningKey {
 				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q signing key changed", planned.Name)
 			}
 			key, exists := manifest.Keys[signing.KeyName]
@@ -734,17 +752,25 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
+		desiredSigningState, err := repositoryDeploymentSigningState(repository, manifest.Keys)
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
 		observed, err := selectedHost.Observe(ctx, hostRepository)
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
+		}
+		plannedObserved := publishedFromPlanObservation(planned)
+		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, plannedObserved, now); err != nil {
+			return ApplyWorkspaceResult{}, fmt.Errorf("repository %q: %w", planned.Name, err)
 		}
 		matchesObserved := revisionMatchesPlanObservation(observed, planned)
 		managedRemote := repository.Host.Type == "s3" || repository.Host.Type == "github-pages"
 		matchesApplied := planned.Action != "noop" && observed.TreeSHA256 == planned.DesiredTreeSHA256 &&
 			(!managedRemote || (observed.PlanID == plan.PlanID && observed.ChangeID == planned.ChangeID && observed.ManifestSHA256 == planned.DesiredManifestSHA256))
-		deploymentApplied := deployment.PlanID == plan.PlanID && deployment.ChangeID == planned.ChangeID && deployment.TreeSHA256 == planned.DesiredTreeSHA256 && deployment.ManifestSHA256 == planned.DesiredManifestSHA256 && deployment.NativeRevision == observed.NativeRevision
-		deploymentCurrent := deploymentMatchesDesired(deployment, observed, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, ledger)
-		if deployment != planned.ObservedDeployment && !deploymentApplied {
+		deploymentApplied := deployment.PlanID == plan.PlanID && deployment.ChangeID == planned.ChangeID && deployment.TreeSHA256 == planned.DesiredTreeSHA256 && deployment.ManifestSHA256 == planned.DesiredManifestSHA256 && deployment.NativeRevision == observed.NativeRevision && deploymentSigningMatches(deployment, desiredSigningState)
+		deploymentCurrent := deploymentMatchesDesired(deployment, observed, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, ledger, desiredSigningState)
+		if !reflect.DeepEqual(deployment, planned.ObservedDeployment) && !deploymentApplied {
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q deployment receipt changed", planned.Name)
 		}
 		if !matchesObserved && !matchesApplied {
@@ -757,8 +783,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q target changed", planned.Name)
 		}
 		expectedAction := "noop"
-		plannedObserved := publishedFromPlanObservation(planned)
-		if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 || (managedRemote && planned.ObservedManifestSHA256 != planned.DesiredManifestSHA256) || !publicationBindingsComplete(lock, ledger) || !deploymentMatchesDesired(planned.ObservedDeployment, plannedObserved, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, ledger) {
+		if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 || (managedRemote && planned.ObservedManifestSHA256 != planned.DesiredManifestSHA256) || !publicationBindingsComplete(lock, ledger) || !deploymentMatchesDesired(planned.ObservedDeployment, plannedObserved, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, ledger, desiredSigningState) {
 			expectedAction = "update"
 			if planned.ObservedRevision == "" {
 				expectedAction = "create"
@@ -767,11 +792,11 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if planned.Action != expectedAction || planned.ChangeID != planned.Name+":"+planned.DesiredTreeSHA256[:12] {
 			return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q has inconsistent action metadata", planned.Name)
 		}
-		receiptRecovery := matchesApplied && deployment == planned.ObservedDeployment
+		receiptRecovery := matchesApplied && reflect.DeepEqual(deployment, planned.ObservedDeployment)
 		current := observed.TreeSHA256 == planned.DesiredTreeSHA256 && (!managedRemote || observed.ManifestSHA256 == planned.DesiredManifestSHA256) && (deploymentApplied || (planned.Action == "noop" && deploymentCurrent) || receiptRecovery)
 		item := applyRepository{
 			planned: planned, repository: repository, lock: lock, host: selectedHost,
-			hostRepository: hostRepository, observed: observed, current: current,
+			hostRepository: hostRepository, observed: observed, current: current, deployment: deployment, signingState: desiredSigningState,
 		}
 		if item.current && (request.StructuralOnly || planned.Action == "noop") && !(planned.Action != "noop" && len(planned.Signing) != 0) {
 			prepared = append(prepared, item)
@@ -1001,11 +1026,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 				}
 			}
 			if item.planned.Action != "noop" {
-				deployments = append(deployments, state.DeploymentRecord{
-					Repository: item.planned.Name, PlanID: plan.PlanID, ChangeID: item.planned.ChangeID,
-					TreeSHA256: item.planned.DesiredTreeSHA256, ManifestSHA256: item.planned.DesiredManifestSHA256,
-					NativeRevision: item.observed.NativeRevision, DeployedAt: plan.Payload.CreatedAt,
-				})
+				deployments = append(deployments, deploymentRecordFor(item.planned, item.deployment, item.observed, item.signingState, item.observed.NativeRevision, plan.PlanID, plan.Payload.CreatedAt, request.currentTime()))
 			}
 			continue
 		}
@@ -1068,15 +1089,16 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
 			return result, err
 		}
-		deployments = append(deployments, state.DeploymentRecord{
-			Repository: item.planned.Name, PlanID: plan.PlanID, ChangeID: item.planned.ChangeID,
-			TreeSHA256: item.planned.DesiredTreeSHA256, ManifestSHA256: item.planned.DesiredManifestSHA256,
-			NativeRevision: committed.Revision.NativeRevision, DeployedAt: plan.Payload.CreatedAt,
-		})
+		deployments = append(deployments, deploymentRecordFor(item.planned, item.deployment, item.observed, item.signingState, committed.Revision.NativeRevision, plan.PlanID, plan.Payload.CreatedAt, request.currentTime()))
 	}
 	if unlockGit != nil {
 		unlockGit()
 		unlockGit = nil
+	}
+	if request.beforeDeploymentCommit != nil {
+		if err := request.beforeDeploymentCommit(); err != nil {
+			return result, fmt.Errorf("before deployment receipt commit: %w", err)
+		}
 	}
 	if _, err := state.CommitDeployments(root, plan.PlanID, applyGitRevision, deployments); err != nil {
 		return result, fmt.Errorf("record successful deployments: %w", err)
@@ -1654,9 +1676,7 @@ func validateApplyPlan(plan state.Plan) error {
 		if err := state.ValidateGateConfiguration(repository.Gate, repository.ApprovalKeys, plan.Payload.ForgeRepository); err != nil {
 			return fmt.Errorf("plan repository %q gate: %w", repository.Name, err)
 		}
-		if deployment := repository.ObservedDeployment; deployment.NativeRevision != "" &&
-			(deployment.SchemaVersion != state.DeploymentSchema || deployment.Repository != repository.Name || !validSHA256(deployment.PlanID) || !validSHA256(deployment.TreeSHA256) ||
-				(deployment.ManifestSHA256 != "" && !validSHA256(deployment.ManifestSHA256)) || deployment.ChangeID != deployment.Repository+":"+deployment.TreeSHA256[:12] || deployment.DeployedAt == "") {
+		if err := state.ValidateDeploymentRecord(repository.ObservedDeployment, repository.Name); err != nil {
 			return fmt.Errorf("plan repository %q has invalid deployment observation", repository.Name)
 		}
 		if !validSHA256(repository.LockSHA256) || !validSHA256(repository.DesiredTreeSHA256) ||
@@ -1769,10 +1789,10 @@ func blobref(locked state.LockedBlob) blob.Ref {
 	return blob.Ref{SHA256: locked.SHA256, Size: locked.Size}
 }
 
-func deploymentMatchesDesired(deployment state.DeploymentRecord, observed host.PublishedRevision, treeSHA256, manifestSHA256 string, ledger []state.PublicationRecord) bool {
+func deploymentMatchesDesired(deployment state.DeploymentRecord, observed host.PublishedRevision, treeSHA256, manifestSHA256 string, ledger []state.PublicationRecord, signing deploymentSigningState) bool {
 	if !validSHA256(treeSHA256) || deployment.TreeSHA256 != treeSHA256 || deployment.ManifestSHA256 != manifestSHA256 ||
 		deployment.NativeRevision == "" || deployment.NativeRevision != observed.NativeRevision ||
-		deployment.ChangeID != deployment.Repository+":"+treeSHA256[:12] {
+		deployment.ChangeID != deployment.Repository+":"+treeSHA256[:12] || !deploymentSigningMatches(deployment, signing) {
 		return false
 	}
 	for _, record := range ledger {
@@ -1781,6 +1801,11 @@ func deploymentMatchesDesired(deployment state.DeploymentRecord, observed host.P
 		}
 	}
 	return false
+}
+
+func deploymentSigningMatches(deployment state.DeploymentRecord, signing deploymentSigningState) bool {
+	return deployment.ActiveSigningFingerprint == signing.active && reflect.DeepEqual(deployment.TrustedSigningFingerprints, signing.trusted) && deployment.SigningRotationPhase == signing.phase &&
+		deployment.SigningKeyringPath == signing.keyring && deployment.SigningMinimumRefreshSeconds == signing.minimumRefresh && (signing.active == "" || deployment.TrustSince != "")
 }
 
 func publishedFromPlanObservation(planned state.PlanRepository) host.PublishedRevision {

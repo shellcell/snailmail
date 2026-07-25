@@ -3,11 +3,11 @@ package state
 import "time"
 
 const (
-	ManifestSchema   = 5
+	ManifestSchema   = 6
 	LockSchema       = 1
-	PlanSchema       = 7
+	PlanSchema       = 8
 	LedgerSchema     = 1
-	DeploymentSchema = 1
+	DeploymentSchema = 2
 )
 
 type Manifest struct {
@@ -34,16 +34,24 @@ type BlobStoreConfig struct {
 }
 
 type Repository struct {
-	Format        string     `toml:"format"`
-	Lock          string     `toml:"lock"`
-	Host          HostConfig `toml:"host"`
-	Visibility    string     `toml:"visibility"`
-	Gate          string     `toml:"gate"`
-	ApprovalKeys  []string   `toml:"approval_keys,omitempty"`
-	SigningKeys   []string   `toml:"signing_keys,omitempty"`
-	Suite         string     `toml:"suite,omitempty"`
-	Component     string     `toml:"component,omitempty"`
-	Architectures []string   `toml:"architectures,omitempty"`
+	Format          string           `toml:"format"`
+	Lock            string           `toml:"lock"`
+	Host            HostConfig       `toml:"host"`
+	Visibility      string           `toml:"visibility"`
+	Gate            string           `toml:"gate"`
+	ApprovalKeys    []string         `toml:"approval_keys,omitempty"`
+	SigningKeys     []string         `toml:"signing_keys,omitempty"`
+	SigningKeyring  string           `toml:"signing_keyring,omitempty"`
+	SigningRotation *SigningRotation `toml:"signing_rotation,omitempty"`
+	Suite           string           `toml:"suite,omitempty"`
+	Component       string           `toml:"component,omitempty"`
+	Architectures   []string         `toml:"architectures,omitempty"`
+}
+
+type SigningRotation struct {
+	SuccessorKey          string `toml:"successor_key"`
+	Phase                 string `toml:"phase"`
+	MinimumRefreshSeconds int64  `toml:"minimum_refresh_seconds"`
 }
 
 type SigningKey struct {
@@ -125,14 +133,20 @@ type PublicationRecord struct {
 }
 
 type DeploymentRecord struct {
-	SchemaVersion  int    `json:"schema_version"`
-	Repository     string `json:"repository"`
-	PlanID         string `json:"plan_id"`
-	ChangeID       string `json:"change_id"`
-	TreeSHA256     string `json:"tree_sha256"`
-	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
-	NativeRevision string `json:"native_revision"`
-	DeployedAt     string `json:"deployed_at"`
+	SchemaVersion                int      `json:"schema_version"`
+	Repository                   string   `json:"repository"`
+	PlanID                       string   `json:"plan_id"`
+	ChangeID                     string   `json:"change_id"`
+	TreeSHA256                   string   `json:"tree_sha256"`
+	ManifestSHA256               string   `json:"manifest_sha256,omitempty"`
+	NativeRevision               string   `json:"native_revision"`
+	DeployedAt                   string   `json:"deployed_at"`
+	ActiveSigningFingerprint     string   `json:"active_signing_fingerprint,omitempty"`
+	TrustedSigningFingerprints   []string `json:"trusted_signing_fingerprints,omitempty"`
+	SigningKeyringPath           string   `json:"signing_keyring_path,omitempty"`
+	SigningRotationPhase         string   `json:"signing_rotation_phase,omitempty"`
+	SigningMinimumRefreshSeconds int64    `json:"signing_minimum_refresh_seconds,omitempty"`
+	TrustSince                   string   `json:"trust_since,omitempty"`
 }
 
 type Plan struct {
@@ -191,16 +205,28 @@ type PlanRepository struct {
 }
 
 type PlanSigning struct {
-	KeyName           string        `json:"key_name"`
-	Algorithm         string        `json:"algorithm"`
-	Fingerprint       string        `json:"fingerprint"`
-	PublicKeyPath     string        `json:"public_key_path"`
-	PublicKeySHA256   string        `json:"public_key_sha256"`
-	PublicArmorPath   string        `json:"public_armor_path"`
-	PublicArmorSHA256 string        `json:"public_armor_sha256"`
-	SignatureTime     string        `json:"signature_time"`
-	RecipeSHA256      string        `json:"recipe_sha256"`
-	Nodes             []SigningNode `json:"nodes"`
+	KeyName               string          `json:"key_name"`
+	Algorithm             string          `json:"algorithm"`
+	Fingerprint           string          `json:"fingerprint"`
+	PublicKeyPath         string          `json:"public_key_path"`
+	PublicKeySHA256       string          `json:"public_key_sha256"`
+	PublicArmorPath       string          `json:"public_armor_path"`
+	PublicArmorSHA256     string          `json:"public_armor_sha256"`
+	SignatureTime         string          `json:"signature_time"`
+	RecipeSHA256          string          `json:"recipe_sha256"`
+	KeyringPath           string          `json:"keyring_path"`
+	KeyringSHA256         string          `json:"keyring_sha256"`
+	TrustedKeys           []PlanPublicKey `json:"trusted_keys"`
+	RotationPhase         string          `json:"rotation_phase,omitempty"`
+	MinimumRefreshSeconds int64           `json:"minimum_refresh_seconds,omitempty"`
+	Nodes                 []SigningNode   `json:"nodes"`
+}
+
+type PlanPublicKey struct {
+	KeyName         string `json:"key_name"`
+	Fingerprint     string `json:"fingerprint"`
+	PublicKeyPath   string `json:"public_key_path"`
+	PublicKeySHA256 string `json:"public_key_sha256"`
 }
 
 type SigningNode struct {

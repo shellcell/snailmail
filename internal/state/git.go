@@ -44,6 +44,21 @@ func RequireGitRepository(root string) error {
 }
 
 func RequireCleanGit(root string) (string, error) {
+	return requireCleanGit(root, nil)
+}
+
+func RequireCleanGitAllowingUntracked(root string, relativePaths []string) (string, error) {
+	allowed := make(map[string]bool, len(relativePaths))
+	for _, name := range relativePaths {
+		if err := validateRelativePath(name); err != nil {
+			return "", err
+		}
+		allowed[filepath.ToSlash(name)] = true
+	}
+	return requireCleanGit(root, allowed)
+}
+
+func requireCleanGit(root string, allowedUntracked map[string]bool) (string, error) {
 	if err := requireCompleteGitHistory(root); err != nil {
 		return "", err
 	}
@@ -62,10 +77,10 @@ func RequireCleanGit(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := validateGitStatus(status, nil, authoritative); err != nil {
+	if err := validateGitStatusAllowingUntracked(status, allowedUntracked, authoritative); err != nil {
 		return "", err
 	}
-	if err := requireAuthoritativeFilesCommitted(root, revision, authoritative, nil); err != nil {
+	if err := requireAuthoritativeFilesCommitted(root, revision, authoritative, allowedUntracked); err != nil {
 		return "", err
 	}
 	confirmedRevision, err := gitOutput(root, "rev-parse", "HEAD")
@@ -73,6 +88,25 @@ func RequireCleanGit(root string) (string, error) {
 		return "", errors.New("Git revision changed while validating workspace")
 	}
 	return revision, nil
+}
+
+func validateGitStatusAllowingUntracked(status string, allowedUntracked, authoritative map[string]bool) error {
+	for _, line := range strings.Split(status, "\n") {
+		if line == "" {
+			continue
+		}
+		if len(line) < 4 {
+			return errors.New("cannot parse Git status")
+		}
+		name := filepath.ToSlash(strings.TrimSpace(line[3:]))
+		if strings.HasPrefix(line, "?? ") && allowedUntracked[name] {
+			continue
+		}
+		if err := validateGitStatus(line, nil, authoritative); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ValidatePlanGit accepts the reviewed base commit, its exact publication
