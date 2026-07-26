@@ -48,11 +48,18 @@ func IsPackageFilename(name string) bool {
 // Inspect derives package identity and control fields directly from a Debian
 // binary package without invoking dpkg.
 func Inspect(filename string, reader io.ReaderAt, size int64) (domain.PackageFacts, error) {
+	return InspectWithExpandedLimit(filename, reader, size, maxDataArchive)
+}
+
+func InspectWithExpandedLimit(filename string, reader io.ReaderAt, size, maximumExpanded int64) (domain.PackageFacts, error) {
 	if !IsPackageFilename(filename) {
 		return domain.PackageFacts{}, fmt.Errorf("unsupported Debian package %q", filename)
 	}
 	if size < 8 || size > MaxArtifactSize {
 		return domain.PackageFacts{}, fmt.Errorf("Debian package size %d is outside the supported range", size)
+	}
+	if maximumExpanded < 1<<20 || maximumExpanded > maxDataArchive {
+		return domain.PackageFacts{}, errors.New("Debian expanded-size limit is outside the supported range")
 	}
 	members, err := readArMembers(reader, size)
 	if err != nil {
@@ -90,7 +97,7 @@ func Inspect(filename string, reader io.ReaderAt, size int64) (domain.PackageFac
 	if err != nil {
 		return domain.PackageFacts{}, fmt.Errorf("inspect %q: %w", filename, err)
 	}
-	installedSize, err := validateDataArchive(data.name, io.NewSectionReader(reader, data.offset, data.size))
+	installedSize, err := validateDataArchive(data.name, io.NewSectionReader(reader, data.offset, data.size), maximumExpanded)
 	if err != nil {
 		return domain.PackageFacts{}, fmt.Errorf("inspect %q: %w", filename, err)
 	}
@@ -165,15 +172,15 @@ func readArMembers(reader io.ReaderAt, size int64) ([]arMember, error) {
 	return members, nil
 }
 
-func validateDataArchive(name string, raw io.Reader) (int64, error) {
-	stream, closeStream, err := compressedTarReader(name, raw, 128<<20)
+func validateDataArchive(name string, raw io.Reader, maximumExpanded int64) (int64, error) {
+	stream, closeStream, err := compressedTarReader(name, raw, uint64(maximumExpanded))
 	if err != nil {
 		return 0, fmt.Errorf("open data archive: %w", err)
 	}
 	if closeStream != nil {
 		defer closeStream()
 	}
-	limited := &io.LimitedReader{R: stream, N: maxDataArchive + 1}
+	limited := &io.LimitedReader{R: stream, N: maximumExpanded + 1}
 	archive := tar.NewReader(limited)
 	entries := 0
 	var installedSize int64
@@ -199,7 +206,7 @@ func validateDataArchive(name string, raw io.Reader) (int64, error) {
 		switch header.Typeflag {
 		case tar.TypeReg, tar.TypeRegA, tar.TypeDir, tar.TypeSymlink, tar.TypeLink:
 			if header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA {
-				if header.Size < 0 || header.Size > maxDataArchive-installedSize {
+				if header.Size < 0 || header.Size > maximumExpanded-installedSize {
 					return 0, errors.New("data archive expanded size exceeds limit")
 				}
 				installedSize += header.Size
@@ -228,7 +235,7 @@ func compressedTarReader(name string, raw io.Reader, maxMemory uint64) (io.Reade
 		}
 		return compressed, func() { _ = compressed.Close() }, nil
 	case strings.HasSuffix(name, ".xz"):
-		compressed, err := xz.NewReader(raw)
+		compressed, err := (xz.ReaderConfig{DictCap: int(maxMemory)}).NewReader(raw)
 		return compressed, nil, err
 	case strings.HasSuffix(name, ".zst"):
 		compressed, err := zstd.NewReader(raw, zstd.WithDecoderMaxMemory(maxMemory))
@@ -290,7 +297,7 @@ func readControlArchive(name string, raw io.Reader) (map[string]string, error) {
 		stream = compressed
 		closeStream = func() { _ = compressed.Close() }
 	case strings.HasSuffix(name, ".xz"):
-		compressed, err := xz.NewReader(raw)
+		compressed, err := (xz.ReaderConfig{DictCap: maxControlArchive}).NewReader(raw)
 		if err != nil {
 			return nil, fmt.Errorf("open xz control archive: %w", err)
 		}

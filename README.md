@@ -93,6 +93,15 @@ receipt is recorded; `--json` emits the same deterministic schema for
 automation. A receipt is evidence of a prior successful apply, not proof that a
 host currently serves those bytes.
 
+`snailmail doctor URL` needs no workspace and inspects a public HTTPS PyPI,
+Debian, or Helm repository. It parses bounded native indexes, follows at most the
+configured artifact limit, and checks referenced availability, size, SHA-256,
+archive validity, and package identity. Use `--project` for PyPI artifacts and
+`--suite` for a Debian base URL. Debian Release signatures and Helm provenance
+are explicitly reported as unverified in this initial slice. Runs inspect at
+most four artifacts, cap each expanded archive at 64 MiB, and stop after two
+minutes.
+
 Signed Debian repositories use an encrypted private key outside the workspace
 and commit only canonical public forms. Set a passphrase through the environment
 (never an argument), generate the key, and reference it during setup:

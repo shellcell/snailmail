@@ -1196,9 +1196,11 @@ ordering per package/track/distro while deferring physical blob GC. Read-only
 bindings against the configured blob authority; upstream freshness remains
 deferred until origin state exists. Read-only `status` now exposes deterministic
 human and JSON summaries of committed placements, publication bindings, and
-deployment receipts without claiming live provider state. Additional backends,
-remaining operational commands, and format expansion remain subsequent Phase 3
-slices.
+deployment receipts without claiming live provider state. Workspace-independent
+`doctor` now performs bounded public-HTTPS inspection of
+PyPI, Debian, and Helm indexes plus selected referenced artifacts, with explicit
+unverified-signature findings. Additional backends, remaining operational
+commands, and format expansion remain subsequent Phase 3 slices.
 
 **Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
 drift detection, then irreversible `target` operations for AUR, Homebrew,

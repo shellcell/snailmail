@@ -548,6 +548,13 @@ completeness for those placements, and managed deployment receipts. It does not
 derive `current`, `missing`, or `lagging` without observing hosts and modeled
 upstream/remotes.
 
+`doctor` is workspace-independent live observation through a bounded public
+HTTPS fetcher. The initial PyPI, Debian, and Helm inspectors validate native
+indexes and selected referenced artifacts while distinguishing HTTP 404 from
+transport unavailability. Private addresses, URL credentials, queries, unsafe
+paths, implicit proxies, and unbounded responses are rejected. Signature checks
+that are not implemented are reported as unverified rather than inferred.
+
 Git-authoritative controls protect reviewed automation from stale, accidental,
 or partially applied state; they do not treat a repository administrator as an
 adversary. An operator who can rewrite Git metadata, access signing keys, and

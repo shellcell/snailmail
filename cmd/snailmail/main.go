@@ -17,10 +17,12 @@ import (
 	"syscall"
 	"time"
 
+	httpsource "github.com/shellcell/snailmail/adapters/source/http"
 	"github.com/shellcell/snailmail/engine"
 	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/internal/wire"
 	"github.com/shellcell/snailmail/signer"
+	"github.com/shellcell/snailmail/source"
 )
 
 const defaultGeneratedAt = "1970-01-01T00:00:00Z"
@@ -56,6 +58,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runCheck(ctx, args[1:], stdout, stderr)
 	case "status":
 		return runStatus(ctx, args[1:], stdout, stderr)
+	case "doctor":
+		return runDoctor(ctx, args[1:], stdout, stderr)
 	case "blob-store":
 		return runBlobStore(ctx, args[1:], stdout, stderr)
 	case "plan":
@@ -488,6 +492,58 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) err
 			repository.Name, repository.VisiblePackageVersions, repository.RetainedPackageVersions, repository.VisibleBindingState, repository.Deployment.State)
 	}
 	fmt.Fprintln(stdout, "✉️   live hosts, upstream releases, foreign remotes, gate completion, and apply failures were not observed")
+	return nil
+}
+
+func runDoctor(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return runDoctorWithFetcher(ctx, args, stdout, stderr, httpsource.New())
+}
+
+func runDoctorWithFetcher(ctx context.Context, args []string, stdout, stderr io.Writer, fetcher source.Fetcher) error {
+	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	format := flags.String("format", "auto", "repository format: auto, pypi, deb, or helm")
+	project := flags.String("project", "", "PyPI project to inspect")
+	suite := flags.String("suite", "", "Debian suite")
+	component := flags.String("component", "", "Debian component")
+	architecture := flags.String("architecture", "", "Debian architecture")
+	maximum := flags.Int("max-artifacts", 4, "maximum referenced artifacts to inspect (1-4)")
+	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: snailmail doctor [options] URL")
+	}
+	result, err := engine.Doctor(ctx, engine.DoctorRequest{
+		URL: flags.Arg(0), Format: *format, Project: *project, Suite: *suite, Component: *component,
+		Architecture: *architecture, MaxArtifacts: *maximum, Fetcher: fetcher,
+	})
+	if err != nil {
+		return err
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(result); err != nil {
+			return err
+		}
+	} else {
+		printBrand(stdout)
+		fmt.Fprintf(stdout, "📦  inspected %s repository index with %d entries and %d referenced artifacts\n", result.Format, result.Entries, result.ArtifactsChecked)
+		for _, finding := range result.Findings {
+			fmt.Fprintf(stdout, "✉️   [%s] %s %s: %s\n", finding.Severity, finding.Code, finding.Subject, finding.Message)
+		}
+	}
+	errorsFound := 0
+	for _, finding := range result.Findings {
+		if finding.Severity == "error" {
+			errorsFound++
+		}
+	}
+	if errorsFound != 0 {
+		return fmt.Errorf("doctor found %d repository %s", errorsFound, plural(errorsFound, "error", "errors"))
+	}
 	return nil
 }
 
@@ -980,6 +1036,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail prune REPOSITORY --keep N")
 	fmt.Fprintln(output, "  snailmail check [--workspace DIR]")
 	fmt.Fprintln(output, "  snailmail status [--workspace DIR] [--json]")
+	fmt.Fprintln(output, "  snailmail doctor [--format auto|pypi|deb|helm] [--json] URL")
 	fmt.Fprintln(output, "  snailmail blob-store s3 --bucket BUCKET [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
 	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")

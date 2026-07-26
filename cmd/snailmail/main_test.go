@@ -11,6 +11,7 @@ import (
 
 	"github.com/shellcell/snailmail/engine"
 	"github.com/shellcell/snailmail/internal/testutil"
+	"github.com/shellcell/snailmail/source"
 )
 
 func TestBuildAndVerifyOutputUsesProductIcons(t *testing.T) {
@@ -169,6 +170,65 @@ func TestStatusRejectsUnexpectedArguments(t *testing.T) {
 	if err := run(context.Background(), []string{"status", "repository"}, &stdout, &stderr); err == nil {
 		t.Fatal("status accepted a repository selector")
 	}
+}
+
+func TestDoctorEmitsUnbrandedJSONWithoutWorkspace(t *testing.T) {
+	fetcher := cliDoctorFetcher{response: source.Response{
+		URL: "https://packages.example/simple/", StatusCode: 200, ContentType: "text/html",
+		Body: []byte(`<html><body><a href="demo/">demo</a></body></html>`),
+	}}
+	var stdout, stderr bytes.Buffer
+	if err := runDoctorWithFetcher(context.Background(), []string{"--format", "pypi", "--json", "https://packages.example"}, &stdout, &stderr, fetcher); err != nil {
+		t.Fatal(err)
+	}
+	var result engine.DoctorResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode doctor JSON: %v: %s", err, stdout.String())
+	}
+	if result.Format != "pypi" || result.Entries != 1 || len(result.Findings) != 1 || result.Findings[0].Code != "scope.project-required" || strings.Contains(stdout.String(), "🐌") {
+		t.Fatalf("unexpected doctor result %#v", result)
+	}
+}
+
+func TestDoctorRequiresOneURL(t *testing.T) {
+	for _, arguments := range [][]string{{"doctor"}, {"doctor", "https://one.example", "https://two.example"}} {
+		var stdout, stderr bytes.Buffer
+		if err := run(context.Background(), arguments, &stdout, &stderr); err == nil {
+			t.Fatalf("doctor arguments accepted: %v", arguments)
+		}
+	}
+}
+
+func TestDoctorPrintsJSONBeforeUnhealthyExit(t *testing.T) {
+	fetcher := cliDoctorFetcher{response: source.Response{URL: "https://packages.example/index.yaml", StatusCode: 404}}
+	var stdout, stderr bytes.Buffer
+	err := runDoctorWithFetcher(context.Background(), []string{"--format", "helm", "--json", "https://packages.example"}, &stdout, &stderr, fetcher)
+	if err == nil {
+		t.Fatal("doctor accepted a missing index")
+	}
+	var result engine.DoctorResult
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &result); jsonErr != nil || len(result.Findings) != 1 || result.Findings[0].Code != "index.missing" {
+		t.Fatalf("doctor JSON=%q decode=%v result=%#v", stdout.String(), jsonErr, result)
+	}
+}
+
+func TestDoctorPrintsMalformedIndexAsJSONFinding(t *testing.T) {
+	fetcher := cliDoctorFetcher{response: source.Response{URL: "https://packages.example/index.yaml", StatusCode: 200, Body: []byte("not: [valid")}}
+	var stdout, stderr bytes.Buffer
+	err := runDoctorWithFetcher(context.Background(), []string{"--format", "helm", "--json", "https://packages.example"}, &stdout, &stderr, fetcher)
+	if err == nil {
+		t.Fatal("doctor accepted a malformed index")
+	}
+	var result engine.DoctorResult
+	if jsonErr := json.Unmarshal(stdout.Bytes(), &result); jsonErr != nil || len(result.Findings) != 1 || result.Findings[0].Code != "index.invalid" {
+		t.Fatalf("doctor malformed JSON=%q decode=%v result=%#v", stdout.String(), jsonErr, result)
+	}
+}
+
+type cliDoctorFetcher struct{ response source.Response }
+
+func (fetcher cliDoctorFetcher) Fetch(context.Context, string, int64) (source.Response, error) {
+	return fetcher.response, nil
 }
 
 func TestDebBuildAndVerifyOutputUsesProductIcons(t *testing.T) {

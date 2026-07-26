@@ -46,18 +46,25 @@ func IsChartFilename(name string) bool {
 // Inspect derives chart metadata from the exact archive bytes and validates
 // the complete tar stream before returning facts.
 func Inspect(filename string, reader io.ReaderAt, size int64) (domain.PackageFacts, error) {
+	return InspectWithExpandedLimit(filename, reader, size, maxExpandedSize)
+}
+
+func InspectWithExpandedLimit(filename string, reader io.ReaderAt, size, maximumExpanded int64) (domain.PackageFacts, error) {
 	if !IsChartFilename(filename) {
 		return domain.PackageFacts{}, fmt.Errorf("unsupported Helm chart %q", filename)
 	}
 	if size < 1 || size > MaxArtifactSize {
 		return domain.PackageFacts{}, fmt.Errorf("Helm chart size %d is outside the supported range", size)
 	}
+	if maximumExpanded < maxChartYAML || maximumExpanded > maxExpandedSize {
+		return domain.PackageFacts{}, errors.New("Helm expanded-size limit is outside the supported range")
+	}
 	compressed, err := gzip.NewReader(io.NewSectionReader(reader, 0, size))
 	if err != nil {
 		return domain.PackageFacts{}, fmt.Errorf("inspect %q: open gzip: %w", filename, err)
 	}
 	defer compressed.Close()
-	limited := &io.LimitedReader{R: compressed, N: maxExpandedSize + 1}
+	limited := &io.LimitedReader{R: compressed, N: maximumExpanded + 1}
 	archive := tar.NewReader(limited)
 	root := ""
 	var chartYAML []byte
@@ -91,7 +98,7 @@ func Inspect(filename string, reader io.ReaderAt, size int64) (domain.PackageFac
 		switch header.Typeflag {
 		case tar.TypeDir:
 		case tar.TypeReg, tar.TypeRegA:
-			if header.Size < 0 || header.Size > maxExpandedSize-expandedSize {
+			if header.Size < 0 || header.Size > maximumExpanded-expandedSize {
 				return domain.PackageFacts{}, fmt.Errorf("inspect %q: expanded chart exceeds limit", filename)
 			}
 			expandedSize += header.Size
