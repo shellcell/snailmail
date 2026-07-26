@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -53,6 +54,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runPrune(args[1:], stdout, stderr)
 	case "check":
 		return runCheck(ctx, args[1:], stdout, stderr)
+	case "status":
+		return runStatus(ctx, args[1:], stdout, stderr)
 	case "blob-store":
 		return runBlobStore(ctx, args[1:], stdout, stderr)
 	case "plan":
@@ -455,6 +458,36 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if len(result.Findings) != 0 {
 		return fmt.Errorf("check found %d unavailable or changed %s", len(result.Findings), plural(len(result.Findings), "artifact", "artifacts"))
 	}
+	return nil
+}
+
+func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("status", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: snailmail status [--workspace DIR] [--json]")
+	}
+	result, err := engine.StatusWorkspace(ctx, engine.StatusWorkspaceRequest{Root: *workspace})
+	if err != nil {
+		return err
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(result)
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  workspace %s at %s\n", result.Workspace, result.GitRevision)
+	for _, repository := range result.Repositories {
+		fmt.Fprintf(stdout, "✉️   %s: %d visible, %d retained; visible bindings %s; deployment %s\n",
+			repository.Name, repository.VisiblePackageVersions, repository.RetainedPackageVersions, repository.VisibleBindingState, repository.Deployment.State)
+	}
+	fmt.Fprintln(stdout, "✉️   live hosts, upstream releases, foreign remotes, gate completion, and apply failures were not observed")
 	return nil
 }
 
@@ -946,6 +979,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail prune REPOSITORY --keep N")
 	fmt.Fprintln(output, "  snailmail check [--workspace DIR]")
+	fmt.Fprintln(output, "  snailmail status [--workspace DIR] [--json]")
 	fmt.Fprintln(output, "  snailmail blob-store s3 --bucket BUCKET [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
 	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")

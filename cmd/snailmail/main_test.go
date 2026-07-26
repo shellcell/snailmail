@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -112,6 +113,61 @@ func TestCheckReportsReadOnlyAuditScope(t *testing.T) {
 	if !strings.Contains(stdout.String(), "checked 1 repository, 0 package versions, and 0 locked artifacts") ||
 		!strings.Contains(stdout.String(), "upstream release checks unavailable") {
 		t.Fatalf("unexpected check output %q", stdout.String())
+	}
+}
+
+func TestStatusEmitsMachineReadableCommittedEvidence(t *testing.T) {
+	root := t.TempDir()
+	if output, err := exec.Command("git", "init", "-b", "main", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: root, Name: "cli-status"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.SetupRepository(engine.SetupRepositoryRequest{Root: root, Name: "python", Format: "pypi", HostType: "local", Output: "public/python", Visibility: "public"}); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", root, "add", "-A").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v: %s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", root, "-c", "user.name=Snailmail", "-c", "user.email=snailmail@example.invalid", "commit", "-m", "initialize").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v: %s", err, output)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"status", "--workspace", root, "--json"}, &stdout, &stderr); err != nil {
+		t.Fatalf("status failed: %v\n%s", err, stderr.String())
+	}
+	var document struct {
+		Workspace        string `json:"workspace"`
+		ObservationScope string `json:"observation_scope"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
+		t.Fatalf("decode status JSON: %v: %s", err, stdout.String())
+	}
+	if document.Workspace != "cli-status" || document.ObservationScope != "committed workspace evidence only" || strings.Contains(stdout.String(), "🐌") {
+		t.Fatalf("unexpected status JSON %q", stdout.String())
+	}
+	firstJSON := stdout.String()
+	stdout.Reset()
+	if err := run(context.Background(), []string{"status", "--workspace", root, "--json"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != firstJSON || !strings.Contains(firstJSON, `"visible_packages": []`) {
+		t.Fatalf("status JSON is not deterministic or canonical: %q", stdout.String())
+	}
+	stdout.Reset()
+	if err := run(context.Background(), []string{"status", "--workspace", root}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "live hosts, upstream releases") {
+		t.Fatalf("status omitted observation scope: %q", stdout.String())
+	}
+}
+
+func TestStatusRejectsUnexpectedArguments(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"status", "repository"}, &stdout, &stderr); err == nil {
+		t.Fatal("status accepted a repository selector")
 	}
 }
 

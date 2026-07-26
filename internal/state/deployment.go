@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -138,24 +139,59 @@ func AuthoritativeDeploymentTrustSince(root, repository string, record Deploymen
 	if err != nil {
 		return time.Time{}, errors.New("invalid deployment trust timestamp")
 	}
+	committedAt, err := managedDeploymentCommitTimeContext(context.Background(), root, repository, record)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if committedAt.After(trustSince) {
+		trustSince = committedAt
+	}
+	return trustSince.UTC(), nil
+}
+
+func ValidateDeploymentProvenance(root, repository string, record DeploymentRecord) error {
+	return ValidateDeploymentProvenanceContext(context.Background(), root, repository, record)
+}
+
+func ValidateDeploymentProvenanceContext(ctx context.Context, root, repository string, record DeploymentRecord) error {
+	_, err := managedDeploymentCommitTimeContext(ctx, root, repository, record)
+	return err
+}
+
+func managedDeploymentCommitTimeContext(ctx context.Context, root, repository string, record DeploymentRecord) (time.Time, error) {
 	relative := filepath.ToSlash(filepath.Join("deployments", repository+".json"))
 	treePath, err := workspaceGitPath(root, relative)
 	if err != nil {
 		return time.Time{}, err
 	}
-	commit, err := gitOutput(root, "log", "-1", "--format=%H", "--", ":(top,literal)"+treePath)
+	commit, err := gitOutputContext(ctx, root, "log", "-1", "--format=%H", "--", ":(top,literal)"+treePath)
+	if ctx.Err() != nil {
+		return time.Time{}, ctx.Err()
+	}
 	if err != nil || commit == "" {
-		return time.Time{}, errors.New("deployment trust receipt is not committed")
+		return time.Time{}, errors.New("deployment receipt is not committed")
 	}
-	managed, err := isPlanDeploymentCommit(root, commit, record.PlanID)
-	if err != nil || !managed {
-		return time.Time{}, errors.New("deployment trust receipt was not produced by managed apply")
+	managed, err := isPlanDeploymentCommitContext(ctx, root, commit, record.PlanID)
+	if err != nil {
+		return time.Time{}, err
 	}
-	changedPaths, err := gitChangedPaths(root, commit)
-	if err != nil || len(changedPaths) == 0 {
+	if !managed {
+		return time.Time{}, errors.New("deployment receipt was not produced by managed apply")
+	}
+	changedPaths, err := gitChangedPathsContext(ctx, root, commit)
+	if err != nil {
+		if ctx.Err() != nil {
+			return time.Time{}, ctx.Err()
+		}
+		return time.Time{}, errors.New("managed deployment commit has invalid paths")
+	}
+	if len(changedPaths) == 0 {
 		return time.Time{}, errors.New("managed deployment commit has invalid paths")
 	}
 	for _, changed := range changedPaths {
+		if err := ctx.Err(); err != nil {
+			return time.Time{}, err
+		}
 		relativeChanged, inside, pathErr := workspaceRelativeGitPath(root, changed)
 		if pathErr != nil {
 			return time.Time{}, pathErr
@@ -164,8 +200,11 @@ func AuthoritativeDeploymentTrustSince(root, repository string, record Deploymen
 			return time.Time{}, errors.New("managed deployment commit changed non-deployment state")
 		}
 	}
-	committedContent, err := execGitShow(root, commit, treePath)
+	committedContent, err := execGitShowContext(ctx, root, commit, treePath)
 	if err != nil {
+		if ctx.Err() != nil {
+			return time.Time{}, ctx.Err()
+		}
 		return time.Time{}, err
 	}
 	canonical, err := json.MarshalIndent(record, "", "  ")
@@ -174,20 +213,20 @@ func AuthoritativeDeploymentTrustSince(root, repository string, record Deploymen
 	}
 	canonical = append(canonical, '\n')
 	if !bytes.Equal(committedContent, canonical) {
-		return time.Time{}, errors.New("deployment trust receipt differs from its managed commit")
+		return time.Time{}, errors.New("deployment receipt differs from its managed commit")
 	}
-	committedAtValue, err := gitOutput(root, "show", "-s", "--format=%cI", commit)
+	committedAtValue, err := gitOutputContext(ctx, root, "show", "-s", "--format=%cI", commit)
 	if err != nil {
+		if ctx.Err() != nil {
+			return time.Time{}, ctx.Err()
+		}
 		return time.Time{}, err
 	}
 	committedAt, err := time.Parse(time.RFC3339, committedAtValue)
 	if err != nil {
 		return time.Time{}, errors.New("managed deployment commit has invalid timestamp")
 	}
-	if committedAt.After(trustSince) {
-		trustSince = committedAt
-	}
-	return trustSince.UTC(), nil
+	return committedAt.UTC(), nil
 }
 
 func validDeploymentSigning(record DeploymentRecord) bool {

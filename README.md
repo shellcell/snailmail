@@ -86,6 +86,13 @@ package facts, and revalidates historical publication bindings. Upstream release
 and adopted-origin checks remain unavailable until artifact origins are modeled;
 the command reports that limitation explicitly rather than inferring provenance.
 
+`snailmail status` reports committed workspace evidence without contacting
+hosts or providers. Human output summarizes visible and retained versions,
+visible publication-binding completeness, and whether a managed deployment
+receipt is recorded; `--json` emits the same deterministic schema for
+automation. A receipt is evidence of a prior successful apply, not proof that a
+host currently serves those bytes.
+
 Signed Debian repositories use an encrypted private key outside the workspace
 and commit only canonical public forms. Set a passphrase through the environment
 (never an argument), generate the key, and reference it during setup:

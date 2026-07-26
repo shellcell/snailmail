@@ -678,7 +678,7 @@ The verbs, and which part of the model each one touches:
 | `demote` / `yank` | Placement (remove), version stays recorded | ✅ |
 | `prune <repo> --keep 5` | Placements, then blob GC | ✅ until GC |
 | `check` | Sources — newer Release? adopted bytes still match their pin? | read-only |
-| `status` | Repositories + Remotes | read-only |
+| `status` | committed repository evidence; live remotes deferred | read-only |
 | `plan` / `apply` | writes the plan / executes exactly it | per-change |
 | `verify` | container install from the staged tree | read-only |
 | `render` | static status + install page | — |
@@ -1194,8 +1194,11 @@ Placement-only `prune --keep N` now uses native PEP 440, Debian, and SemVer
 ordering per package/track/distro while deferring physical blob GC. Read-only
 `check` now audits all retained artifact bytes and immutable publication
 bindings against the configured blob authority; upstream freshness remains
-deferred until origin state exists. Additional backends, remaining operational
-commands, and format expansion remain subsequent Phase 3 slices.
+deferred until origin state exists. Read-only `status` now exposes deterministic
+human and JSON summaries of committed placements, publication bindings, and
+deployment receipts without claiming live provider state. Additional backends,
+remaining operational commands, and format expansion remain subsequent Phase 3
+slices.
 
 **Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
 drift detection, then irreversible `target` operations for AUR, Homebrew,

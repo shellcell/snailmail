@@ -542,6 +542,12 @@ facts and validates full publication history without populating the local CAS
 from a remote authority. Source freshness is not claimed when origin state is
 absent.
 
+`status` similarly distinguishes committed evidence from live observation. Its
+initial CLI view reports desired visible placements, immutable binding
+completeness for those placements, and managed deployment receipts. It does not
+derive `current`, `missing`, or `lagging` without observing hosts and modeled
+upstream/remotes.
+
 Git-authoritative controls protect reviewed automation from stale, accidental,
 or partially applied state; they do not treat a repository administrator as an
 adversary. An operator who can rewrite Git metadata, access signing keys, and

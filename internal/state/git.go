@@ -60,7 +60,11 @@ func RequireCompleteGitHistoryContext(ctx context.Context, root string) error {
 }
 
 func RequireCleanGit(root string) (string, error) {
-	return requireCleanGit(root, nil)
+	return requireCleanGitContext(context.Background(), root, nil)
+}
+
+func RequireCleanGitContext(ctx context.Context, root string) (string, error) {
+	return requireCleanGitContext(ctx, root, nil)
 }
 
 func RequireCleanGitAllowingUntracked(root string, relativePaths []string) (string, error) {
@@ -75,18 +79,28 @@ func RequireCleanGitAllowingUntracked(root string, relativePaths []string) (stri
 }
 
 func requireCleanGit(root string, allowedUntracked map[string]bool) (string, error) {
-	if err := requireCompleteGitHistory(root); err != nil {
+	return requireCleanGitContext(context.Background(), root, allowedUntracked)
+}
+
+func requireCleanGitContext(ctx context.Context, root string, allowedUntracked map[string]bool) (string, error) {
+	if err := requireCompleteGitHistoryContext(ctx, root); err != nil {
 		return "", err
 	}
-	if _, err := symbolicHead(root); err != nil {
+	if _, err := symbolicHeadContext(ctx, root); err != nil {
 		return "", err
 	}
-	revision, err := gitOutput(root, "rev-parse", "HEAD")
+	revision, err := gitOutputContext(ctx, root, "rev-parse", "HEAD")
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		return "", errors.New("workspace must be a Git repository with at least one commit")
 	}
-	status, err := gitStatusOutput(root)
+	status, err := gitStatusOutputContext(ctx, root)
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
 		return "", err
 	}
 	authoritative, err := authoritativePaths(root)
@@ -96,10 +110,13 @@ func requireCleanGit(root string, allowedUntracked map[string]bool) (string, err
 	if err := validateGitStatusAllowingUntracked(status, allowedUntracked, authoritative); err != nil {
 		return "", err
 	}
-	if err := requireAuthoritativeFilesCommitted(root, revision, authoritative, allowedUntracked); err != nil {
+	if err := requireAuthoritativeFilesCommittedContext(ctx, root, revision, authoritative, allowedUntracked); err != nil {
 		return "", err
 	}
-	confirmedRevision, err := gitOutput(root, "rev-parse", "HEAD")
+	confirmedRevision, err := gitOutputContext(ctx, root, "rev-parse", "HEAD")
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
 	if err != nil || confirmedRevision != revision {
 		return "", errors.New("Git revision changed while validating workspace")
 	}
@@ -215,11 +232,21 @@ func PlanLedgerRevision(root, planID string) (string, error) {
 }
 
 func isPlanDeploymentCommit(root, revision, planID string) (bool, error) {
-	message, err := gitOutput(root, "log", "-1", "--format=%B", revision)
+	return isPlanDeploymentCommitContext(context.Background(), root, revision, planID)
+}
+
+func isPlanDeploymentCommitContext(ctx context.Context, root, revision, planID string) (bool, error) {
+	message, err := gitOutputContext(ctx, root, "log", "-1", "--format=%B", revision)
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 	if err != nil || !hasPlanTrailer(message, planID) || !strings.HasPrefix(message, "record snailmail deployments\n") {
 		return false, nil
 	}
-	paths, err := gitChangedPaths(root, revision)
+	paths, err := gitChangedPathsContext(ctx, root, revision)
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 	if err != nil || len(paths) == 0 {
 		return false, errors.New("invalid deployment receipt commit")
 	}
@@ -420,12 +447,16 @@ func ValidateDeploymentCommitPaths(root, revision string, repositories []string)
 }
 
 func AssertGitRevision(root, expected string) error {
-	current, err := RequireCleanGit(root)
+	return AssertGitRevisionContext(context.Background(), root, expected)
+}
+
+func AssertGitRevisionContext(ctx context.Context, root, expected string) error {
+	current, err := RequireCleanGitContext(ctx, root)
 	if err != nil {
 		return err
 	}
 	if current != expected {
-		return errors.New("Git revision changed during apply")
+		return errors.New("Git revision changed during operation")
 	}
 	return nil
 }
@@ -511,12 +542,19 @@ func requireCompleteGitHistoryContext(ctx context.Context, root string) error {
 }
 
 func requireAuthoritativeFilesCommitted(root, revision string, authoritative, allowedChanges map[string]bool) error {
+	return requireAuthoritativeFilesCommittedContext(context.Background(), root, revision, authoritative, allowedChanges)
+}
+
+func requireAuthoritativeFilesCommittedContext(ctx context.Context, root, revision string, authoritative, allowedChanges map[string]bool) error {
 	names := make([]string, 0, len(authoritative))
 	for name := range authoritative {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if allowedChanges[name] {
 			continue
 		}
@@ -524,8 +562,11 @@ func requireAuthoritativeFilesCommitted(root, revision string, authoritative, al
 		if err != nil {
 			return err
 		}
-		expected, err := gitOutput(root, "rev-parse", revision+":"+treePath)
+		expected, err := gitOutputContext(ctx, root, "rev-parse", revision+":"+treePath)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("authoritative state %q is not committed to Git", name)
 		}
 		workspacePath, err := WorkspacePath(root, name)
@@ -540,8 +581,11 @@ func requireAuthoritativeFilesCommitted(root, revision string, authoritative, al
 		if err != nil {
 			return err
 		}
-		actual, err := gitHashObject(root, content)
+		actual, err := gitHashObjectContext(ctx, root, content)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return err
 		}
 		if actual != expected {
@@ -621,7 +665,14 @@ func hasPlanTrailer(message, planID string) bool {
 }
 
 func symbolicHead(root string) (string, error) {
-	name, err := gitOutput(root, "symbolic-ref", "--quiet", "HEAD")
+	return symbolicHeadContext(context.Background(), root)
+}
+
+func symbolicHeadContext(ctx context.Context, root string) (string, error) {
+	name, err := gitOutputContext(ctx, root, "symbolic-ref", "--quiet", "HEAD")
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
 	if err != nil || !strings.HasPrefix(name, "refs/") {
 		return "", errors.New("workspace requires Git HEAD to be attached to a branch")
 	}
@@ -673,7 +724,11 @@ func workspaceRelativeGitPath(root, name string) (string, bool, error) {
 }
 
 func gitChangedPaths(root, revision string) ([]string, error) {
-	return gitPathOutput(root, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", revision)
+	return gitChangedPathsContext(context.Background(), root, revision)
+}
+
+func gitChangedPathsContext(ctx context.Context, root, revision string) ([]string, error) {
+	return gitPathOutputContext(ctx, root, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", revision)
 }
 
 func validatePublicationTree(root, baseRevision, tree string, expectedPaths map[string]bool) error {
@@ -720,7 +775,11 @@ func validatePublicationTree(root, baseRevision, tree string, expectedPaths map[
 }
 
 func gitPathOutput(root string, arguments ...string) ([]string, error) {
-	output, err := gitCommand(root, arguments...).Output()
+	return gitPathOutputContext(context.Background(), root, arguments...)
+}
+
+func gitPathOutputContext(ctx context.Context, root string, arguments ...string) ([]string, error) {
+	output, err := gitCommandContext(ctx, root, arguments...).Output()
 	if err != nil {
 		return nil, err
 	}
@@ -809,7 +868,11 @@ func restoreGitIndex(backup, indexPath string, cause error) error {
 }
 
 func gitHashObject(root string, content []byte) (string, error) {
-	command := gitCommand(root, "hash-object", "--stdin")
+	return gitHashObjectContext(context.Background(), root, content)
+}
+
+func gitHashObjectContext(ctx context.Context, root string, content []byte) (string, error) {
+	command := gitCommandContext(ctx, root, "hash-object", "--stdin")
 	command.Stdin = bytes.NewReader(content)
 	output, err := command.Output()
 	if err != nil {
@@ -845,7 +908,11 @@ func gitOutputContext(ctx context.Context, root string, arguments ...string) (st
 }
 
 func gitStatusOutput(root string) (string, error) {
-	output, err := gitCommand(root, "status", "--porcelain", "--untracked-files=all").Output()
+	return gitStatusOutputContext(context.Background(), root)
+}
+
+func gitStatusOutputContext(ctx context.Context, root string) (string, error) {
+	output, err := gitCommandContext(ctx, root, "status", "--porcelain", "--untracked-files=all").Output()
 	if err != nil {
 		return "", err
 	}

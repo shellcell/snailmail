@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,18 @@ func LoadLedgerHistory(root, repository string) ([]PublicationRecord, error) {
 }
 
 func LoadLedgerHistoryContext(ctx context.Context, root, repository string) ([]PublicationRecord, error) {
+	return loadLedgerHistoryContext(ctx, root, repository, "--all")
+}
+
+func LoadLedgerHistoryAtRevisionContext(ctx context.Context, root, repository, revision string) ([]PublicationRecord, error) {
+	decoded, err := hex.DecodeString(revision)
+	if err != nil || (len(decoded) != 20 && len(decoded) != 32) || revision != strings.ToLower(revision) {
+		return nil, errors.New("invalid publication history revision")
+	}
+	return loadLedgerHistoryContext(ctx, root, repository, revision)
+}
+
+func loadLedgerHistoryContext(ctx context.Context, root, repository, revision string) ([]PublicationRecord, error) {
 	records, err := LoadLedger(root, repository)
 	if err != nil {
 		return nil, err
@@ -57,7 +70,7 @@ func LoadLedgerHistoryContext(ctx context.Context, root, repository string) ([]P
 	if err != nil {
 		return nil, err
 	}
-	output, err := gitOutputContext(ctx, root, "log", "--all", "--format=%H", "--diff-filter=AM", "--", ":(top,literal)"+treePath)
+	output, err := gitOutputContext(ctx, root, "log", revision, "--format=%H", "--diff-filter=AM", "--", ":(top,literal)"+treePath)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
