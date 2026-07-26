@@ -555,6 +555,16 @@ transport unavailability. Private addresses, URL credentials, queries, unsafe
 paths, implicit proxies, and unbounded responses are rejected. Signature checks
 that are not implemented are reported as unverified rather than inferred.
 
+`adopt` is a desired-state acquisition operation, not host takeover. It requires
+an operator-supplied SHA-256 and explicit confirmation that the full origin URL
+is public, non-secret metadata before fetching one artifact. It validates native
+package facts and records the requested URL beside the immutable blob binding.
+Plans enumerate visible adopted acquisitions so reviewers can see which selected
+third-party bytes repository signing would endorse. Adoption changes only local
+CAS and lock state; publication still requires a separate reviewed plan/apply.
+`check --origins` revalidates at most four recorded pins within a two-minute run;
+an explicit sorted offset makes every later origin reachable in bounded batches.
+
 Git-authoritative controls protect reviewed automation from stale, accidental,
 or partially applied state; they do not treat a repository administrator as an
 adversary. An operator who can rewrite Git metadata, access signing keys, and

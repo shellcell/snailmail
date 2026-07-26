@@ -12,6 +12,7 @@ import (
 
 	"github.com/shellcell/snailmail/blob"
 	"github.com/shellcell/snailmail/internal/state"
+	"github.com/shellcell/snailmail/source"
 )
 
 func TestCheckWorkspaceAuditsPlacedAndUnplacedArtifacts(t *testing.T) {
@@ -132,8 +133,9 @@ func TestCheckWorkspaceReadsRemoteAuthorityWithoutFillingCAS(t *testing.T) {
 	if err := os.Remove(localName); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := CheckWorkspace(context.Background(), CheckWorkspaceRequest{Root: root, Blobs: staticBlobResolver{}}); err == nil {
-		t.Fatal("remote resolver returned a nil store")
+	unavailable, err := CheckWorkspace(context.Background(), CheckWorkspaceRequest{Root: root, Blobs: staticBlobResolver{}})
+	if err != nil || len(unavailable.Findings) < 1 || unavailable.Findings[0].State != "unknown" {
+		t.Fatalf("remote resolver failure=%#v err=%v", unavailable, err)
 	}
 	checked, err := CheckWorkspace(context.Background(), CheckWorkspaceRequest{Root: root, Blobs: staticBlobResolver{store: store}})
 	if err != nil {
@@ -184,9 +186,55 @@ func TestCheckWorkspaceRejectsShallowHistory(t *testing.T) {
 	}
 }
 
+func TestOriginAuditOffsetReachesLaterOrigins(t *testing.T) {
+	fetcher := &checkSourceFetcher{}
+	result := CheckWorkspaceResult{}
+	audit := originAuditState{enabled: true, fetcher: fetcher, maximum: 1, offset: 1}
+	for index := 0; index < 3; index++ {
+		locked := state.LockedBlob{SHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", Origin: &state.ArtifactOrigin{Kind: "https", URL: fmt.Sprintf("https://downloads.example/%d.whl", index)}}
+		if err := auditLockedOrigin(context.Background(), &audit, locked, fmt.Sprintf("artifact/%d", index), &result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if result.OriginsChecked != 1 || result.OriginsSkipped != 2 || fetcher.fetches != 1 || len(result.Findings) != 0 {
+		t.Fatalf("paginated origin audit %#v fetches=%d", result, fetcher.fetches)
+	}
+	result = CheckWorkspaceResult{}
+	audit = originAuditState{enabled: true, fetcher: fetcher, maximum: 1, offset: 2}
+	for index := 0; index < 3; index++ {
+		locked := state.LockedBlob{SHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", Origin: &state.ArtifactOrigin{Kind: "https", URL: fmt.Sprintf("https://downloads.example/%d.whl", index)}}
+		if err := auditLockedOrigin(context.Background(), &audit, locked, fmt.Sprintf("artifact/%d", index), &result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if result.OriginsChecked != 1 || result.OriginsSkipped != 2 {
+		t.Fatalf("later origin batch %#v", result)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	audit = originAuditState{enabled: true, fetcher: cancelingSourceFetcher{cancel: cancel}, maximum: 1}
+	locked := state.LockedBlob{SHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", Origin: &state.ArtifactOrigin{Kind: "https", URL: "https://downloads.example/cancel.whl"}}
+	if err := auditLockedOrigin(ctx, &audit, locked, "artifact/cancel", &CheckWorkspaceResult{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("post-fetch cancellation = %v", err)
+	}
+}
+
 type checkBlobStore struct {
 	err     error
 	fetches int
+}
+
+type checkSourceFetcher struct{ fetches int }
+
+func (fetcher *checkSourceFetcher) Fetch(context.Context, string, int64) (source.Response, error) {
+	fetcher.fetches++
+	return source.Response{StatusCode: 200}, nil
+}
+
+type cancelingSourceFetcher struct{ cancel context.CancelFunc }
+
+func (fetcher cancelingSourceFetcher) Fetch(context.Context, string, int64) (source.Response, error) {
+	fetcher.cancel()
+	return source.Response{StatusCode: 200}, nil
 }
 
 func (*checkBlobStore) Put(context.Context, blob.Ref, io.Reader) error {

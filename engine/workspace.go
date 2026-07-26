@@ -110,9 +110,19 @@ type PlanWorkspaceRequest struct {
 }
 
 type PlanWorkspaceResult struct {
-	PlanID  string
-	Output  string
-	Changes int
+	PlanID       string
+	Output       string
+	Changes      int
+	Acquisitions []PlannedAcquisition
+}
+
+type PlannedAcquisition struct {
+	Repository string
+	Package    string
+	Version    string
+	Filename   string
+	SHA256     string
+	OriginURL  string
 }
 
 type ApprovePlanRequest struct {
@@ -463,6 +473,7 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		return PlanWorkspaceResult{}, errors.New("verification mode must be structural or client")
 	}
 	changes := 0
+	var plannedAcquisitions []PlannedAcquisition
 	hosts := request.Hosts
 	if hosts == nil {
 		hosts = localHostResolver{}
@@ -544,6 +555,13 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 			return PlanWorkspaceResult{}, err
 		}
 		missingBindings := missingPublicationBindings(lock, repository, ledger)
+		acquisitions := planAcquisitionsForVersions(visiblePackageVersions(lock, repository))
+		for _, acquisition := range acquisitions {
+			plannedAcquisitions = append(plannedAcquisitions, PlannedAcquisition{
+				Repository: name, Package: acquisition.Package, Version: acquisition.Version,
+				Filename: acquisition.Filename, SHA256: acquisition.SHA256, OriginURL: acquisition.OriginURL,
+			})
+		}
 		publicationBindings := []state.PlanPublicationBinding(nil)
 		if len(missingBindings) != 0 {
 			publicationBindings = publicationBindingsForVersions(visiblePackageVersions(lock, repository))
@@ -573,6 +591,7 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 			Signing:                   desired.Signing,
 			PublicationRecords:        publicationRecords,
 			PublicationBindings:       publicationBindings,
+			Acquisitions:              acquisitions,
 			FaithfulPreview:           capabilities.FaithfulPreview, ConditionalCommit: capabilities.ConditionalCommit,
 			ConditionalRestore:       capabilities.ConditionalRestore,
 			PrivateRead:              capabilities.PrivateRead,
@@ -595,7 +614,7 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 	if err := state.WritePlan(output, plan); err != nil {
 		return PlanWorkspaceResult{}, err
 	}
-	return PlanWorkspaceResult{PlanID: plan.PlanID, Output: output, Changes: changes}, nil
+	return PlanWorkspaceResult{PlanID: plan.PlanID, Output: output, Changes: changes, Acquisitions: plannedAcquisitions}, nil
 }
 
 func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWorkspaceResult, error) {
@@ -768,6 +787,9 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
+		if err := state.ValidatePublicationHistory(planned.Name, ledger); err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
 		if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
@@ -775,6 +797,10 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		expectedBindings := []state.PlanPublicationBinding(nil)
 		if planned.PublicationRecords {
 			expectedBindings = publicationBindingsForVersions(visiblePackageVersions(lock, repository))
+		}
+		expectedAcquisitions := planAcquisitionsForVersions(visiblePackageVersions(lock, repository))
+		if !reflect.DeepEqual(planned.Acquisitions, expectedAcquisitions) {
+			return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q has inconsistent adopted acquisitions", planned.Name)
 		}
 		if planned.PublicationRecords != (len(planned.PublicationBindings) != 0) ||
 			!reflect.DeepEqual(planned.PublicationBindings, expectedBindings) ||
@@ -1614,6 +1640,34 @@ func publicationBindingsForVersions(versions []state.PackageVersion) []state.Pla
 	return bindings
 }
 
+func planAcquisitionsForVersions(versions []state.PackageVersion) []state.PlanAcquisition {
+	var acquisitions []state.PlanAcquisition
+	for _, version := range versions {
+		for _, locked := range version.Blobs {
+			if locked.Origin == nil {
+				continue
+			}
+			acquisitions = append(acquisitions, state.PlanAcquisition{
+				Package: version.Package, Version: version.Version, Filename: locked.Filename,
+				SHA256: locked.SHA256, OriginURL: locked.Origin.URL,
+			})
+		}
+	}
+	sort.Slice(acquisitions, func(left, right int) bool {
+		if acquisitions[left].Package != acquisitions[right].Package {
+			return acquisitions[left].Package < acquisitions[right].Package
+		}
+		if acquisitions[left].Version != acquisitions[right].Version {
+			return acquisitions[left].Version < acquisitions[right].Version
+		}
+		if acquisitions[left].Filename != acquisitions[right].Filename {
+			return acquisitions[left].Filename < acquisitions[right].Filename
+		}
+		return acquisitions[left].SHA256 < acquisitions[right].SHA256
+	})
+	return acquisitions
+}
+
 func verifyStaged(ctx context.Context, format, repository string, request ApplyWorkspaceRequest) error {
 	switch format {
 	case "pypi":
@@ -1843,6 +1897,15 @@ func validateApplyPlan(plan state.Plan) error {
 				}
 				previous = digest
 			}
+		}
+		previousAcquisition := ""
+		for _, acquisition := range repository.Acquisitions {
+			identity := acquisition.Package + "\x00" + acquisition.Version + "\x00" + acquisition.Filename + "\x00" + acquisition.SHA256
+			if acquisition.Package == "" || acquisition.Version == "" || acquisition.Filename == "" || !validSHA256(acquisition.SHA256) || identity <= previousAcquisition ||
+				state.ValidateArtifactOrigin(state.ArtifactOrigin{Kind: "https", URL: acquisition.OriginURL}) != nil {
+				return fmt.Errorf("plan repository %q has invalid adopted acquisition", repository.Name)
+			}
+			previousAcquisition = identity
 		}
 		if err := state.ValidateGateConfiguration(repository.Gate, repository.ApprovalKeys, plan.Payload.ForgeRepository); err != nil {
 			return fmt.Errorf("plan repository %q gate: %w", repository.Name, err)

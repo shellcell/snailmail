@@ -60,6 +60,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runStatus(ctx, args[1:], stdout, stderr)
 	case "doctor":
 		return runDoctor(ctx, args[1:], stdout, stderr)
+	case "adopt":
+		return runAdopt(ctx, args[1:], stdout, stderr)
 	case "blob-store":
 		return runBlobStore(ctx, args[1:], stdout, stderr)
 	case "plan":
@@ -442,13 +444,16 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	flags := flag.NewFlagSet("check", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	workspace := flags.String("workspace", ".", "workspace root")
+	origins := flags.Bool("origins", false, "re-fetch recorded adopted origins")
+	maxOrigins := flags.Int("max-origins", 2, "maximum recorded origins to re-fetch (1-4)")
+	originOffset := flags.Int("origin-offset", 0, "skip this many sorted recorded origins")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
-		return errors.New("usage: snailmail check [--workspace DIR]")
+		return errors.New("usage: snailmail check [--workspace DIR] [--origins --max-origins N --origin-offset N]")
 	}
-	result, err := engine.CheckWorkspace(ctx, engine.CheckWorkspaceRequest{Root: *workspace, Blobs: wire.NewBlobResolver()})
+	result, err := engine.CheckWorkspace(ctx, engine.CheckWorkspaceRequest{Root: *workspace, Blobs: wire.NewBlobResolver(), Origins: *origins, Sources: httpsource.New(), MaxOrigins: *maxOrigins, OriginOffset: *originOffset})
 	if err != nil {
 		return err
 	}
@@ -458,7 +463,11 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	for _, finding := range result.Findings {
 		fmt.Fprintf(stdout, "✉️   [%s] %s: %s\n", finding.State, finding.Subject, finding.Message)
 	}
-	fmt.Fprintln(stdout, "✉️   upstream release checks unavailable: no artifact origins are recorded")
+	if *origins {
+		fmt.Fprintf(stdout, "✉️   checked %d recorded origins and skipped %d beyond the limit; artifacts without origins remain unavailable for source comparison\n", result.OriginsChecked, result.OriginsSkipped)
+	} else {
+		fmt.Fprintln(stdout, "✉️   adopted-origin checks disabled; use --origins to re-fetch recorded pins")
+	}
 	if len(result.Findings) != 0 {
 		return fmt.Errorf("check found %d unavailable or changed %s", len(result.Findings), plural(len(result.Findings), "artifact", "artifacts"))
 	}
@@ -547,6 +556,51 @@ func runDoctorWithFetcher(ctx context.Context, args []string, stdout, stderr io.
 	return nil
 }
 
+func runAdopt(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	return runAdoptWithFetcher(ctx, args, stdout, stderr, httpsource.New())
+}
+
+func runAdoptWithFetcher(ctx context.Context, args []string, stdout, stderr io.Writer, fetcher source.Fetcher) error {
+	flags := flag.NewFlagSet("adopt", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	digest := flags.String("sha256", "", "required artifact SHA-256 pin")
+	filename := flags.String("filename", "", "artifact filename override")
+	track := flags.String("track", "", "placement track")
+	distro := flags.String("distro", "", "Debian placement distribution")
+	dryRun := flags.Bool("dry-run", false, "validate without changing CAS or lock")
+	publicOrigin := flags.Bool("public-origin", false, "confirm URL is public, non-secret, and will be committed")
+	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 2 || *digest == "" || !*publicOrigin {
+		return errors.New("usage: snailmail adopt --sha256 HEX --public-origin [options] REPOSITORY URL")
+	}
+	result, err := engine.AdoptArtifact(ctx, engine.AdoptArtifactRequest{
+		Root: *workspace, Repository: flags.Arg(0), URL: flags.Arg(1), SHA256: *digest,
+		Filename: *filename, Track: *track, Distro: *distro, DryRun: *dryRun, PublicOrigin: *publicOrigin, Fetcher: fetcher,
+	})
+	if err != nil {
+		return err
+	}
+	if *jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(result)
+	}
+	printBrand(stdout)
+	action := "already recorded"
+	if result.Changed && result.DryRun {
+		action = "would record"
+	} else if result.Changed {
+		action = "recorded"
+	}
+	fmt.Fprintf(stdout, "📦  %s %s@%s from pinned selected bytes\n", action, result.Package, result.Version)
+	fmt.Fprintf(stdout, "✉️   sha256:%s %s\n", result.SHA256, result.OriginURL)
+	return nil
+}
+
 func runBlobStore(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("usage: snailmail blob-store <local|s3> [options]")
@@ -613,6 +667,10 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fmt.Fprintf(stdout, "📦  planned %d repository %s\n", result.Changes, plural(result.Changes, "change", "changes"))
 	fmt.Fprintf(stdout, "✉️   %s\n", result.Output)
 	fmt.Fprintf(stdout, "    plan sha256:%s\n", result.PlanID)
+	for _, acquisition := range result.Acquisitions {
+		fmt.Fprintf(stdout, "✉️   adopted %s/%s@%s %s sha256:%s\n",
+			acquisition.Repository, acquisition.Package, acquisition.Version, acquisition.OriginURL, acquisition.SHA256)
+	}
 	return nil
 }
 
@@ -1034,9 +1092,10 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail prune REPOSITORY --keep N")
-	fmt.Fprintln(output, "  snailmail check [--workspace DIR]")
+	fmt.Fprintln(output, "  snailmail check [--workspace DIR] [--origins --max-origins N --origin-offset N]")
 	fmt.Fprintln(output, "  snailmail status [--workspace DIR] [--json]")
 	fmt.Fprintln(output, "  snailmail doctor [--format auto|pypi|deb|helm] [--json] URL")
+	fmt.Fprintln(output, "  snailmail adopt --sha256 HEX --public-origin [--filename NAME --track TRACK --distro DISTRO --dry-run --json --workspace DIR] REPOSITORY URL")
 	fmt.Fprintln(output, "  snailmail blob-store s3 --bucket BUCKET [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
 	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")

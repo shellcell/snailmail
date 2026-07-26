@@ -22,6 +22,7 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/shellcell/snailmail/blob"
+	"github.com/shellcell/snailmail/source"
 )
 
 const ManifestFilename = "snailmail.toml"
@@ -784,6 +785,16 @@ func LoadLock(root string, repository Repository) (RepositoryLock, error) {
 	if err := decodeTOML(name, &lock); err != nil {
 		return RepositoryLock{}, err
 	}
+	if lock.SchemaVersion == 1 {
+		for _, packageVersion := range lock.PackageVersion {
+			for _, locked := range packageVersion.Blobs {
+				if locked.Origin != nil {
+					return RepositoryLock{}, errors.New("lock schema 1 cannot contain artifact origins")
+				}
+			}
+		}
+		lock.SchemaVersion = LockSchema
+	}
 	if lock.SchemaVersion != LockSchema || lock.Repository == "" {
 		return RepositoryLock{}, errors.New("invalid repository lock schema")
 	}
@@ -827,9 +838,14 @@ func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob
 		index = len(lock.PackageVersion) - 1
 	}
 	packageVersion := &lock.PackageVersion[index]
+	blobExists := false
 	for _, existing := range packageVersion.Blobs {
 		if existing.SHA256 == blob.SHA256 && existing.Filename == blob.Filename {
-			return false, nil
+			if existing.Size != blob.Size || (existing.MD5 != "" && existing.MD5 != blob.MD5) || (existing.SHA1 != "" && existing.SHA1 != blob.SHA1) || existing.Architecture != blob.Architecture {
+				return false, fmt.Errorf("package %s@%s has inconsistent metadata for existing bytes", packageName, version)
+			}
+			blobExists = true
+			break
 		}
 		conflicts := existing.Filename == blob.Filename
 		if format == "helm" || (format == "deb" && existing.Architecture == blob.Architecture) {
@@ -839,7 +855,9 @@ func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob
 			return false, fmt.Errorf("package %s@%s is already bound to different bytes", packageName, version)
 		}
 	}
-	packageVersion.Blobs = append(packageVersion.Blobs, blob)
+	if !blobExists {
+		packageVersion.Blobs = append(packageVersion.Blobs, blob)
+	}
 	placementExists := false
 	for _, placement := range lock.Placement {
 		if placement.Package == packageName && placement.Version == version && placement.Track == track && placement.Distro == distro {
@@ -851,7 +869,31 @@ func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob
 		lock.Placement = append(lock.Placement, Placement{Package: packageName, Version: version, Track: track, Distro: distro})
 	}
 	canonicalizeLock(lock)
-	return true, nil
+	return !blobExists || !placementExists, nil
+}
+
+func SetBlobOrigin(lock *RepositoryLock, packageName, version, filename, digest string, origin ArtifactOrigin) (bool, error) {
+	for packageIndex := range lock.PackageVersion {
+		packageVersion := &lock.PackageVersion[packageIndex]
+		if packageVersion.Package != packageName || packageVersion.Version != version {
+			continue
+		}
+		for blobIndex := range packageVersion.Blobs {
+			locked := &packageVersion.Blobs[blobIndex]
+			if locked.Filename != filename || locked.SHA256 != digest {
+				continue
+			}
+			if locked.Origin != nil {
+				if *locked.Origin == origin {
+					return false, nil
+				}
+				return false, errors.New("artifact already records a different origin")
+			}
+			locked.Origin = &origin
+			return true, nil
+		}
+	}
+	return false, errors.New("artifact is not recorded in the lock")
 }
 
 func PromotePlacement(lock *RepositoryLock, format, packageName, version, track, distro string) (bool, error) {
@@ -1107,6 +1149,11 @@ func ValidateLock(lock RepositoryLock, expectedRepository, format string) error 
 			if err != nil || len(decoded) != sha256.Size || blob.SHA256 != strings.ToLower(blob.SHA256) {
 				return fmt.Errorf("invalid locked blob SHA-256")
 			}
+			if blob.Origin != nil {
+				if ValidateArtifactOrigin(*blob.Origin) != nil {
+					return errors.New("invalid locked blob origin")
+				}
+			}
 			coordinate := blob.Filename
 			if format == "deb" {
 				coordinate = blob.Architecture
@@ -1131,6 +1178,14 @@ func ValidateLock(lock RepositoryLock, expectedRepository, format string) error 
 			return fmt.Errorf("duplicate placement for %s@%s", placement.Package, placement.Version)
 		}
 		placements[coordinate] = true
+	}
+	return nil
+}
+
+func ValidateArtifactOrigin(origin ArtifactOrigin) error {
+	parsed, err := url.Parse(origin.URL)
+	if origin.Kind != "https" || err != nil || source.ValidatePublicURL(parsed) != nil {
+		return errors.New("invalid artifact origin")
 	}
 	return nil
 }

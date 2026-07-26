@@ -83,8 +83,19 @@ period.
 version, including yanked and pruned versions. It verifies local CAS bytes or
 fetches the configured S3 authority into temporary storage, reparses native
 package facts, and revalidates historical publication bindings. Upstream release
-and adopted-origin checks remain unavailable until artifact origins are modeled;
-the command reports that limitation explicitly rather than inferring provenance.
+discovery remains unavailable until releases are modeled. `check --origins`
+re-fetches explicitly adopted URLs and compares their pinned bytes; default
+checks remain offline from external sources. Origin checks process at most four
+sorted records per run; `--origin-offset` selects subsequent batches.
+
+`snailmail adopt --sha256 HEX --public-origin REPOSITORY URL` records one
+explicitly selected artifact in an existing owned repository. The lowercase
+SHA-256 pin is mandatory; `--public-origin` confirms that the complete requested
+URL is non-secret and may be committed and printed. Lock schema 2 retains that
+URL, plans display every visible adopted acquisition, and `--dry-run` validates
+up to 128 MiB without changing CAS or lock state. Adoption currently requires
+the local blob store and does not claim authorship, build provenance, source
+signatures, or historical snailmail publication.
 
 `snailmail status` reports committed workspace evidence without contacting
 hosts or providers. Human output summarizes visible and retained versions,

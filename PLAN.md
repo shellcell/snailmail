@@ -401,14 +401,14 @@ PackageVersion, and it is **four cases, not two**:
 
 | Mode | Bytes authored by | You store them | Use when |
 |---|---|---|---|
-| `adopt` | upstream | ✅ | upstream's package is correct for your distros |
+| `adopt` | selected third party | ✅ | you explicitly trust pinned external package bytes |
 | `repack` | you, payload theirs | ✅ | upstream ships a tarball/binary, not a package |
 | `build` | you, from source | ✅ | you need your own deps, arches, or patches |
 | `proxy` | upstream | ❌ — index links to theirs | you want the index, not the bandwidth |
 
-**`adopt` is the common case and the one people hand-roll badly.** You fetch
-upstream's `.deb`, verify it, and place it in *your* repository. Your index,
-their bytes. Cheap and correct — until it isn't, and the failure modes are worth
+**`adopt` is the common case and the one people hand-roll badly.** You fetch a
+selected third party's `.deb`, verify its operator-supplied pin, and place it in
+*your* repository. Your index, their bytes. Cheap and correct — until it isn't, and the failure modes are worth
 encoding as preflight checks rather than discovering later:
 
 - upstream's version string may violate your repository's conventions (no epoch
@@ -672,7 +672,7 @@ The verbs, and which part of the model each one touches:
 | Command | Touches | Reversible |
 |---|---|---|
 | `add <repo> <artifact…>` | Blob + PackageVersion + Placement | ✅ revert |
-| `add --from <url>` | adopts upstream bytes, pinned by sha256 | ✅ |
+| `adopt --sha256 <hex> --public-origin <repo> <url>` | selected bytes + origin, pinned by SHA-256 | ✅ |
 | `build <product> --distro …` | repack/build → Blob + PackageVersion | ✅ |
 | `promote <pv> <repo>/<track>` | Placement (add) | ✅ |
 | `demote` / `yank` | Placement (remove), version stays recorded | ✅ |
@@ -722,7 +722,7 @@ requires = [
   acquire = "repack"         # upstream ships a tarball; we build the .deb
   [product.ttysvg.map.pypi]
   main    = "tty-svg"        # → normalized tty_svg by PEP 503
-  acquire = "adopt"          # upstream's wheel, our index, pinned by sha256
+  acquire = "adopt"          # selected wheel, our index, operator-pinned sha256
   [product.ttysvg.map.npm]
   main = "@shellcell/ttysvg"
   [product.ttysvg.map.aur]
@@ -1056,7 +1056,7 @@ until it exists the operation is manual.
 
 The signing key is the one that matters. §8's `KeyBackend` exists so that with
 KMS or a hardware token the engine never holds it — and the fact that adopting
-upstream bytes (§3.8) means signing them with that key is precisely why it
+selected third-party bytes (§3.8) means signing them with that key is precisely why it
 deserves this much care.
 
 ### 12.4 Rate limits and failure modes
@@ -1199,7 +1199,11 @@ human and JSON summaries of committed placements, publication bindings, and
 deployment receipts without claiming live provider state. Workspace-independent
 `doctor` now performs bounded public-HTTPS inspection of
 PyPI, Debian, and Helm indexes plus selected referenced artifacts, with explicit
-unverified-signature findings. Additional backends, remaining operational
+unverified-signature findings. Single-artifact `adopt` now requires a preselected
+SHA-256 and explicit non-secret public-origin confirmation, stores the selected
+URL in lock schema 2, exposes acquisitions in plan schema 10, and supports
+bounded explicit `check --origins`; repository import and upstream release
+discovery remain deferred. Additional backends, remaining operational
 commands, and format expansion remain subsequent Phase 3 slices.
 
 **Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
@@ -1234,8 +1238,8 @@ pain is visibility, policy, and setup, not mechanics.
   × 2 arches is 144 cells before you have shipped anything twice. Storage, CI
   time, verify containers and the TUI all scale with it. Default to the
   narrowest matrix that works and make widening deliberate.
-- **Adopting upstream bytes means signing them.** Your repository signature says
-  "this came from us" about an artifact you did not build. That is often the
+- **Adopting selected bytes means signing them.** Your repository signature
+  endorses an artifact you did not build without proving its source is authoritative. That is often the
   right trade, but it must be a visible choice in `plan`, not a default nobody
   noticed.
 - **Cross-distro dependency naming has no complete answer.** The capability

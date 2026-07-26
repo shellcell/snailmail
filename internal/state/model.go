@@ -4,8 +4,8 @@ import "time"
 
 const (
 	ManifestSchema   = 7
-	LockSchema       = 1
-	PlanSchema       = 9
+	LockSchema       = 2
+	PlanSchema       = 10
 	LedgerSchema     = 1
 	DeploymentSchema = 2
 )
@@ -106,12 +106,18 @@ type PackageVersion struct {
 }
 
 type LockedBlob struct {
-	Filename     string `toml:"filename"`
-	Architecture string `toml:"architecture,omitempty"`
-	Size         int64  `toml:"size"`
-	MD5          string `toml:"md5,omitempty"`
-	SHA1         string `toml:"sha1,omitempty"`
-	SHA256       string `toml:"sha256"`
+	Filename     string          `toml:"filename"`
+	Architecture string          `toml:"architecture,omitempty"`
+	Size         int64           `toml:"size"`
+	MD5          string          `toml:"md5,omitempty"`
+	SHA1         string          `toml:"sha1,omitempty"`
+	SHA256       string          `toml:"sha256"`
+	Origin       *ArtifactOrigin `toml:"origin,omitempty"`
+}
+
+type ArtifactOrigin struct {
+	Kind string `toml:"kind"`
+	URL  string `toml:"url"`
 }
 
 type Placement struct {
@@ -200,6 +206,7 @@ type PlanRepository struct {
 	Signing                   []PlanSigning            `json:"signing,omitempty"`
 	PublicationRecords        bool                     `json:"publication_records"`
 	PublicationBindings       []PlanPublicationBinding `json:"publication_bindings,omitempty"`
+	Acquisitions              []PlanAcquisition        `json:"acquisitions,omitempty"`
 	ObservedTreeSHA256        string                   `json:"observed_tree_sha256,omitempty"`
 	DesiredTreeSHA256         string                   `json:"desired_tree_sha256"`
 	DesiredManifestSHA256     string                   `json:"desired_manifest_sha256,omitempty"`
@@ -211,6 +218,14 @@ type PlanPublicationBinding struct {
 	Package    string   `json:"package"`
 	Version    string   `json:"version"`
 	BlobSHA256 []string `json:"blob_sha256"`
+}
+
+type PlanAcquisition struct {
+	Package   string `json:"package"`
+	Version   string `json:"version"`
+	Filename  string `json:"filename"`
+	SHA256    string `json:"sha256"`
+	OriginURL string `json:"origin_url"`
 }
 
 type PlanSigning struct {

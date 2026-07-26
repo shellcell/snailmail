@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/rand"
@@ -117,6 +118,31 @@ func PutArtifact(root, format, sourceName string) (domain.Blob, error) {
 		SHA1:     hex.EncodeToString(sha1Hash.Sum(nil)),
 		SHA256:   digest,
 		Facts:    facts,
+	}, nil
+}
+
+func InspectArtifactBytes(format, filename string, content []byte) (domain.Blob, error) {
+	if filename == "" || filepath.Base(filename) != filename || strings.ContainsAny(filename, "\x00\r\n/\\") {
+		return domain.Blob{}, errors.New("artifact filename is unsafe")
+	}
+	maximum, err := formatMaximum(format)
+	if err != nil {
+		return domain.Blob{}, err
+	}
+	if int64(len(content)) > maximum {
+		return domain.Blob{}, errors.New("artifact exceeds format size limit")
+	}
+	reader := bytes.NewReader(content)
+	facts, err := inspect(format, filename, reader, int64(len(content)))
+	if err != nil {
+		return domain.Blob{}, err
+	}
+	md5Digest := md5.Sum(content)
+	sha1Digest := sha1.Sum(content)
+	sha256Digest := sha256.Sum256(content)
+	return domain.Blob{
+		Filename: filename, Size: int64(len(content)), MD5: hex.EncodeToString(md5Digest[:]),
+		SHA1: hex.EncodeToString(sha1Digest[:]), SHA256: hex.EncodeToString(sha256Digest[:]), Facts: facts,
 	}, nil
 }
 

@@ -2,14 +2,18 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"sort"
+	"time"
 
 	"github.com/shellcell/snailmail/blob"
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/state"
+	"github.com/shellcell/snailmail/source"
 )
 
 type CheckFinding struct {
@@ -19,14 +23,20 @@ type CheckFinding struct {
 }
 
 type CheckWorkspaceRequest struct {
-	Root  string
-	Blobs blob.Resolver
+	Root         string
+	Blobs        blob.Resolver
+	Origins      bool
+	Sources      source.Fetcher
+	MaxOrigins   int
+	OriginOffset int
 }
 
 type CheckWorkspaceResult struct {
 	Repositories    int
 	PackageVersions int
 	Artifacts       int
+	OriginsChecked  int
+	OriginsSkipped  int
 	Findings        []CheckFinding
 }
 
@@ -36,6 +46,20 @@ func (err authorityFetchError) Error() string { return err.err.Error() }
 func (err authorityFetchError) Unwrap() error { return err.err }
 
 func CheckWorkspace(ctx context.Context, request CheckWorkspaceRequest) (CheckWorkspaceResult, error) {
+	if request.Origins {
+		if request.MaxOrigins == 0 {
+			request.MaxOrigins = 2
+		}
+		if request.MaxOrigins < 1 || request.MaxOrigins > 4 {
+			return CheckWorkspaceResult{}, errors.New("origin check limit must be between 1 and 4")
+		}
+		if request.OriginOffset < 0 {
+			return CheckWorkspaceResult{}, errors.New("origin check offset must not be negative")
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 2*time.Minute)
+		defer cancel()
+	}
 	root, err := workspaceRoot(request.Root)
 	if err != nil {
 		return CheckWorkspaceResult{}, err
@@ -55,11 +79,12 @@ func CheckWorkspace(ctx context.Context, request CheckWorkspaceRequest) (CheckWo
 	if err != nil {
 		return CheckWorkspaceResult{}, err
 	}
-	store, err := resolveBlobStore(ctx, manifest, request.Blobs)
-	if err != nil {
-		return CheckWorkspaceResult{}, err
-	}
+	store, storeErr := resolveBlobStore(ctx, manifest, request.Blobs)
+	originAudit := originAuditState{enabled: request.Origins, fetcher: request.Sources, maximum: request.MaxOrigins, offset: request.OriginOffset}
 	result := CheckWorkspaceResult{Repositories: len(manifest.Repositories)}
+	if storeErr != nil {
+		result.Findings = append(result.Findings, CheckFinding{State: "unknown", Subject: "blob-authority", Message: storeErr.Error()})
+	}
 	for _, repositoryName := range state.RepositoryNames(manifest) {
 		repository := manifest.Repositories[repositoryName]
 		lock, err := state.LoadLock(root, repository)
@@ -87,10 +112,16 @@ func CheckWorkspace(ctx context.Context, request CheckWorkspaceRequest) (CheckWo
 				}
 				result.Artifacts++
 				subject := fmt.Sprintf("repo/%s/%s@%s/%s", repositoryName, packageVersion.Package, packageVersion.Version, locked.Filename)
-				validated, checkErr := checkLockedBlob(ctx, root, repository.Format, locked, store)
+				var validated domain.Blob
+				var checkErr error
+				if storeErr != nil {
+					checkErr = authorityFetchError{err: storeErr}
+				} else {
+					validated, checkErr = checkLockedBlob(ctx, root, repository.Format, locked, store)
+				}
 				if checkErr != nil {
-					if errors.Is(checkErr, context.Canceled) || errors.Is(checkErr, context.DeadlineExceeded) {
-						return result, checkErr
+					if ctx.Err() != nil {
+						return result, ctx.Err()
 					}
 					findingState := "unknown"
 					if errors.Is(checkErr, blob.ErrNotFound) || errors.Is(checkErr, os.ErrNotExist) {
@@ -99,6 +130,9 @@ func CheckWorkspace(ctx context.Context, request CheckWorkspaceRequest) (CheckWo
 						findingState = "changed"
 					}
 					result.Findings = append(result.Findings, CheckFinding{State: findingState, Subject: subject, Message: checkErr.Error()})
+					if err := auditLockedOrigin(ctx, &originAudit, locked, subject, &result); err != nil {
+						return result, err
+					}
 					continue
 				}
 				if nativePackageName(repository.Format, validated.Facts.Name) != packageVersion.Package || validated.Facts.Version != packageVersion.Version {
@@ -106,6 +140,9 @@ func CheckWorkspace(ctx context.Context, request CheckWorkspaceRequest) (CheckWo
 						State: "changed", Subject: subject,
 						Message: fmt.Sprintf("artifact facts identify %s@%s", nativePackageName(repository.Format, validated.Facts.Name), validated.Facts.Version),
 					})
+				}
+				if err := auditLockedOrigin(ctx, &originAudit, locked, subject, &result); err != nil {
+					return result, err
 				}
 			}
 		}
@@ -120,6 +157,78 @@ func CheckWorkspace(ctx context.Context, request CheckWorkspaceRequest) (CheckWo
 		return result.Findings[left].Message < result.Findings[right].Message
 	})
 	return result, nil
+}
+
+type originAuditState struct {
+	enabled bool
+	fetcher source.Fetcher
+	maximum int
+	offset  int
+	seen    int
+	used    int
+}
+
+func auditLockedOrigin(ctx context.Context, audit *originAuditState, locked state.LockedBlob, subject string, result *CheckWorkspaceResult) error {
+	if !audit.enabled || locked.Origin == nil {
+		return nil
+	}
+	position := audit.seen
+	audit.seen++
+	if position < audit.offset {
+		result.OriginsSkipped++
+		return nil
+	}
+	if audit.used >= audit.maximum {
+		result.OriginsSkipped++
+		return nil
+	}
+	audit.used++
+	result.OriginsChecked++
+	originErr := checkLockedOrigin(ctx, locked, audit.fetcher)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if originErr == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	findingState := "unknown"
+	if errors.Is(originErr, blob.ErrNotFound) {
+		findingState = "missing"
+	} else if errors.Is(originErr, blob.ErrCorrupt) {
+		findingState = "changed"
+	}
+	result.Findings = append(result.Findings, CheckFinding{State: findingState, Subject: subject + "/origin", Message: originErr.Error()})
+	return nil
+}
+
+func checkLockedOrigin(ctx context.Context, locked state.LockedBlob, fetcher source.Fetcher) error {
+	if fetcher == nil {
+		return errors.New("origin fetcher is required")
+	}
+	response, err := fetcher.Fetch(ctx, locked.Origin.URL, maximumAdoptBytes)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if response.StatusCode == 404 {
+		return blob.ErrNotFound
+	}
+	if response.StatusCode != 200 {
+		return fmt.Errorf("origin returned HTTP %d", response.StatusCode)
+	}
+	digest := sha256.Sum256(response.Body)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if int64(len(response.Body)) != locked.Size || hex.EncodeToString(digest[:]) != locked.SHA256 {
+		return blob.ErrCorrupt
+	}
+	return nil
 }
 
 func checkLockedBlob(ctx context.Context, root, format string, locked state.LockedBlob, store blob.Store) (domain.Blob, error) {

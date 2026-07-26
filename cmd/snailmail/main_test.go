@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/shellcell/snailmail/engine"
+	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/internal/testutil"
 	"github.com/shellcell/snailmail/source"
 )
@@ -112,7 +116,7 @@ func TestCheckReportsReadOnlyAuditScope(t *testing.T) {
 		t.Fatalf("check failed: %v\n%s", err, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "checked 1 repository, 0 package versions, and 0 locked artifacts") ||
-		!strings.Contains(stdout.String(), "upstream release checks unavailable") {
+		!strings.Contains(stdout.String(), "adopted-origin checks disabled") {
 		t.Fatalf("unexpected check output %q", stdout.String())
 	}
 }
@@ -222,6 +226,49 @@ func TestDoctorPrintsMalformedIndexAsJSONFinding(t *testing.T) {
 	var result engine.DoctorResult
 	if jsonErr := json.Unmarshal(stdout.Bytes(), &result); jsonErr != nil || len(result.Findings) != 1 || result.Findings[0].Code != "index.invalid" {
 		t.Fatalf("doctor malformed JSON=%q decode=%v result=%#v", stdout.String(), jsonErr, result)
+	}
+}
+
+func TestAdoptDryRunEmitsPinnedJSONWithoutMutation(t *testing.T) {
+	root := t.TempDir()
+	if output, err := exec.Command("git", "init", "-b", "main", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: root, Name: "cli-adopt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.SetupRepository(engine.SetupRepositoryRequest{Root: root, Name: "python", Format: "pypi", HostType: "local", Output: "public/python", Visibility: "public"}); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := testutil.WriteWheel(t.TempDir(), "demo", "1.2.3", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(content)
+	origin := "https://downloads.example/" + filepath.Base(artifact)
+	fetcher := cliDoctorFetcher{response: source.Response{URL: origin, StatusCode: 200, Body: content}}
+	var stdout, stderr bytes.Buffer
+	err = runAdoptWithFetcher(context.Background(), []string{
+		"--workspace", root, "--sha256", hex.EncodeToString(digest[:]), "--public-origin", "--dry-run", "--json", "python", origin,
+	}, &stdout, &stderr, fetcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result engine.AdoptArtifactResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil || !result.Changed || !result.DryRun || result.OriginURL != origin {
+		t.Fatalf("adopt JSON=%q result=%#v err=%v", stdout.String(), result, err)
+	}
+	manifest, err := state.LoadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := state.LoadLock(root, manifest.Repositories["python"])
+	if err != nil || len(lock.PackageVersion) != 0 {
+		t.Fatalf("adopt dry-run lock=%#v err=%v", lock, err)
 	}
 }
 
