@@ -536,6 +536,12 @@ the retained cohort. Equal-precedence versions at the cutoff are retained
 together. Package-version records, local and remote blobs, and publication
 history remain GC roots; prune performs no physical deletion.
 
+`check` is read-only and validates every locked artifact, including unplaced
+versions, against the configured authoritative blob store. It reparses native
+facts and validates full publication history without populating the local CAS
+from a remote authority. Source freshness is not claimed when origin state is
+absent.
+
 Git-authoritative controls protect reviewed automation from stale, accidental,
 or partially applied state; they do not treat a repository administrator as an
 adversary. An operator who can rewrite Git metadata, access signing keys, and

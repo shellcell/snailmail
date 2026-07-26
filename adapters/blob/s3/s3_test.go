@@ -62,8 +62,8 @@ func TestStoreRejectsImmutableConflictAndCorruptFetch(t *testing.T) {
 	client.objects[key] = memoryObject{content: []byte("corrupt!"), info: ObjectInfo{
 		Size: ref.Size, SHA256: ref.SHA256, Metadata: map[string]string{"sha256": ref.SHA256, "size": strconv.FormatInt(ref.Size, 10)},
 	}}
-	if err := store.Fetch(ctx, ref, io.Discard); err == nil {
-		t.Fatal("expected corrupt fetch to fail")
+	if err := store.Fetch(ctx, ref, io.Discard); !errors.Is(err, blob.ErrCorrupt) {
+		t.Fatalf("corrupt fetch error = %v", err)
 	}
 	client.objects[key] = memoryObject{content: []byte("corrupt!"), info: ObjectInfo{
 		Size: ref.Size, Metadata: map[string]string{"sha256": ref.SHA256, "size": strconv.FormatInt(ref.Size, 10)},

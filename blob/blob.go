@@ -9,6 +9,8 @@ import (
 var (
 	ErrNotFound     = errors.New("blob not found")
 	ErrPrecondition = errors.New("blob precondition failed")
+	ErrCorrupt      = errors.New("blob content is corrupt")
+	ErrUnavailable  = errors.New("blob authority is unavailable")
 )
 
 type Ref struct {

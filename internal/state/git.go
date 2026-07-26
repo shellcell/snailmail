@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -37,10 +38,25 @@ func AcquireWorkspaceLock(root string) (func(), error) {
 }
 
 func RequireGitRepository(root string) error {
-	if _, err := gitOutput(root, "rev-parse", "--git-dir"); err != nil {
+	return RequireGitRepositoryContext(context.Background(), root)
+}
+
+func RequireGitRepositoryContext(ctx context.Context, root string) error {
+	if _, err := gitOutputContext(ctx, root, "rev-parse", "--git-dir"); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return errors.New("workspace must be inside a Git repository")
 	}
 	return nil
+}
+
+func RequireCompleteGitHistory(root string) error {
+	return requireCompleteGitHistoryContext(context.Background(), root)
+}
+
+func RequireCompleteGitHistoryContext(ctx context.Context, root string) error {
+	return requireCompleteGitHistoryContext(ctx, root)
 }
 
 func RequireCleanGit(root string) (string, error) {
@@ -463,13 +479,33 @@ func AcquireGitRevisionLock(root, expectedRevision string) (func(), error) {
 }
 
 func requireCompleteGitHistory(root string) error {
-	shallow, err := gitOutput(root, "rev-parse", "--is-shallow-repository")
+	return requireCompleteGitHistoryContext(context.Background(), root)
+}
+
+func requireCompleteGitHistoryContext(ctx context.Context, root string) error {
+	shallow, err := gitOutputContext(ctx, root, "rev-parse", "--is-shallow-repository")
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err != nil || shallow == "true" {
 		return errors.New("workspace requires complete, non-shallow Git history")
 	}
-	command := gitCommand(root, "config", "--get", "extensions.partialClone")
-	if output, err := command.Output(); err == nil && strings.TrimSpace(string(output)) != "" {
+	command := gitCommandContext(ctx, root, "config", "--get", "extensions.partialClone")
+	output, configErr := command.Output()
+	if configErr == nil && strings.TrimSpace(string(output)) != "" {
 		return errors.New("workspace requires complete, non-partial Git history")
+	}
+	if configErr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(configErr, &exitErr) || exitErr.ExitCode() != 1 {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("inspect partial Git configuration: %w", configErr)
+		}
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	return nil
 }
@@ -783,13 +819,25 @@ func gitHashObject(root string, content []byte) (string, error) {
 }
 
 func gitCommand(root string, arguments ...string) *exec.Cmd {
-	command := exec.Command("git", append([]string{"-C", root}, arguments...)...)
+	return gitCommandContext(context.Background(), root, arguments...)
+}
+
+func gitCommandContext(ctx context.Context, root string, arguments ...string) *exec.Cmd {
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", root}, arguments...)...)
 	command.Env = replaceEnvironment(os.Environ(), "GIT_OPTIONAL_LOCKS", "0")
 	return command
 }
 
 func gitOutput(root string, arguments ...string) (string, error) {
 	output, err := gitCommand(root, arguments...).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func gitOutputContext(ctx context.Context, root string, arguments ...string) (string, error) {
+	output, err := gitCommandContext(ctx, root, arguments...).Output()
 	if err != nil {
 		return "", err
 	}

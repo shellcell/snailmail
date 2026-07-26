@@ -92,7 +92,7 @@ func (store *Store) Fetch(ctx context.Context, ref blob.Ref, writer io.Writer) e
 	}
 	if !matches(info, ref) {
 		_ = reader.Close()
-		return errors.New("fetched S3 blob metadata does not match its reference")
+		return fmt.Errorf("%w: fetched S3 blob metadata does not match its reference", blob.ErrCorrupt)
 	}
 	hash := sha256.New()
 	written, readErr := io.Copy(io.MultiWriter(writer, hash), io.LimitReader(reader, ref.Size+1))
@@ -104,7 +104,7 @@ func (store *Store) Fetch(ctx context.Context, ref blob.Ref, writer io.Writer) e
 		return closeErr
 	}
 	if written != ref.Size || hex.EncodeToString(hash.Sum(nil)) != ref.SHA256 {
-		return errors.New("fetched S3 blob does not match its reference")
+		return fmt.Errorf("%w: fetched S3 blob does not match its reference", blob.ErrCorrupt)
 	}
 	return nil
 }

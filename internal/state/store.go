@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/shellcell/snailmail/blob"
@@ -1099,7 +1100,7 @@ func ValidateLock(lock RepositoryLock, expectedRepository, format string) error 
 		versions[identity] = true
 		coordinates := make(map[string]bool)
 		for _, blob := range packageVersion.Blobs {
-			if blob.Filename == "" || filepath.Base(blob.Filename) != blob.Filename || blob.Size < 0 {
+			if blob.Filename == "" || filepath.Base(blob.Filename) != blob.Filename || strings.IndexFunc(blob.Filename, unicode.IsControl) >= 0 || blob.Size < 0 {
 				return fmt.Errorf("invalid locked blob filename or size")
 			}
 			decoded, err := hex.DecodeString(blob.SHA256)

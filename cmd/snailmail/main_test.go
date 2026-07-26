@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/shellcell/snailmail/engine"
 	"github.com/shellcell/snailmail/internal/testutil"
 )
 
@@ -82,6 +84,34 @@ func TestPruneRequiresPositiveRetention(t *testing.T) {
 		if err := run(context.Background(), arguments, &stdout, &stderr); err == nil {
 			t.Fatalf("prune arguments unexpectedly accepted: %v", arguments)
 		}
+	}
+}
+
+func TestCheckRejectsUnexpectedArguments(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"check", "repository"}, &stdout, &stderr); err == nil {
+		t.Fatal("check accepted an unexpected repository selector")
+	}
+}
+
+func TestCheckReportsReadOnlyAuditScope(t *testing.T) {
+	root := t.TempDir()
+	if output, err := exec.Command("git", "init", "-b", "main", root).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: root, Name: "cli-check"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.SetupRepository(engine.SetupRepositoryRequest{Root: root, Name: "python", Format: "pypi", HostType: "local", Output: "public/python", Visibility: "public"}); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := run(context.Background(), []string{"check", "--workspace", root}, &stdout, &stderr); err != nil {
+		t.Fatalf("check failed: %v\n%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "checked 1 repository, 0 package versions, and 0 locked artifacts") ||
+		!strings.Contains(stdout.String(), "upstream release checks unavailable") {
+		t.Fatalf("unexpected check output %q", stdout.String())
 	}
 }
 

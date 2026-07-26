@@ -79,6 +79,13 @@ package-version records, CAS objects, remote blobs, or publication history;
 physical blob GC remains a separate future operation with tombstones and a grace
 period.
 
+`snailmail check` is a read-only integrity audit of every retained package
+version, including yanked and pruned versions. It verifies local CAS bytes or
+fetches the configured S3 authority into temporary storage, reparses native
+package facts, and revalidates historical publication bindings. Upstream release
+and adopted-origin checks remain unavailable until artifact origins are modeled;
+the command reports that limitation explicitly rather than inferring provenance.
+
 Signed Debian repositories use an encrypted private key outside the workspace
 and commit only canonical public forms. Set a passphrase through the environment
 (never an argument), generate the key, and reference it during setup:

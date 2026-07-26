@@ -112,8 +112,6 @@ func normalizeAWSError(err error) error {
 	var responseError *transport.ResponseError
 	if errors.As(err, &responseError) {
 		switch responseError.HTTPStatusCode() {
-		case 404:
-			return fmt.Errorf("%w: %v", blob.ErrNotFound, err)
 		case 412:
 			return fmt.Errorf("%w: %v", blob.ErrPrecondition, err)
 		}

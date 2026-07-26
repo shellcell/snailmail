@@ -3,6 +3,7 @@ package state
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/shellcell/snailmail/internal/jsonstrict"
 )
 
 func LoadLedger(root, repository string) ([]PublicationRecord, error) {
@@ -30,37 +34,76 @@ func LoadLedger(root, repository string) ([]PublicationRecord, error) {
 }
 
 func LoadLedgerHistory(root, repository string) ([]PublicationRecord, error) {
+	return LoadLedgerHistoryContext(context.Background(), root, repository)
+}
+
+func LoadLedgerHistoryContext(ctx context.Context, root, repository string) ([]PublicationRecord, error) {
 	records, err := LoadLedger(root, repository)
 	if err != nil {
 		return nil, err
+	}
+	current := make(map[string]PublicationRecord, len(records))
+	all := make(map[string]PublicationRecord, len(records))
+	for _, record := range records {
+		key := publicationRecordKey(record)
+		if _, exists := current[key]; exists {
+			return nil, errors.New("publication ledger contains a duplicate record key")
+		}
+		current[key] = record
+		all[key] = record
 	}
 	relative := filepath.ToSlash(filepath.Join("publications", repository+".jsonl"))
 	treePath, err := workspaceGitPath(root, relative)
 	if err != nil {
 		return nil, err
 	}
-	output, err := gitOutput(root, "log", "--all", "--format=%H", "--diff-filter=AM", "--", ":(top,literal)"+treePath)
+	output, err := gitOutputContext(ctx, root, "log", "--all", "--format=%H", "--diff-filter=AM", "--", ":(top,literal)"+treePath)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("read publication history: %w", err)
 	}
-	seen := make(map[string]bool)
-	for _, record := range records {
-		seen[recordIdentity(record)] = true
-	}
 	for _, revision := range strings.Fields(output) {
-		content, err := execGitShow(root, revision, treePath)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		content, err := execGitShowContext(ctx, root, revision, treePath)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			return nil, fmt.Errorf("read publication ledger at %s: %w", revision, err)
 		}
 		historical, err := parseLedger(bytes.NewReader(content))
 		if err != nil {
 			return nil, err
 		}
+		historicalKeys := make(map[string]bool, len(historical))
 		for _, record := range historical {
-			if !seen[recordIdentity(record)] {
-				records = append(records, record)
-				seen[recordIdentity(record)] = true
+			key := publicationRecordKey(record)
+			if historicalKeys[key] {
+				return nil, errors.New("publication ledger history contains a duplicate record key")
 			}
+			historicalKeys[key] = true
+			if existing, exists := all[key]; exists {
+				if !publicationRecordEqual(existing, record) {
+					return nil, errors.New("publication ledger history changed an immutable record")
+				}
+			} else {
+				records = append(records, record)
+				all[key] = record
+			}
+		}
+	}
+	keys := make([]string, 0, len(all))
+	for key := range all {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, exists := current[key]; !exists {
+			return nil, errors.New("publication ledger removed an immutable record")
 		}
 	}
 	return records, nil
@@ -72,11 +115,11 @@ func parseLedger(reader io.Reader) ([]PublicationRecord, error) {
 	scanner.Buffer(make([]byte, 4096), 4<<20)
 	for scanner.Scan() {
 		var record PublicationRecord
-		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
+		if err := jsonstrict.Decode(scanner.Bytes(), &record, 4<<20); err != nil {
 			return nil, fmt.Errorf("decode publication ledger: %w", err)
 		}
-		if record.SchemaVersion != LedgerSchema {
-			return nil, fmt.Errorf("unsupported publication ledger schema")
+		if err := validatePublicationRecord(record, ""); err != nil {
+			return nil, err
 		}
 		records = append(records, record)
 	}
@@ -87,11 +130,19 @@ func parseLedger(reader io.Reader) ([]PublicationRecord, error) {
 }
 
 func recordIdentity(record PublicationRecord) string {
-	return record.PlanID + "\x00" + record.ChangeID + "\x00" + record.Package + "\x00" + record.Version + "\x00" + strings.Join(record.BlobSHA256, ",")
+	return record.Repository + "\x00" + record.PlanID + "\x00" + record.ChangeID + "\x00" + record.Package + "\x00" + record.Version + "\x00" + strings.Join(record.BlobSHA256, ",") + "\x00" + record.TreeSHA256 + "\x00" + record.RecordedAt
+}
+
+func publicationRecordKey(record PublicationRecord) string {
+	return record.PlanID + "\x00" + record.ChangeID + "\x00" + record.Package + "\x00" + record.Version
 }
 
 func execGitShow(root, revision, treePath string) ([]byte, error) {
-	return gitCommand(root, "show", revision+":"+treePath).Output()
+	return execGitShowContext(context.Background(), root, revision, treePath)
+}
+
+func execGitShowContext(ctx context.Context, root, revision, treePath string) ([]byte, error) {
+	return gitCommandContext(ctx, root, "show", revision+":"+treePath).Output()
 }
 
 func ValidatePublishedBindings(lock RepositoryLock, records []PublicationRecord) error {
@@ -118,11 +169,54 @@ func ValidatePublishedBindings(lock RepositoryLock, records []PublicationRecord)
 			return fmt.Errorf("published package %s@%s cannot change bytes", packageVersion.Package, packageVersion.Version)
 		}
 	}
+	keys := make([]string, 0, len(bindings))
 	for key := range bindings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
 		if lockBindings[key] == nil {
 			parts := strings.SplitN(key, "\x00", 2)
 			return fmt.Errorf("published package %s@%s cannot be removed from the lock", parts[0], parts[1])
 		}
+	}
+	return nil
+}
+
+func ValidatePublicationHistory(repository string, records []PublicationRecord) error {
+	seen := make(map[string]bool, len(records))
+	for _, record := range records {
+		if err := validatePublicationRecord(record, repository); err != nil {
+			return err
+		}
+		key := publicationRecordKey(record)
+		if seen[key] {
+			return errors.New("publication ledger contains a duplicate record key")
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+func validatePublicationRecord(record PublicationRecord, repository string) error {
+	if record.SchemaVersion != LedgerSchema {
+		return errors.New("unsupported publication ledger schema")
+	}
+	if record.Repository == "" || (repository != "" && record.Repository != repository) ||
+		!validSHA256(record.PlanID) || !validSHA256(record.TreeSHA256) ||
+		record.ChangeID != record.Repository+":"+record.TreeSHA256[:12] ||
+		record.Package == "" || record.Version == "" || len(record.BlobSHA256) == 0 {
+		return errors.New("invalid publication ledger record")
+	}
+	previous := ""
+	for _, digest := range record.BlobSHA256 {
+		if !validSHA256(digest) || (previous != "" && digest <= previous) {
+			return errors.New("invalid publication ledger blob binding")
+		}
+		previous = digest
+	}
+	if _, err := time.Parse(time.RFC3339, record.RecordedAt); err != nil {
+		return errors.New("invalid publication ledger timestamp")
 	}
 	return nil
 }

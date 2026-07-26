@@ -1937,7 +1937,14 @@ func resolveBlobStore(ctx context.Context, manifest state.Manifest, resolver blo
 	if resolver == nil {
 		return nil, errors.New("remote blob store resolver is required")
 	}
-	return resolver.Resolve(ctx, configuration)
+	store, err := resolver.Resolve(ctx, configuration)
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return nil, errors.New("remote blob store resolver returned no store")
+	}
+	return store, nil
 }
 
 func blobStoreIdentity(manifest state.Manifest) (string, error) {

@@ -51,6 +51,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runYank(args[1:], stdout, stderr)
 	case "prune":
 		return runPrune(args[1:], stdout, stderr)
+	case "check":
+		return runCheck(ctx, args[1:], stdout, stderr)
 	case "blob-store":
 		return runBlobStore(ctx, args[1:], stdout, stderr)
 	case "plan":
@@ -426,6 +428,33 @@ func runPrune(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "📦  removed %d old %s from %s placements\n", result.Removed, plural(result.Removed, "placement", "placements"), result.Repository)
 	}
 	fmt.Fprintln(stdout, "✉️   package versions and blobs were retained")
+	return nil
+}
+
+func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("check", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	workspace := flags.String("workspace", ".", "workspace root")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: snailmail check [--workspace DIR]")
+	}
+	result, err := engine.CheckWorkspace(ctx, engine.CheckWorkspaceRequest{Root: *workspace, Blobs: wire.NewBlobResolver()})
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  checked %d %s, %d package versions, and %d locked %s\n",
+		result.Repositories, plural(result.Repositories, "repository", "repositories"), result.PackageVersions, result.Artifacts, plural(result.Artifacts, "artifact", "artifacts"))
+	for _, finding := range result.Findings {
+		fmt.Fprintf(stdout, "✉️   [%s] %s: %s\n", finding.State, finding.Subject, finding.Message)
+	}
+	fmt.Fprintln(stdout, "✉️   upstream release checks unavailable: no artifact origins are recorded")
+	if len(result.Findings) != 0 {
+		return fmt.Errorf("check found %d unavailable or changed %s", len(result.Findings), plural(len(result.Findings), "artifact", "artifacts"))
+	}
 	return nil
 }
 
@@ -916,6 +945,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail prune REPOSITORY --keep N")
+	fmt.Fprintln(output, "  snailmail check [--workspace DIR]")
 	fmt.Fprintln(output, "  snailmail blob-store s3 --bucket BUCKET [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
 	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")
