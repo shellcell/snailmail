@@ -243,6 +243,9 @@ func parseMetadata(raw []byte) (domain.PackageFacts, error) {
 	if !versionPattern.MatchString(version) {
 		return domain.PackageFacts{}, fmt.Errorf("invalid package version %q", version)
 	}
+	if _, err := parsePEP440(version); err != nil {
+		return domain.PackageFacts{}, fmt.Errorf("invalid package version %q", version)
+	}
 	requiresPython := strings.TrimSpace(message.Header.Get("Requires-Python"))
 	if !requiresPythonPattern.MatchString(requiresPython) {
 		return domain.PackageFacts{}, errors.New("invalid Requires-Python metadata")

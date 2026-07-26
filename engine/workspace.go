@@ -529,7 +529,14 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
-		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, observed, createdAt); err != nil {
+		trustNotBefore := time.Time{}
+		if repository.SigningRotation != nil || deployment.SigningRotationPhase != "" {
+			trustNotBefore, err = state.AuthoritativeDeploymentTrustSince(root, name, deployment)
+			if err != nil {
+				return PlanWorkspaceResult{}, err
+			}
+		}
+		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, observed, createdAt, trustNotBefore); err != nil {
 			return PlanWorkspaceResult{}, fmt.Errorf("repository %q: %w", name, err)
 		}
 		desiredSigningState, err := repositoryDeploymentSigningState(repository, manifest.Keys)
@@ -788,7 +795,14 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return ApplyWorkspaceResult{}, err
 		}
 		plannedObserved := publishedFromPlanObservation(planned)
-		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, plannedObserved, now); err != nil {
+		trustNotBefore := time.Time{}
+		if repository.SigningRotation != nil || deployment.SigningRotationPhase != "" {
+			trustNotBefore, err = state.AuthoritativeDeploymentTrustSince(root, planned.Name, deployment)
+			if err != nil {
+				return ApplyWorkspaceResult{}, err
+			}
+		}
+		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, plannedObserved, now, trustNotBefore); err != nil {
 			return ApplyWorkspaceResult{}, fmt.Errorf("repository %q: %w", planned.Name, err)
 		}
 		matchesObserved := revisionMatchesPlanObservation(observed, planned)

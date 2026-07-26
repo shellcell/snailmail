@@ -247,10 +247,14 @@ func validVersion(version string) bool {
 	}
 	remainder := version
 	if separator := strings.IndexByte(remainder, ':'); separator >= 0 {
-		if separator == 0 || strings.Contains(remainder[separator+1:], ":") {
+		if separator == 0 {
 			return false
 		}
-		if _, err := strconv.ParseUint(remainder[:separator], 10, 64); err != nil {
+		epoch := strings.TrimPrefix(remainder[:separator], "+")
+		if epoch == "" {
+			return false
+		}
+		if _, err := strconv.ParseUint(epoch, 10, 64); err != nil {
 			return false
 		}
 		remainder = remainder[separator+1:]
@@ -261,8 +265,11 @@ func validVersion(version string) bool {
 	if strings.HasSuffix(remainder, "-") {
 		return false
 	}
+	if separator := strings.LastIndexByte(remainder, '-'); separator >= 0 && strings.ContainsRune(remainder[separator+1:], ':') {
+		return false
+	}
 	for _, character := range remainder {
-		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || strings.ContainsRune(".+~-", character) {
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || strings.ContainsRune(".:+~-", character) {
 			continue
 		}
 		return false

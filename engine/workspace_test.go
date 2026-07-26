@@ -424,7 +424,7 @@ func TestDebianSigningKeyRotationLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	trustSince, err := time.Parse(time.RFC3339, introductionReceipt.TrustSince)
+	trustSince, err := state.AuthoritativeDeploymentTrustSince(root, "debian", introductionReceipt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,28 @@ func TestDebianSigningKeyRotationLifecycle(t *testing.T) {
 	if _, err := RotateKey(context.Background(), RotateKeyRequest{Root: root, Repository: "debian", Advance: true, now: trustSince.Add(minimumRefresh)}); err == nil {
 		t.Fatal("uncommitted backdated deployment receipt authorized activation")
 	}
+	if output, err := exec.Command("git", "-C", root, "add", "deployments/debian.json").CombinedOutput(); err != nil {
+		t.Fatalf("stage forged receipt: %v: %s", err, output)
+	}
+	forgedCommit := exec.Command("git", "-C", root, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "backdate deployment receipt")
+	if output, err := forgedCommit.CombinedOutput(); err != nil {
+		t.Fatalf("commit forged receipt: %v: %s", err, output)
+	}
+	if _, err := RotateKey(context.Background(), RotateKeyRequest{Root: root, Repository: "debian", Advance: true, now: trustSince.Add(2 * minimumRefresh)}); err == nil {
+		t.Fatal("normally committed backdated receipt authorized activation")
+	}
 	if err := os.WriteFile(receiptPath, receiptContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", root, "add", "deployments/debian.json").CombinedOutput(); err != nil {
+		t.Fatalf("stage restored receipt: %v: %s", err, output)
+	}
+	restoredCommit := exec.Command("git", "-C", root, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "record snailmail deployments", "-m", "Snailmail-Plan: "+introductionReceipt.PlanID)
+	if output, err := restoredCommit.CombinedOutput(); err != nil {
+		t.Fatalf("commit restored receipt: %v: %s", err, output)
+	}
+	trustSince, err = state.AuthoritativeDeploymentTrustSince(root, "debian", introductionReceipt)
+	if err != nil {
 		t.Fatal(err)
 	}
 	directManifest, err := state.LoadManifest(root)
@@ -514,7 +535,7 @@ func TestDebianSigningKeyRotationLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	activationTrustSince, err := time.Parse(time.RFC3339, activationReceipt.TrustSince)
+	activationTrustSince, err := state.AuthoritativeDeploymentTrustSince(root, "debian", activationReceipt)
 	if err != nil {
 		t.Fatal(err)
 	}

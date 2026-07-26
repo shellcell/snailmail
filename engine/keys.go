@@ -259,8 +259,8 @@ func AuditKeys(request PublishKeyRequest, now time.Time) (KeyAuditResult, error)
 				findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "repo/" + name, Message: desiredErr.Error()})
 			} else if !deploymentSigningMatches(deployment, desired) {
 				findings = append(findings, KeyAuditFinding{Severity: "warning", Subject: "repo/" + name, Message: "rotation state has not been successfully deployed"})
-			} else if trustSince, parseErr := time.Parse(time.RFC3339, deployment.TrustSince); parseErr != nil {
-				findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "repo/" + name, Message: "deployment trust timestamp is invalid"})
+			} else if trustSince, authorityErr := state.AuthoritativeDeploymentTrustSince(root, name, deployment); authorityErr != nil {
+				findings = append(findings, KeyAuditFinding{Severity: "error", Subject: "repo/" + name, Message: authorityErr.Error()})
 			} else {
 				status.Deployed = true
 				earliest := trustSince.Add(time.Duration(deployment.SigningMinimumRefreshSeconds) * time.Second)

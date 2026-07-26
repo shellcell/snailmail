@@ -1190,8 +1190,10 @@ keyring and one active `InRelease` signer. Repository-local `promote` and `yank`
 now mutate exact placements, with each repository rendering only its configured
 track and Debian suite. Final visible-placement removal produces deterministic
 empty output without discarding package versions, blobs, or publication history.
-Additional backends, remaining operational commands, and format expansion remain
-subsequent Phase 3 slices.
+Placement-only `prune --keep N` now uses native PEP 440, Debian, and SemVer
+ordering per package/track/distro while deferring physical blob GC. Additional
+backends, remaining operational commands, and format expansion remain subsequent
+Phase 3 slices.
 
 **Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
 drift detection, then irreversible `target` operations for AUR, Homebrew,

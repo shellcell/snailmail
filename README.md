@@ -63,6 +63,22 @@ while retaining immutable package and blob records in Git. Debian defaults a
 new placement's distro to the configured suite; `--distro DISTRO` selects another
 distro coordinate explicitly.
 
+Retention pruning removes only older placements, independently per package,
+track, and distro, using native PEP 440, Debian, or SemVer precedence:
+
+```sh
+go run ./cmd/snailmail prune python --keep 5
+git add repos/python.lock.toml
+git commit -m "prune old Python placements"
+go run ./cmd/snailmail plan
+go run ./cmd/snailmail apply
+```
+
+Versions tied at the retention boundary are kept together. Prune does not remove
+package-version records, CAS objects, remote blobs, or publication history;
+physical blob GC remains a separate future operation with tombstones and a grace
+period.
+
 Signed Debian repositories use an encrypted private key outside the workspace
 and commit only canonical public forms. Set a passphrase through the environment
 (never an argument), generate the key, and reference it during setup:

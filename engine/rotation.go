@@ -94,7 +94,15 @@ func RotateKey(ctx context.Context, request RotateKeyRequest) (RotateKeyResult, 
 			return RotateKeyResult{}, err
 		}
 		requiresDeploy := !deploymentSigningMatches(deployment, desired)
-		return rotationResult(request.Repository, repository, deployment, requiresDeploy), nil
+		result := rotationResult(request.Repository, repository, requiresDeploy)
+		if !requiresDeploy {
+			trustSince, err := state.AuthoritativeDeploymentTrustSince(root, request.Repository, deployment)
+			if err != nil {
+				return RotateKeyResult{}, err
+			}
+			result.EarliestAdvance = trustSince.Add(time.Duration(rotation.MinimumRefreshSeconds) * time.Second).UTC().Format(time.RFC3339)
+		}
+		return result, nil
 	}
 	if request.Successor == repository.SigningKeys[0] {
 		return RotateKeyResult{}, errors.New("successor signing key must differ from the active key")
@@ -114,6 +122,9 @@ func RotateKey(ctx context.Context, request RotateKeyRequest) (RotateKeyResult, 
 	}
 	if deployment.NativeRevision == "" || !deploymentSigningMatches(deployment, stableState) {
 		return RotateKeyResult{}, errors.New("rotation requires the stable signing state to be successfully deployed")
+	}
+	if _, err := state.AuthoritativeDeploymentTrustSince(root, request.Repository, deployment); err != nil {
+		return RotateKeyResult{}, err
 	}
 	successorKey, exists := manifest.Keys[request.Successor]
 	var prepared *preparedSigningKey
@@ -168,7 +179,7 @@ func RotateKey(ctx context.Context, request RotateKeyRequest) (RotateKeyResult, 
 		return RotateKeyResult{}, err
 	}
 	committed = true
-	return rotationResult(request.Repository, repository, state.DeploymentRecord{}, true), nil
+	return rotationResult(request.Repository, repository, true), nil
 }
 
 func advanceKeyRotation(root, repositoryName string, now time.Time) (RotateKeyResult, error) {
@@ -198,7 +209,7 @@ func advanceKeyRotation(root, repositoryName string, now time.Time) (RotateKeyRe
 			return RotateKeyResult{}, err
 		}
 		requiresDeploy := !deploymentSigningMatches(deployment, desired)
-		return rotationResult(repositoryName, repository, deployment, requiresDeploy), nil
+		return rotationResult(repositoryName, repository, requiresDeploy), nil
 	}
 	desired, err := repositoryDeploymentSigningState(repository, manifest.Keys)
 	if err != nil {
@@ -207,9 +218,9 @@ func advanceKeyRotation(root, repositoryName string, now time.Time) (RotateKeyRe
 	if !deploymentSigningMatches(deployment, desired) {
 		return RotateKeyResult{}, errors.New("current signing rotation state has not been successfully deployed")
 	}
-	trustSince, err := time.Parse(time.RFC3339, deployment.TrustSince)
+	trustSince, err := state.AuthoritativeDeploymentTrustSince(root, repositoryName, deployment)
 	if err != nil {
-		return RotateKeyResult{}, errors.New("deployment receipt has invalid trust timestamp")
+		return RotateKeyResult{}, err
 	}
 	earliest := trustSince.Add(time.Duration(repository.SigningRotation.MinimumRefreshSeconds) * time.Second)
 	if now.Before(earliest) {
@@ -232,7 +243,7 @@ func advanceKeyRotation(root, repositoryName string, now time.Time) (RotateKeyRe
 	if err := state.WriteManifest(root, manifest); err != nil {
 		return RotateKeyResult{}, err
 	}
-	return rotationResult(repositoryName, repository, deployment, true), nil
+	return rotationResult(repositoryName, repository, true), nil
 }
 
 func validateRotationAdvanceValidity(repository state.Repository, keys map[string]state.SigningKey, now time.Time) error {
@@ -256,19 +267,14 @@ func validateRotationAdvanceValidity(repository state.Repository, keys map[strin
 	return nil
 }
 
-func rotationResult(repositoryName string, repository state.Repository, deployment state.DeploymentRecord, requiresDeploy bool) RotateKeyResult {
-	active, trusted, phase, minimum, _ := repositorySigningState(repository)
+func rotationResult(repositoryName string, repository state.Repository, requiresDeploy bool) RotateKeyResult {
+	active, trusted, phase, _, _ := repositorySigningState(repository)
 	result := RotateKeyResult{
 		Repository: repositoryName, ActiveKey: active, TrustedKeys: trusted, Phase: phase, RequiresDeploy: requiresDeploy,
 	}
 	if repository.SigningRotation != nil {
 		result.PreviousKey = repository.SigningKeys[0]
 		result.SuccessorKey = repository.SigningRotation.SuccessorKey
-		if deployment.TrustSince != "" {
-			if trustSince, err := time.Parse(time.RFC3339, deployment.TrustSince); err == nil {
-				result.EarliestAdvance = trustSince.Add(time.Duration(minimum) * time.Second).UTC().Format(time.RFC3339)
-			}
-		}
 	} else {
 		result.Phase = "stable"
 	}

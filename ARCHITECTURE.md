@@ -530,6 +530,19 @@ configured track. Debian also requires the placement distro to match its suite;
 coordinates for other views remain desired state but cannot leak into the
 configured output.
 
+`prune --keep N` applies ecosystem-native version precedence independently to
+each `(package, track, distro)` partition and removes only placements older than
+the retained cohort. Equal-precedence versions at the cutoff are retained
+together. Package-version records, local and remote blobs, and publication
+history remain GC roots; prune performs no physical deletion.
+
+Git-authoritative controls protect reviewed automation from stale, accidental,
+or partially applied state; they do not treat a repository administrator as an
+adversary. An operator who can rewrite Git metadata, access signing keys, and
+write the publication host can impersonate apply or publish outside snailmail.
+Preventing that requires externally enforced protected branches, approval
+policies, hardware or remote signing, and provider audit logs.
+
 ### 8.1 Artifact ingestion
 
 `snailmail add` performs this transaction:

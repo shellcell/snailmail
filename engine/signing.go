@@ -366,7 +366,7 @@ func validateRotationKeyValidity(repository state.Repository, keys map[string]st
 	return nil
 }
 
-func validateRepositorySigningTransition(repository state.Repository, keys map[string]state.SigningKey, deployment state.DeploymentRecord, observed host.PublishedRevision, at time.Time) error {
+func validateRepositorySigningTransition(repository state.Repository, keys map[string]state.SigningKey, deployment state.DeploymentRecord, observed host.PublishedRevision, at, trustNotBefore time.Time) error {
 	desired, err := repositoryDeploymentSigningState(repository, keys)
 	if err != nil {
 		return err
@@ -398,9 +398,8 @@ func validateRepositorySigningTransition(repository state.Repository, keys map[s
 		return nil
 	}
 	transitionReady := func() bool {
-		trustSince, parseErr := time.Parse(time.RFC3339, deployment.TrustSince)
-		return parseErr == nil && deployment.SigningMinimumRefreshSeconds >= state.MinimumSigningRefreshSeconds &&
-			!at.Before(trustSince.Add(time.Duration(deployment.SigningMinimumRefreshSeconds)*time.Second))
+		return !trustNotBefore.IsZero() && deployment.SigningMinimumRefreshSeconds >= state.MinimumSigningRefreshSeconds &&
+			!at.Before(trustNotBefore.Add(time.Duration(deployment.SigningMinimumRefreshSeconds)*time.Second))
 	}
 	switch desired.phase {
 	case "introducing":

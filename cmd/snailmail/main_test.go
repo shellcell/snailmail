@@ -70,6 +70,21 @@ func TestPlacementCommandsRequireUnambiguousCoordinates(t *testing.T) {
 	}
 }
 
+func TestPruneRequiresPositiveRetention(t *testing.T) {
+	for _, arguments := range [][]string{
+		{"prune"},
+		{"prune", "python"},
+		{"prune", "python", "--keep", "0"},
+		{"prune", "python", "--keep", "-1"},
+		{"prune", "python", "--keep", "2", "extra"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if err := run(context.Background(), arguments, &stdout, &stderr); err == nil {
+			t.Fatalf("prune arguments unexpectedly accepted: %v", arguments)
+		}
+	}
+}
+
 func TestDebBuildAndVerifyOutputUsesProductIcons(t *testing.T) {
 	input := t.TempDir()
 	if _, err := testutil.WriteDeb(input, "snail-demo", "1.2.3-1", "amd64", nil); err != nil {
