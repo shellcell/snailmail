@@ -1,6 +1,7 @@
 package state
 
 import (
+	"github.com/shellcell/snailmail/formats"
 	"testing"
 
 	"github.com/shellcell/snailmail/internal/factscache"
@@ -19,7 +20,7 @@ func BenchmarkRepeatedBlobValidation(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	blob, err := PutArtifact(root, "deb", source)
+	blob, err := PutArtifact(root, "deb", source, formats.Identity{})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -29,7 +30,7 @@ func BenchmarkRepeatedBlobValidation(b *testing.B) {
 		factscache.Reset()
 		// Four validations, as one apply performs.
 		for range 4 {
-			if _, _, err := LoadBlob(root, "deb", locked); err != nil {
+			if _, _, err := LoadBlob(root, "deb", locked, formats.Identity{}); err != nil {
 				b.Fatal(err)
 			}
 		}

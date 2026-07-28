@@ -1,6 +1,7 @@
 package state
 
 import (
+	"github.com/shellcell/snailmail/formats"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,7 +19,7 @@ func TestLoadBlobRejectsCASDirectorySymlinkedOutOfWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blob, err := PutArtifact(root, "pypi", source)
+	blob, err := PutArtifact(root, "pypi", source, formats.Identity{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +34,7 @@ func TestLoadBlobRejectsCASDirectorySymlinkedOutOfWorkspace(t *testing.T) {
 	if err := os.Symlink(relocated, shard); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := LoadBlob(root, "pypi", locked); err == nil {
+	if _, _, err := LoadBlob(root, "pypi", locked, formats.Identity{}); err == nil {
 		t.Fatal("a CAS shard symlinked out of the workspace was accepted")
 	}
 }
@@ -46,7 +47,7 @@ func TestLoadBlobRejectsBlobThatIsItselfASymlink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blob, err := PutArtifact(root, "pypi", source)
+	blob, err := PutArtifact(root, "pypi", source, formats.Identity{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +61,7 @@ func TestLoadBlobRejectsBlobThatIsItselfASymlink(t *testing.T) {
 	if err := os.Symlink(relocated, stored); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := LoadBlob(root, "pypi", locked); err == nil {
+	if _, _, err := LoadBlob(root, "pypi", locked, formats.Identity{}); err == nil {
 		t.Fatal("a CAS object that is a symlink was accepted")
 	}
 }

@@ -73,7 +73,11 @@ type AddArtifactsRequest struct {
 	Repository string
 	Artifacts  []string
 	Track      string
-	Blobs      blob.Resolver
+	// Name and Version supply identity for a format whose artifacts carry none,
+	// such as a release tarball. Formats that name themselves reject them.
+	Name    string
+	Version string
+	Blobs   blob.Resolver
 }
 
 type ConfigureBlobStoreRequest struct {
@@ -240,6 +244,10 @@ func AddArtifacts(request AddArtifactsRequest) (AddArtifactsResult, error) {
 	if !exists {
 		return AddArtifactsResult{}, fmt.Errorf("repository %q is not configured", request.Repository)
 	}
+	selectedFormat, err := formats.For(repository.Format)
+	if err != nil {
+		return AddArtifactsResult{}, err
+	}
 	lock, err := state.LoadLock(root, repository)
 	if err != nil {
 		return AddArtifactsResult{}, err
@@ -265,13 +273,19 @@ func AddArtifacts(request AddArtifactsRequest) (AddArtifactsResult, error) {
 	result := AddArtifactsResult{Repository: request.Repository}
 	packages := make(map[string]bool)
 	for _, artifact := range request.Artifacts {
-		blob, err := state.PutArtifact(root, repository.Format, artifact)
+		// What the operator typed goes to the format unfiltered. IdentityFor is
+		// for replaying an identity a lock already records; using it here would
+		// drop --name and --version for formats that read identity from bytes,
+		// turning a rejection an operator needs to see into a silent no-op.
+		blob, err := state.PutArtifact(root, repository.Format, artifact,
+			formats.Identity{Name: request.Name, Version: request.Version})
 		if err != nil {
 			return AddArtifactsResult{}, err
 		}
 		if blobStore != nil {
 			locked := state.ToLockedBlob(blob)
-			_, name, err := state.LoadBlob(root, repository.Format, locked)
+			_, name, err := state.LoadBlob(root, repository.Format, locked,
+				formats.IdentityFor(selectedFormat, blob.Facts.Name, blob.Facts.Version))
 			if err != nil {
 				return AddArtifactsResult{}, err
 			}
@@ -372,13 +386,18 @@ func ConfigureBlobStore(ctx context.Context, request ConfigureBlobStoreRequest) 
 		if err := state.ValidateLock(lock, name, repository.Format); err != nil {
 			return err
 		}
+		migratingFormat, err := formats.For(repository.Format)
+		if err != nil {
+			return err
+		}
 		for _, packageVersion := range lock.PackageVersion {
 			for _, locked := range packageVersion.Blobs {
 				if seen[locked.SHA256] {
 					continue
 				}
 				seen[locked.SHA256] = true
-				_, blobName, err := state.EnsureBlob(ctx, root, repository.Format, locked, sourceStore)
+				_, blobName, err := state.EnsureBlob(ctx, root, repository.Format, locked, sourceStore,
+					formats.IdentityFor(migratingFormat, packageVersion.Package, packageVersion.Version))
 				if err != nil {
 					return err
 				}
@@ -1241,6 +1260,9 @@ func verifyEndpointClient(ctx context.Context, repository state.Repository, stag
 		}
 		_, _, err := app.VerifyDebClientEndpointAccess(ctx, staged, access, request.Runner, image, maximum)
 		return err
+	case "raw":
+		_, _, err := app.VerifyRawClientEndpointAccess(ctx, staged, access)
+		return err
 	default:
 		return fmt.Errorf("client verification is not implemented for format %q", repository.Format)
 	}
@@ -1255,14 +1277,26 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	if err != nil {
 		return BuildResult{}, err
 	}
+	selected, err := formats.For(repository.Format)
+	if err != nil {
+		return BuildResult{}, err
+	}
 	defer os.RemoveAll(input)
 	active := visiblePackageVersions(lock, repository)
+	// Formats that read identity out of the bytes are rebuilt from the input
+	// directory. Raw cannot be: its identity was supplied by an operator and
+	// lives in the lock, so the blobs are carried through directly.
+	var lockedBlobs []domain.Blob
+	lockedSources := make(map[string]string)
 	for _, packageVersion := range active {
 		for _, locked := range packageVersion.Blobs {
-			blob, source, err := state.EnsureBlob(ctx, root, repository.Format, locked, blobStore)
+			blob, source, err := state.EnsureBlob(ctx, root, repository.Format, locked, blobStore,
+				formats.IdentityFor(selected, packageVersion.Package, packageVersion.Version))
 			if err != nil {
 				return BuildResult{}, err
 			}
+			lockedBlobs = append(lockedBlobs, blob)
+			lockedSources[blob.SHA256] = source
 			if nativePackageName(repository.Format, blob.Facts.Name) != packageVersion.Package || blob.Facts.Version != packageVersion.Version {
 				return BuildResult{}, fmt.Errorf("blob %s disagrees with package version %s@%s", locked.SHA256, packageVersion.Package, packageVersion.Version)
 			}
@@ -1286,30 +1320,29 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		defer os.RemoveAll(temporary)
 		output = filepath.Join(temporary, "repository")
 	}
-	selected, err := formats.For(repository.Format)
-	if err != nil {
-		return BuildResult{}, err
-	}
 	if err := requireSigningSupport(selected, repository, plannedSigning); err != nil {
 		return BuildResult{}, err
 	}
-	if len(active) == 0 {
-		artifact, err := selected.Build(nil, formats.BuildOptions{
+	renderFromBlobs := func(blobs []domain.Blob, sources map[string]string) (BuildResult, error) {
+		artifact, err := selected.Build(blobs, formats.BuildOptions{
 			Repository: formatRepository(repository), GeneratedAt: generatedAt,
 		})
 		if err != nil {
 			return BuildResult{}, err
 		}
 		if !selected.ImplementsSigning() {
-			return materializeLockedArtifact(ctx, output, generatedAt, artifact)
+			return materializeLockedArtifact(ctx, output, generatedAt, artifact, sources)
 		}
 		artifact, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers)
 		if err != nil {
 			return BuildResult{}, err
 		}
-		result, materializeErr := materializeLockedArtifact(ctx, output, generatedAt, artifact)
+		result, materializeErr := materializeLockedArtifact(ctx, output, generatedAt, artifact, sources)
 		result.Signing = signing
 		return result, materializeErr
+	}
+	if len(active) == 0 {
+		return renderFromBlobs(nil, nil)
 	}
 	switch repository.Format {
 	case "pypi":
@@ -1325,6 +1358,8 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		return result, err
 	case "helm":
 		return BuildHelm(ctx, BuildHelmRequest{Input: input, Output: output, GeneratedAt: generatedAt})
+	case "raw":
+		return renderFromBlobs(lockedBlobs, lockedSources)
 	default:
 		return BuildResult{}, fmt.Errorf("unsupported repository format %q", repository.Format)
 	}
@@ -1362,16 +1397,18 @@ func requireSigningSupport(selected formats.Format, repository state.Repository,
 		return errors.New("PyPI repository cannot contain repository signing effects")
 	case "helm":
 		return errors.New("Helm repository signing is not implemented")
+	case "raw":
+		return errors.New("raw repositories have no signing scheme a client would check")
 	}
 	return fmt.Errorf("format %q cannot contain repository signing effects", selected.Name())
 }
 
-func materializeLockedArtifact(ctx context.Context, output string, generatedAt time.Time, artifact domain.RepositoryArtifact) (BuildResult, error) {
+func materializeLockedArtifact(ctx context.Context, output string, generatedAt time.Time, artifact domain.RepositoryArtifact, sources map[string]string) (BuildResult, error) {
 	artifact, manifest, err := buildgraph.Finalize(artifact, generatedAt)
 	if err != nil {
 		return BuildResult{}, err
 	}
-	if err := app.Materialize(ctx, output, artifact, nil); err != nil {
+	if err := app.Materialize(ctx, output, artifact, sources); err != nil {
 		return BuildResult{}, err
 	}
 	manifestSHA256, err := state.HashFile(filepath.Join(output, buildgraph.ManifestFilename))
@@ -1486,6 +1523,9 @@ func verifyStaged(ctx context.Context, format, repository string, request ApplyW
 		return result.Manifest, err
 	case "helm":
 		result, err := VerifyHelm(ctx, VerifyHelmRequest{Repository: repository, Runner: request.Runner, Image: request.HelmImage, StructuralOnly: request.StructuralOnly})
+		return result.Manifest, err
+	case "raw":
+		result, err := VerifyRaw(VerifyRawRequest{Repository: repository})
 		return result.Manifest, err
 	default:
 		return buildgraph.RepositoryManifest{}, fmt.Errorf("unsupported repository format %q", format)

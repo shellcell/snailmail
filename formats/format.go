@@ -14,6 +14,7 @@
 package formats
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -23,8 +24,36 @@ import (
 	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/formats/raw"
 	"github.com/shellcell/snailmail/internal/domain"
 )
+
+// Identity is operator-supplied package identity, used only where an artifact
+// carries none of its own. It is empty for every format that reads identity
+// from bytes.
+type Identity struct {
+	Name    string
+	Version string
+}
+
+// Supplied reports whether any identity was given.
+func (identity Identity) Supplied() bool {
+	return identity.Name != "" || identity.Version != ""
+}
+
+// IdentityFor returns the identity to hand a format when re-deriving facts for
+// a package version already recorded in a lock.
+//
+// It is empty for formats that name themselves, which reject anything supplied.
+// For the rest it replays what was reviewed, so validation checks that the
+// bytes are unchanged rather than re-deciding an identity the operator already
+// chose and committed.
+func IdentityFor(selected Format, name, version string) Identity {
+	if selected == nil || selected.DerivesIdentityFromBytes() {
+		return Identity{}
+	}
+	return Identity{Name: name, Version: version}
+}
 
 // Artifact identifies one artifact within a package version, which is what a
 // format needs to decide whether two artifacts collide.
@@ -65,8 +94,18 @@ type Format interface {
 	// NormalizeName folds a package name to its canonical form. Formats
 	// without a folding rule return the name unchanged.
 	NormalizeName(name string) string
-	// Inspect derives package facts from the artifact bytes themselves.
-	Inspect(filename string, reader io.ReaderAt, size int64) (domain.PackageFacts, error)
+	// DerivesIdentityFromBytes reports whether the artifact names itself.
+	// Where it does, supplied identity is refused, so a caller can never
+	// relabel a wheel or a .deb into something a client would not agree with.
+	DerivesIdentityFromBytes() bool
+	// Inspect derives package facts from the artifact.
+	//
+	// Supplied identity is a last resort for formats whose artifacts carry no
+	// metadata. A format that reads identity out of the bytes must reject it:
+	// letting a caller relabel a wheel or a .deb would make the lock disagree
+	// with what any client sees, and it is the one thing this boundary exists
+	// to prevent.
+	Inspect(filename string, reader io.ReaderAt, size int64, supplied Identity) (domain.PackageFacts, error)
 	// CompareVersions orders two native version strings.
 	CompareVersions(left, right string) (int, error)
 
@@ -95,6 +134,7 @@ var registry = map[string]Format{
 	"pypi": pypiFormat{},
 	"deb":  debFormat{},
 	"helm": helmFormat{},
+	"raw":  rawFormat{},
 }
 
 // For returns the format registered under name.
@@ -141,7 +181,11 @@ func (pypiFormat) NormalizeName(n string) string    { return pypi.NormalizeName(
 func (pypiFormat) CompareVersions(l, r string) (int, error) {
 	return pypi.CompareVersions(l, r)
 }
-func (pypiFormat) Inspect(filename string, reader io.ReaderAt, size int64) (domain.PackageFacts, error) {
+func (pypiFormat) DerivesIdentityFromBytes() bool { return true }
+func (pypiFormat) Inspect(filename string, reader io.ReaderAt, size int64, supplied Identity) (domain.PackageFacts, error) {
+	if supplied.Supplied() {
+		return domain.PackageFacts{}, errors.New("PyPI identity comes from wheel or source-distribution metadata and cannot be supplied")
+	}
 	return pypi.Inspect(filename, reader, size)
 }
 
@@ -170,7 +214,11 @@ func (debFormat) NormalizeName(n string) string { return n }
 func (debFormat) CompareVersions(l, r string) (int, error) {
 	return deb.CompareVersions(l, r)
 }
-func (debFormat) Inspect(filename string, reader io.ReaderAt, size int64) (domain.PackageFacts, error) {
+func (debFormat) DerivesIdentityFromBytes() bool { return true }
+func (debFormat) Inspect(filename string, reader io.ReaderAt, size int64, supplied Identity) (domain.PackageFacts, error) {
+	if supplied.Supplied() {
+		return domain.PackageFacts{}, errors.New("Debian identity comes from its control file and cannot be supplied")
+	}
 	return deb.Inspect(filename, reader, size)
 }
 
@@ -214,7 +262,11 @@ func (helmFormat) NormalizeName(n string) string    { return n }
 func (helmFormat) CompareVersions(l, r string) (int, error) {
 	return helm.CompareVersions(l, r)
 }
-func (helmFormat) Inspect(filename string, reader io.ReaderAt, size int64) (domain.PackageFacts, error) {
+func (helmFormat) DerivesIdentityFromBytes() bool { return true }
+func (helmFormat) Inspect(filename string, reader io.ReaderAt, size int64, supplied Identity) (domain.PackageFacts, error) {
+	if supplied.Supplied() {
+		return domain.PackageFacts{}, errors.New("Helm identity comes from its Chart.yaml and cannot be supplied")
+	}
 	return helm.Inspect(filename, reader, size)
 }
 
@@ -232,7 +284,44 @@ func (helmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.Repos
 
 // Compile-time proof that every registered value satisfies the interface.
 var (
+	_ Format = rawFormat{}
 	_ Format = pypiFormat{}
 	_ Format = debFormat{}
 	_ Format = helmFormat{}
 )
+
+// rawFormat serves artifacts with no ecosystem metadata: release tarballs,
+// static binaries, installers.
+type rawFormat struct{}
+
+func (rawFormat) Name() string                     { return "raw" }
+func (rawFormat) ID() string                       { return raw.FormatID }
+func (rawFormat) MaxArtifactSize() int64           { return raw.MaxArtifactSize }
+func (rawFormat) IsArtifactFilename(n string) bool { return raw.IsArtifactFilename(n) }
+
+// Raw names are already the operator's chosen identity; there is no ecosystem
+// folding rule to apply.
+func (rawFormat) NormalizeName(n string) string { return n }
+func (rawFormat) CompareVersions(l, r string) (int, error) {
+	return raw.CompareVersions(l, r)
+}
+
+// Raw artifacts carry no metadata, so identity comes from the filename
+// convention or from the operator.
+func (rawFormat) DerivesIdentityFromBytes() bool { return false }
+func (rawFormat) Inspect(filename string, reader io.ReaderAt, size int64, supplied Identity) (domain.PackageFacts, error) {
+	return raw.Inspect(filename, reader, size, raw.Identity{Name: supplied.Name, Version: supplied.Version})
+}
+
+// A raw version holds one artifact per filename, so a release can carry a
+// binary per platform alongside its checksums.
+func (rawFormat) ArtifactCoordinate(artifact Artifact) string { return artifact.Filename }
+func (rawFormat) SupportsDistros() bool                       { return false }
+
+// Detached signatures over the listing are the documented raw scheme; they are
+// not implemented yet.
+func (rawFormat) ImplementsSigning() bool         { return false }
+func (rawFormat) CommitPaths(Repository) []string { return []string{"index.html", "SHA256SUMS"} }
+func (rawFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
+	return raw.Build(blobs, raw.BuildOptions{GeneratedAt: options.GeneratedAt})
+}

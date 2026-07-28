@@ -9,7 +9,8 @@ don't own** — AUR, Homebrew, nixpkgs, npmjs, PyPI, ghcr.
 
 **Status: Phase 2 complete; Phase 3 signing foundation implemented.** The current implementation
 builds, structurally verifies, serves, and client-tests deterministic static
-PyPI, Debian, and Helm repositories. Git-backed workspaces also support local
+PyPI, Debian, and Helm repositories, and publishes `raw` repositories of
+artifacts that carry no ecosystem metadata. Git-backed workspaces also support local
 `init`, `setup`, `add`, `plan`, and `apply` workflows with immutable blobs,
 reviewable plans, publication ledgers, and per-repository managed release
 switching. Replacement of an existing managed release needs an atomic
@@ -113,6 +114,33 @@ archive validity, and package identity. Use `--project` for PyPI artifacts and
 are explicitly reported as unverified in this initial slice. Runs inspect at
 most four artifacts, cap each expanded archive at 64 MiB, and stop after two
 minutes.
+
+`raw` repositories publish artifacts that carry no ecosystem metadata: release
+tarballs, static binaries, installers. Every other format reads a package name
+and version out of the bytes; raw cannot, so identity comes from the filename by
+convention, or from you when the convention does not apply.
+
+```sh
+go run ./cmd/snailmail setup raw --name tools --output public/tools
+
+# <name>_<version>[_<os>][_<arch>].<ext> is read without flags.
+go run ./cmd/snailmail add tools ./dist/ttysvg_0.1.2_linux_amd64.tar.gz
+
+# Anything else needs identity supplied, including a name with an underscore,
+# which cannot be told apart from an extra field.
+go run ./cmd/snailmail add --name ttysvg --version 0.2.0 tools ./dist/build-final.bin
+
+go run ./cmd/snailmail plan && go run ./cmd/snailmail apply
+go run ./cmd/snailmail verify raw --repo public/tools
+```
+
+Artifacts are published at `<name>/<version>/<filename>` beside a generated
+`SHA256SUMS` and `index.html`. Identity lives in the path on purpose: because
+it may have come from a flag rather than from the bytes, the published tree has
+to record it somewhere a later reader can check without knowing what was typed.
+`SHA256SUMS` is the interchange format — `sha256sum -c` verifies a raw
+repository with no snailmail present. Raw has no signing: it is not an
+ecosystem, so no client knows to check a signature.
 
 Signed Debian repositories use an encrypted private key outside the workspace
 and commit only canonical public forms. Set a passphrase through the environment

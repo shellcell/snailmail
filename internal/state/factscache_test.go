@@ -1,6 +1,7 @@
 package state
 
 import (
+	"github.com/shellcell/snailmail/formats"
 	"os"
 	"path/filepath"
 	"testing"
@@ -22,14 +23,14 @@ func TestLockedBlobValidationRejectsCorruptBytesDespiteCachedFacts(t *testing.T)
 		t.Fatal(err)
 	}
 
-	blob, err := PutArtifact(root, "pypi", source)
+	blob, err := PutArtifact(root, "pypi", source, formats.Identity{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	locked := ToLockedBlob(blob)
 
 	// Prime the memo through a successful validation.
-	if _, _, err := LoadBlob(root, "pypi", locked); err != nil {
+	if _, _, err := LoadBlob(root, "pypi", locked, formats.Identity{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, found := factscache.Lookup("pypi", locked.SHA256); !found {
@@ -44,7 +45,7 @@ func TestLockedBlobValidationRejectsCorruptBytesDespiteCachedFacts(t *testing.T)
 	if err := os.WriteFile(stored, []byte("not a wheel at all"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := LoadBlob(root, "pypi", locked); err == nil {
+	if _, _, err := LoadBlob(root, "pypi", locked, formats.Identity{}); err == nil {
 		t.Fatal("corrupt CAS object was accepted because facts were cached")
 	}
 }

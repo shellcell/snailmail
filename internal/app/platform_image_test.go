@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"runtime"
 	"testing"
@@ -24,10 +25,16 @@ func TestPlatformImageResolvesForeignArchitecture(t *testing.T) {
 	if runtime.GOARCH == "amd64" {
 		foreign = "linux/arm64"
 	}
-	reference, platformFlag := platformImage(context.Background(), runner,
+	reference, platformFlag, err := platformImage(context.Background(), runner,
 		"docker.io/library/debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818", foreign)
+	if errors.Is(err, ErrPlatformUnresolved) {
+		t.Skipf("%s cannot reach the registry to resolve the index: %v", runner, err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
 	if platformFlag {
-		t.Skipf("%s cannot inspect the manifest index; falling back to --platform", runner)
+		t.Fatalf("a digest-pinned index resolved to %s with --platform still set", reference)
 	}
 	t.Logf("resolved %s -> %s", foreign, reference)
 

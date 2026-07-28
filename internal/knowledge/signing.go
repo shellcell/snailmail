@@ -25,6 +25,10 @@ var signingRequirements = []SigningRequirement{
 	{Format: "nix", RepositorySigning: true, Algorithms: []string{"nix-ed25519"}, PublicForms: []string{"nix-public-key"}},
 	{Format: "npm", RepositorySigning: false},
 	{Format: "pypi", RepositorySigning: false},
+	// Loose files are not an ecosystem and define no repository signing scheme.
+	// A detached signature over SHA256SUMS is a convention an operator may adopt
+	// by hand, not a standard any client knows to check.
+	{Format: "raw", RepositorySigning: false},
 	{Format: "rpm", RepositorySigning: true, Algorithms: []string{"openpgp-rsa4096"}, PublicForms: []string{"openpgp-armored"}},
 }
 

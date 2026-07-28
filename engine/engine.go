@@ -10,6 +10,7 @@ import (
 	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/formats/raw"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
@@ -374,4 +375,26 @@ func uniquePackages(manifest buildgraph.RepositoryManifest) int {
 		packages[verification.Package] = true
 	}
 	return len(packages)
+}
+
+type VerifyRawRequest struct {
+	Repository string
+}
+
+// VerifyRaw checks a raw repository's listing, checksums and artifact bytes.
+// There is no ecosystem client to invoke, so structural verification is the
+// whole check and there is no separate client mode.
+func VerifyRaw(request VerifyRawRequest) (VerifyResult, error) {
+	manifest, err := app.VerifyRepository(request.Repository)
+	if err != nil {
+		return VerifyResult{}, err
+	}
+	if manifest.Format != raw.FormatID {
+		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, raw.FormatID)
+	}
+	return VerifyResult{
+		Format: manifest.Format, TreeSHA256: manifest.TreeSHA256,
+		FileCount: len(manifest.Files), InstalledCases: len(manifest.VerificationCases),
+		Manifest: manifest,
+	}, nil
 }

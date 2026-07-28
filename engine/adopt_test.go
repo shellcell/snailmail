@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"github.com/shellcell/snailmail/formats"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -71,7 +72,7 @@ func TestAdoptArtifactPinsOriginAndSupportsDryRun(t *testing.T) {
 	if lock.SchemaVersion != state.LockSchema || locked.Origin == nil || locked.Origin.URL != origin || locked.SHA256 != digestText {
 		t.Fatalf("adopted lock %#v", lock)
 	}
-	if _, _, err := state.LoadBlob(root, "pypi", locked); err != nil {
+	if _, _, err := state.LoadBlob(root, "pypi", locked, formats.Identity{}); err != nil {
 		t.Fatalf("adopted CAS blob: %v", err)
 	}
 	commitWorkspace(t, root, "record adopted artifact")
@@ -98,7 +99,7 @@ func TestAdoptArtifactPinsOriginAndSupportsDryRun(t *testing.T) {
 	if err != nil || repeated.Changed {
 		t.Fatalf("repeated adopt=%#v err=%v", repeated, err)
 	}
-	if _, _, err := state.LoadBlob(root, "pypi", locked); err != nil {
+	if _, _, err := state.LoadBlob(root, "pypi", locked, formats.Identity{}); err != nil {
 		t.Fatalf("repeated adopt did not restore CAS: %v", err)
 	}
 	checked, err := CheckWorkspace(context.Background(), CheckWorkspaceRequest{Root: root, Origins: true, Sources: fetcher})

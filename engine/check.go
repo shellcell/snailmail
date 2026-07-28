@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/shellcell/snailmail/blob"
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/source"
@@ -87,6 +88,10 @@ func CheckWorkspace(ctx context.Context, request CheckWorkspaceRequest) (CheckWo
 	}
 	for _, repositoryName := range state.RepositoryNames(manifest) {
 		repository := manifest.Repositories[repositoryName]
+		selectedFormat, err := formats.For(repository.Format)
+		if err != nil {
+			return CheckWorkspaceResult{}, err
+		}
 		lock, err := state.LoadLock(root, repository)
 		if err != nil {
 			return CheckWorkspaceResult{}, err
@@ -117,7 +122,8 @@ func CheckWorkspace(ctx context.Context, request CheckWorkspaceRequest) (CheckWo
 				if storeErr != nil {
 					checkErr = authorityFetchError{err: storeErr}
 				} else {
-					validated, checkErr = checkLockedBlob(ctx, root, repository.Format, locked, store)
+					validated, checkErr = checkLockedBlob(ctx, root, repository.Format, locked, store,
+						formats.IdentityFor(selectedFormat, packageVersion.Package, packageVersion.Version))
 				}
 				if checkErr != nil {
 					if ctx.Err() != nil {
@@ -231,12 +237,12 @@ func checkLockedOrigin(ctx context.Context, locked state.LockedBlob, fetcher sou
 	return nil
 }
 
-func checkLockedBlob(ctx context.Context, root, format string, locked state.LockedBlob, store blob.Store) (domain.Blob, error) {
+func checkLockedBlob(ctx context.Context, root, format string, locked state.LockedBlob, store blob.Store, supplied formats.Identity) (domain.Blob, error) {
 	if err := state.ValidateLockedBlobReference(format, locked); err != nil {
 		return domain.Blob{}, err
 	}
 	if store == nil {
-		validated, _, err := state.LoadBlobContext(ctx, root, format, locked)
+		validated, _, err := state.LoadBlobContext(ctx, root, format, locked, supplied)
 		return validated, err
 	}
 	temporary, err := os.CreateTemp("", ".snailmail-check-*")
@@ -266,7 +272,7 @@ func checkLockedBlob(ctx context.Context, root, format string, locked state.Lock
 		_ = temporary.Close()
 		return domain.Blob{}, fmt.Errorf("%w: seek checked blob: %v", blob.ErrUnavailable, err)
 	}
-	validated, err := state.ValidateLockedBlobOpenContext(ctx, temporary, info, name, format, locked)
+	validated, err := state.ValidateLockedBlobOpenContext(ctx, temporary, info, name, format, locked, supplied)
 	if err != nil {
 		return domain.Blob{}, err
 	}

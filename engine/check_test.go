@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/shellcell/snailmail/formats"
 	"io"
 	"os"
 	"os/exec"
@@ -61,7 +62,7 @@ func TestCheckWorkspaceAuditsPlacedAndUnplacedArtifacts(t *testing.T) {
 	if _, err := Yank(PlacementMutationRequest{Root: root, Repository: "pypi", Package: pyLock.PackageVersion[0].Package, Version: pyLock.PackageVersion[0].Version, All: true}); err != nil {
 		t.Fatal(err)
 	}
-	_, missingName, err := state.LoadBlob(root, "pypi", pyLock.PackageVersion[0].Blobs[0])
+	_, missingName, err := state.LoadBlob(root, "pypi", pyLock.PackageVersion[0].Blobs[0], formats.Identity{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +73,7 @@ func TestCheckWorkspaceAuditsPlacedAndUnplacedArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, changedName, err := state.LoadBlob(root, "helm", helmLock.PackageVersion[0].Blobs[0])
+	_, changedName, err := state.LoadBlob(root, "helm", helmLock.PackageVersion[0].Blobs[0], formats.Identity{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +118,7 @@ func TestCheckWorkspaceReadsRemoteAuthorityWithoutFillingCAS(t *testing.T) {
 		t.Fatal(err)
 	}
 	locked := lock.PackageVersion[0].Blobs[0]
-	_, localName, err := state.LoadBlob(root, "pypi", locked)
+	_, localName, err := state.LoadBlob(root, "pypi", locked, formats.Identity{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -494,7 +494,7 @@ This table is the tool's core competence and belongs in code, not documentation.
 | **pypi** | ✅ | PEP 503 HTML / PEP 691 JSON | none — PyPI dropped GPG in 2023 | 1 |
 | **deb** | ✅ | `dists/*/Packages`, `pool/` | `InRelease` + `Release.gpg`, binary keyring | 1 |
 | **helm** | ✅ | `index.yaml` + `.tgz` | `.prov` (GPG) | 1 |
-| **raw** | ✅ | generated listing + `SHA256SUMS` | detached sigs | 1 |
+| **raw** | ✅ | generated listing + `SHA256SUMS` | none — not an ecosystem, no client checks a signature | 1 |
 | **rpm** | ✅ | `repodata/repomd.xml` | `repomd.xml.asc` + per-RPM `--addsign` | 1 |
 | **apk** | ✅ | `APKINDEX.tar.gz` | RSA only, filename is load-bearing | 1 |
 | **cargo** | ✅ | sparse index | none | 2 |
@@ -802,7 +802,7 @@ thing talk to":
 
 | Driver | Responsibility | Today / representative targets |
 |---|---|---|
-| **Format** | index generation, versions, names, deps | pypi, deb, helm; then raw, rpm, apk (§5 tiers) |
+| **Format** | index generation, versions, names, deps | pypi, deb, helm, raw; then rpm, apk (§5 tiers) |
 | **Source** | watch releases, fetch bytes | pinned HTTPS fetch; watch awaits the Release model |
 | **BlobStore** | content-addressed bytes | local CAS, S3-compatible; ORAS/registry later |
 | **Host** | where a built tree lands | local dir, S3-compatible, GitHub Pages; rsync/registry later |
@@ -1172,12 +1172,12 @@ rotation, plan-resolved deterministic signatures verified through apt
 `signed-by`, and `promote`/`yank`/`prune`/`check`/`status`/`doctor`/`adopt`.
 `README.md` records the exact surface.
 
-One sequencing debt is now visible and is the next slice, not a footnote:
-remote hosts serve PyPI only, so a signed Debian repository can publish only to
-a local directory. Format breadth and host breadth are coupled through that
-matrix; a signed apt repository that cannot be served remotely is most of the
-Phase 3 value still owed. Remaining after that: additional key backends,
-raw/rpm/apk, `import`, and the TUI.
+The format-and-host coupling that this phase owed is now closed for its first
+cases: GitHub Pages serves signed Debian and raw alongside PyPI, and `raw`
+publishes artifacts that carry no ecosystem metadata. The matrix itself is
+declared in `host/support.go` rather than inferred, so the gaps that remain are
+readable rather than discovered. Remaining: S3 beyond PyPI, additional key
+backends, rpm/apk, `import`, and the TUI.
 
 **Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
 drift detection, then irreversible `target` operations for AUR, Homebrew,

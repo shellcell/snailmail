@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/shellcell/snailmail/formats"
 	"io"
 	"os"
 	"os/exec"
@@ -1379,7 +1380,7 @@ func TestPutArtifactRejectsCorruptExistingCASObject(t *testing.T) {
 	root := t.TempDir()
 	initializeRepository(t, root, "pypi")
 	artifact := workspaceArtifact(t, root, "pypi", "1.2.3")
-	blob, err := state.PutArtifact(root, "pypi", artifact)
+	blob, err := state.PutArtifact(root, "pypi", artifact, formats.Identity{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1390,7 +1391,7 @@ func TestPutArtifactRejectsCorruptExistingCASObject(t *testing.T) {
 	if err := os.WriteFile(stored, make([]byte, blob.Size), 0o444); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := state.PutArtifact(root, "pypi", artifact); err == nil {
+	if _, err := state.PutArtifact(root, "pypi", artifact, formats.Identity{}); err == nil {
 		t.Fatal("expected corrupt existing CAS object to be rejected")
 	}
 }

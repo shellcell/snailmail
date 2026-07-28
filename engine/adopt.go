@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/source"
 )
@@ -21,11 +22,14 @@ import (
 const maximumAdoptBytes = 128 << 20
 
 type AdoptArtifactRequest struct {
-	Root         string
-	Repository   string
-	URL          string
-	SHA256       string
-	Filename     string
+	Root       string
+	Repository string
+	URL        string
+	SHA256     string
+	Filename   string
+	// Name and Version supply identity for a format whose artifacts carry none.
+	Name         string
+	Version      string
 	Track        string
 	Distro       string
 	DryRun       bool
@@ -131,7 +135,7 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	if hex.EncodeToString(actualDigest[:]) != request.SHA256 {
 		return AdoptArtifactResult{}, errors.New("adopted artifact does not match the required SHA-256")
 	}
-	blob, err := state.InspectArtifactBytes(repository.Format, filename, response.Body)
+	blob, err := state.InspectArtifactBytes(repository.Format, filename, response.Body, adoptIdentity(repository.Format, request))
 	if err != nil {
 		return AdoptArtifactResult{}, err
 	}
@@ -180,7 +184,7 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	if err := os.WriteFile(temporaryName, response.Body, 0o600); err != nil {
 		return AdoptArtifactResult{}, err
 	}
-	stored, err := state.PutArtifact(root, repository.Format, temporaryName)
+	stored, err := state.PutArtifact(root, repository.Format, temporaryName, adoptIdentity(repository.Format, request))
 	if err != nil {
 		return AdoptArtifactResult{}, err
 	}
@@ -197,4 +201,15 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 		return AdoptArtifactResult{}, err
 	}
 	return result, nil
+}
+
+// adoptIdentity supplies identity for a format whose artifacts carry none.
+// Adoption selects one artifact by digest from a URL, so a raw artifact still
+// needs a name and version; they come from the same flags `add` uses.
+//
+// What the operator typed is passed through unfiltered so a format that reads
+// identity from the bytes rejects it. Filtering here would silently discard the
+// flags instead, leaving an operator believing they had renamed an artifact.
+func adoptIdentity(_ string, request AdoptArtifactRequest) formats.Identity {
+	return formats.Identity{Name: request.Name, Version: request.Version}
 }

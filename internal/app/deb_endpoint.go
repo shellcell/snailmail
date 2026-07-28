@@ -229,7 +229,10 @@ func verifyDebEndpointCase(ctx context.Context, runner, image, endpoint string, 
 	caseCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	memoryBytes := workspaceBytes + 512<<20
-	reference, platformFlag := platformImage(caseCtx, runner, image, platform)
+	reference, platformFlag, err := platformImage(caseCtx, runner, image, platform)
+	if err != nil {
+		return err
+	}
 	arguments := []string{
 		"run", "--rm", "--pull=missing",
 		"--read-only", "--memory=" + strconv.FormatInt(memoryBytes, 10), "--cpus=2", "--pids-limit=256",

@@ -73,11 +73,31 @@ func TestEveryFormatBoundsArtifactSize(t *testing.T) {
 	}
 }
 
-func TestEveryFormatRejectsUnrelatedFilenames(t *testing.T) {
+// Which extensions a format serves is its own business — raw deliberately
+// serves anything, which is the job it exists for. What no format may accept is
+// a name that is unsafe as a path or collides with generated metadata.
+func TestEveryFormatRejectsUnsafeFilenames(t *testing.T) {
 	for _, format := range All() {
-		for _, name := range []string{"", "README.md", "index.html", "../escape", "no-extension"} {
+		for _, name := range []string{"", ".", "..", "../escape", "nested/path", "back\\slash", "trailing/"} {
 			if format.IsArtifactFilename(name) {
-				t.Errorf("format %q accepted %q as an artifact filename", format.Name(), name)
+				t.Errorf("format %q accepted unsafe filename %q", format.Name(), name)
+			}
+		}
+	}
+}
+
+// An artifact may not occupy a path the build generates, or publishing it would
+// overwrite the index a client reads.
+func TestNoFormatAcceptsItsOwnGeneratedPaths(t *testing.T) {
+	repository := Repository{Suite: "stable", Component: "main", Architectures: []string{"amd64"}}
+	for _, format := range All() {
+		artifact, err := format.Build(nil, BuildOptions{Repository: repository, GeneratedAt: time.Unix(0, 0).UTC()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, file := range artifact.Files {
+			if format.IsArtifactFilename(file.Path) {
+				t.Errorf("format %q accepts %q as an artifact, which its build also generates", format.Name(), file.Path)
 			}
 		}
 	}

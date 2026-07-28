@@ -31,6 +31,7 @@ import (
 	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/formats/raw"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
@@ -139,6 +140,12 @@ func verifyRepository(root string) (buildgraph.RepositoryManifest, []domain.Blob
 	}
 	if manifest.Format == helm.FormatID {
 		blobs, err = verifyHelmStructure(absolute, manifest)
+		if err != nil {
+			return buildgraph.RepositoryManifest{}, nil, err
+		}
+	}
+	if manifest.Format == raw.FormatID {
+		blobs, err = verifyRawStructure(absolute, manifest)
 		if err != nil {
 			return buildgraph.RepositoryManifest{}, nil, err
 		}
@@ -567,7 +574,10 @@ func verifyDebCase(ctx context.Context, runner, image, snapshot string, workspac
 	caseCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	memoryBytes := workspaceBytes + 512<<20
-	reference, platformFlag := platformImage(caseCtx, runner, image, platform)
+	reference, platformFlag, err := platformImage(caseCtx, runner, image, platform)
+	if err != nil {
+		return err
+	}
 	arguments := []string{"run", "--rm", "--pull=missing", "--network=none"}
 	if platformFlag {
 		arguments = append(arguments, "--platform", platform)
@@ -1241,4 +1251,80 @@ func copyFile(sourceName, targetName string, expectedSize int64) error {
 		return closeDestinationErr
 	}
 	return closeSourceErr
+}
+
+// verifyRawStructure recomputes a raw repository from its published tree.
+//
+// Identity is read from the path rather than the filename, which is what makes
+// an operator-supplied name verifiable after publication: the build put it
+// there, so re-deriving it needs no access to the flags used at ingest.
+func verifyRawStructure(root string, manifest buildgraph.RepositoryManifest) ([]domain.Blob, error) {
+	var blobs []domain.Blob
+	for _, file := range manifest.Files {
+		if file.Path == "SHA256SUMS" || file.Path == "index.html" {
+			continue
+		}
+		parts := strings.Split(file.Path, "/")
+		if len(parts) != 3 {
+			return nil, fmt.Errorf("unexpected raw repository path %q", file.Path)
+		}
+		name, version, filename := parts[0], parts[1], parts[2]
+		if !raw.IsArtifactFilename(filename) {
+			return nil, fmt.Errorf("unexpected raw artifact filename %q", file.Path)
+		}
+		facts, err := raw.FactsFor(name, version, filename)
+		if err != nil {
+			return nil, fmt.Errorf("raw artifact %q: %w", file.Path, err)
+		}
+		blobs = append(blobs, domain.Blob{Filename: filename, Size: file.Size, SHA256: file.SHA256, Facts: facts})
+	}
+	generatedAt, err := time.Parse(time.RFC3339, manifest.GeneratedAt)
+	if err != nil {
+		return nil, err
+	}
+	expectedArtifact, err := raw.Build(blobs, raw.BuildOptions{GeneratedAt: generatedAt})
+	if err != nil {
+		return nil, fmt.Errorf("rebuild raw structure: %w", err)
+	}
+	_, expectedManifest, err := buildgraph.Finalize(expectedArtifact, generatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("finalize expected raw structure: %w", err)
+	}
+	expectedManifest.SchemaVersion = manifest.SchemaVersion
+	if !reflect.DeepEqual(expectedManifest, manifest) {
+		return nil, errors.New("raw listing or checksums do not match the published artifacts")
+	}
+	return blobs, nil
+}
+
+// VerifyRawClientEndpointAccess proves a host serves exactly the raw tree that
+// was reviewed.
+//
+// There is no client to run: a raw consumer fetches a URL and checks it against
+// SHA256SUMS. Fetching every route and comparing digests is that check, done
+// against the host rather than trusting it.
+func VerifyRawClientEndpointAccess(ctx context.Context, root string, access host.ClientAccess) (buildgraph.RepositoryManifest, int, error) {
+	if access.Credential != nil {
+		defer access.Credential.Destroy()
+	}
+	if _, err := validateClientEndpoint(access.Endpoint); err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
+	}
+	manifest, _, err := verifyRepository(root)
+	if err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
+	}
+	if manifest.Format != raw.FormatID {
+		return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("repository format is %q, not %q", manifest.Format, raw.FormatID)
+	}
+	if len(access.Routes) == 0 {
+		access.Routes, err = defaultClientRoutes(access.Endpoint, manifest.Files)
+		if err != nil {
+			return buildgraph.RepositoryManifest{}, 0, err
+		}
+	}
+	if err := awaitHostedBytes(ctx, access, "", "", false); err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
+	}
+	return manifest, len(manifest.VerificationCases), nil
 }

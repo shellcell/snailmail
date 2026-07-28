@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"github.com/shellcell/snailmail/formats"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,7 +57,7 @@ func TestPruneRetainsHistoryAndSupportsRepromotion(t *testing.T) {
 	}
 	for _, version := range lock.PackageVersion {
 		for _, blob := range version.Blobs {
-			_, name, err := state.LoadBlob(root, "pypi", blob)
+			_, name, err := state.LoadBlob(root, "pypi", blob, formats.Identity{})
 			if err != nil {
 				t.Fatal(err)
 			}

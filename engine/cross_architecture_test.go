@@ -2,10 +2,12 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"runtime"
 	"testing"
 
+	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/testutil"
 )
 
@@ -28,6 +30,11 @@ func TestVerifyDebInstallsForForeignArchitecture(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := VerifyDeb(context.Background(), VerifyDebRequest{Repository: output, Runner: runner})
+	if errors.Is(err, app.ErrPlatformUnresolved) {
+		// Selecting a foreign manifest out of a pinned index needs the registry;
+		// without it nothing was checked, so there is nothing to report.
+		t.Skipf("cannot resolve the %s image: %v", foreign, err)
+	}
 	if err != nil {
 		t.Fatalf("verifying a %s repository from %s failed: %v", foreign, runtime.GOARCH, err)
 	}

@@ -109,7 +109,7 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 
 func runSetup(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail setup <pypi|deb|helm> --name NAME --host <local|s3|github-pages> [host options]")
+		return errors.New("usage: snailmail setup <pypi|deb|helm|raw> --name NAME --host <local|s3|github-pages> [host options]")
 	}
 	format := args[0]
 	flags := newCommandFlags("setup "+format, stderr).withWorkspace().withJSON()
@@ -324,6 +324,8 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("add", stderr).withWorkspace().withJSON()
 	track := flags.String("track", "stable", "placement track")
+	name := flags.String("name", "", "package name, for formats whose artifacts carry none")
+	version := flags.String("version", "", "package version, for formats whose artifacts carry none")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -332,7 +334,7 @@ func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	}
 	result, err := engine.AddArtifacts(engine.AddArtifactsRequest{
 		Context: ctx, Root: flags.Root(), Repository: flags.Arg(0), Artifacts: flags.Args()[1:], Track: *track,
-		Blobs: wire.NewBlobResolver(),
+		Name: *name, Version: *version, Blobs: wire.NewBlobResolver(),
 	})
 	if err != nil {
 		return err
@@ -571,6 +573,8 @@ func runAdoptWithFetcher(ctx context.Context, args []string, stdout, stderr io.W
 	flags := newCommandFlags("adopt", stderr).withWorkspace()
 	digest := flags.String("sha256", "", "required artifact SHA-256 pin")
 	filename := flags.String("filename", "", "artifact filename override")
+	name := flags.String("name", "", "package name, for formats whose artifacts carry none")
+	version := flags.String("version", "", "package version, for formats whose artifacts carry none")
 	track := flags.String("track", "", "placement track")
 	distro := flags.String("distro", "", "Debian placement distribution")
 	dryRun := flags.Bool("dry-run", false, "validate without changing CAS or lock")
@@ -584,7 +588,7 @@ func runAdoptWithFetcher(ctx context.Context, args []string, stdout, stderr io.W
 	}
 	result, err := engine.AdoptArtifact(ctx, engine.AdoptArtifactRequest{
 		Root: flags.Root(), Repository: flags.Arg(0), URL: flags.Arg(1), SHA256: *digest,
-		Filename: *filename, Track: *track, Distro: *distro, DryRun: *dryRun, PublicOrigin: *publicOrigin, Fetcher: fetcher,
+		Filename: *filename, Name: *name, Version: *version, Track: *track, Distro: *distro, DryRun: *dryRun, PublicOrigin: *publicOrigin, Fetcher: fetcher,
 	})
 	if err != nil {
 		return err
@@ -917,7 +921,7 @@ func runBuildHelm(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail verify <pypi|deb|helm> [options]")
+		return errors.New("usage: snailmail verify <pypi|deb|helm|raw> [options]")
 	}
 	switch args[0] {
 	case "pypi":
@@ -926,6 +930,8 @@ func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return runVerifyDeb(ctx, args[1:], stdout, stderr)
 	case "helm":
 		return runVerifyHelm(ctx, args[1:], stdout, stderr)
+	case "raw":
+		return runVerifyRaw(args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown verify format %q", args[0])
 	}
@@ -1022,6 +1028,30 @@ func runVerifyHelm(ctx context.Context, args []string, stdout, stderr io.Writer)
 	return nil
 }
 
+// runVerifyRaw takes no runner or client flags: raw has no ecosystem client to
+// install with, so checking the tree against its own checksums is the whole
+// verification rather than a structural subset of one.
+func runVerifyRaw(args []string, stdout, stderr io.Writer) error {
+	flags := newCommandFlags("verify raw", stderr).withJSON()
+	repository := flags.String("repo", "", "generated repository directory")
+	if err := flags.parse(args); err != nil {
+		return err
+	}
+	result, err := engine.VerifyRaw(engine.VerifyRawRequest{Repository: *repository})
+	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  verified %d repository %s\n", result.FileCount, plural(result.FileCount, "file", "files"))
+	fmt.Fprintf(stdout, "✉️   listing and checksums cover %d package %s\n",
+		result.InstalledCases, plural(result.InstalledCases, "version", "versions"))
+	fmt.Fprintf(stdout, "    tree sha256:%s\n", result.TreeSHA256)
+	return nil
+}
+
 func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("serve", stderr)
 	repository := flags.String("repo", "", "generated repository directory")
@@ -1079,9 +1109,9 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
-	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm> --name NAME --output DIR")
+	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw> --name NAME --output DIR")
 	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]")
-	fmt.Fprintln(output, "  snailmail add REPOSITORY ARTIFACT...")
+	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail prune REPOSITORY --keep N")
@@ -1106,6 +1136,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail verify pypi --repo DIR [--python python3]")
 	fmt.Fprintln(output, "  snailmail verify deb --repo DIR [--runner podman]")
 	fmt.Fprintln(output, "  snailmail verify helm --repo DIR [--runner podman]")
+	fmt.Fprintln(output, "  snailmail verify raw --repo DIR")
 	fmt.Fprintln(output, "  snailmail serve --repo DIR [--listen 127.0.0.1:8080]")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Every command that reports a result accepts --json.")
