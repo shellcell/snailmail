@@ -853,6 +853,16 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if access.Endpoint == "" {
 			access.Endpoint = item.hostStage.PreviewEndpoint
 		}
+		if access.Endpoint == "" {
+			// No preview site was configured, so there is no endpoint to install
+			// from before production changes. The staged tree is still checked by
+			// a real client, exactly as a local host is; what is not checked is
+			// that the host serves it correctly, which is what a preview buys.
+			if _, err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
+				return ApplyWorkspaceResult{}, err
+			}
+			continue
+		}
 		if err := verifyEndpointClient(ctx, item.repository, item.stage, access, request); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}

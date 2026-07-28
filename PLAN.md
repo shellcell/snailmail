@@ -1179,6 +1179,12 @@ declared in `host/support.go` rather than inferred, so the gaps that remain are
 readable rather than discovered. Remaining: S3 beyond PyPI, additional key
 backends, rpm/apk, `import`, and the TUI.
 
+A Pages repository needs a companion preview site only where a gate waits for a
+human to review one. Under an `auto` gate the preview is optional, and its
+absence is a stated trade: the staged tree is still verified by a real client,
+but against the tree itself rather than against a served endpoint, so nothing
+checks that the host serves it correctly until it is live.
+
 **Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
 drift detection, then irreversible `target` operations for AUR, Homebrew,
 nixpkgs, ghcr, and npmjs/PyPI uploads. Every target uses explicit gates,

@@ -145,13 +145,16 @@ func (adapter *Adapter) Stage(ctx context.Context, repository host.Repository, r
 	if err := workspace.ensureRef(ctx, production, stageRef, commit); err != nil {
 		return host.StagedPublication{}, err
 	}
-	preview := adapter.remote(repository.PreviewRepository)
-	if err := workspace.replaceRef(ctx, preview, branchRef(repository.PreviewBranch), commit); err != nil {
-		return host.StagedPublication{}, err
-	}
-	routes, err := clientRoutes(repository.PreviewEndpoint, request.Files)
-	if err != nil {
-		return host.StagedPublication{}, err
+	var routes []host.ClientRoute
+	if previewConfigured(repository) {
+		preview := adapter.remote(repository.PreviewRepository)
+		if err := workspace.replaceRef(ctx, preview, branchRef(repository.PreviewBranch), commit); err != nil {
+			return host.StagedPublication{}, err
+		}
+		routes, err = clientRoutes(repository.PreviewEndpoint, request.Files)
+		if err != nil {
+			return host.StagedPublication{}, err
+		}
 	}
 	return host.StagedPublication{
 		ID: identifier, PlanID: request.PlanID, ChangeID: request.ChangeID, PreviousRevision: request.PreviousRevision, PreviewEndpoint: repository.PreviewEndpoint,
@@ -319,6 +322,13 @@ func commitResult(repository host.Repository, revision host.PublishedRevision, i
 	}
 }
 
+// previewConfigured reports whether a companion preview site was asked for.
+// Any one of the three fields means yes, so a half-filled preview is caught by
+// validation rather than silently ignored.
+func previewConfigured(repository host.Repository) bool {
+	return repository.PreviewRepository != "" || repository.PreviewBranch != "" || repository.PreviewEndpoint != ""
+}
+
 func validateRepository(repository host.Repository) error {
 	// Configuration validation rejects an unsupported pair earlier; this is the
 	// adapter refusing to act on one that reached it anyway.
@@ -328,11 +338,20 @@ func validateRepository(repository host.Repository) error {
 	if repository.Visibility != "public" {
 		return invalid("configure GitHub Pages host", "GitHub Pages currently supports public repositories only")
 	}
-	if !validRepositoryName(repository.RemoteRepository) || !validRepositoryName(repository.PreviewRepository) || strings.EqualFold(repository.RemoteRepository, repository.PreviewRepository) ||
-		!validBranch(repository.Branch) || !validBranch(repository.PreviewBranch) || repository.Path != "" || repository.Bucket != "" || repository.Prefix != "" || repository.Region != "" || repository.Endpoint != "" || repository.UsePathStyle || repository.ReadAuth != "" || repository.CredentialBroker != "" {
-		return invalid("configure GitHub Pages host", "invalid production or preview repository configuration")
+	if !validRepositoryName(repository.RemoteRepository) || !validBranch(repository.Branch) ||
+		repository.Path != "" || repository.Bucket != "" || repository.Prefix != "" || repository.Region != "" || repository.Endpoint != "" || repository.UsePathStyle || repository.ReadAuth != "" || repository.CredentialBroker != "" {
+		return invalid("configure GitHub Pages host", "invalid production repository configuration")
 	}
-	for _, endpoint := range []string{repository.CanonicalEndpoint, repository.PreviewEndpoint} {
+	endpoints := []string{repository.CanonicalEndpoint}
+	// A preview is optional. Without one there is no second site to stage to,
+	// and the caller verifies the staged tree it already holds instead.
+	if previewConfigured(repository) {
+		if !validRepositoryName(repository.PreviewRepository) || strings.EqualFold(repository.RemoteRepository, repository.PreviewRepository) || !validBranch(repository.PreviewBranch) {
+			return invalid("configure GitHub Pages host", "invalid preview repository configuration")
+		}
+		endpoints = append(endpoints, repository.PreviewEndpoint)
+	}
+	for _, endpoint := range endpoints {
 		parsed, err := url.Parse(endpoint)
 		loopback := err == nil && (parsed.Hostname() == "localhost" || parsed.Hostname() == "127.0.0.1" || parsed.Hostname() == "::1")
 		if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Scheme != "https" && !(parsed.Scheme == "http" && loopback)) {
