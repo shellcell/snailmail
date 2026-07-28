@@ -1,0 +1,88 @@
+package main
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"time"
+)
+
+// commandFlags removes the boilerplate every subcommand repeated: routing usage
+// output to stderr, declaring the shared --workspace flag, and rejecting
+// positional arguments the command does not take.
+type commandFlags struct {
+	set       *flag.FlagSet
+	workspace *string
+}
+
+func newCommandFlags(name string, stderr io.Writer) *commandFlags {
+	set := flag.NewFlagSet(name, flag.ContinueOnError)
+	set.SetOutput(stderr)
+	return &commandFlags{set: set}
+}
+
+// withWorkspace declares the shared workspace root flag.
+func (flags *commandFlags) withWorkspace() *commandFlags {
+	flags.workspace = flags.set.String("workspace", ".", "workspace root")
+	return flags
+}
+
+func (flags *commandFlags) String(name, value, usage string) *string {
+	return flags.set.String(name, value, usage)
+}
+
+func (flags *commandFlags) Bool(name string, value bool, usage string) *bool {
+	return flags.set.Bool(name, value, usage)
+}
+
+func (flags *commandFlags) Int(name string, value int, usage string) *int {
+	return flags.set.Int(name, value, usage)
+}
+
+func (flags *commandFlags) Int64(name string, value int64, usage string) *int64 {
+	return flags.set.Int64(name, value, usage)
+}
+
+func (flags *commandFlags) Duration(name string, value time.Duration, usage string) *time.Duration {
+	return flags.set.Duration(name, value, usage)
+}
+
+// Root is the resolved workspace root, or "." for commands without the flag.
+func (flags *commandFlags) Root() string {
+	if flags.workspace == nil {
+		return "."
+	}
+	return *flags.workspace
+}
+
+// Parse, NArg, Arg and Args pass through for the commands that take positional
+// arguments and validate the count themselves.
+func (flags *commandFlags) Parse(arguments []string) error { return flags.set.Parse(arguments) }
+func (flags *commandFlags) NArg() int                      { return flags.set.NArg() }
+func (flags *commandFlags) Arg(index int) string           { return flags.set.Arg(index) }
+func (flags *commandFlags) Args() []string                 { return flags.set.Args() }
+
+// parse reads arguments and rejects any positional argument, which every
+// command using it treats as a usage error.
+func (flags *commandFlags) parse(arguments []string) error {
+	if err := flags.set.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.set.NArg() != 0 {
+		return fmt.Errorf("unexpected argument %q", flags.set.Arg(0))
+	}
+	return nil
+}
+
+// parseWithArguments reads arguments and requires exactly count positional
+// arguments, reporting usage when the count does not match.
+func (flags *commandFlags) parseWithArguments(arguments []string, count int, usage string) ([]string, error) {
+	if err := flags.set.Parse(arguments); err != nil {
+		return nil, err
+	}
+	if flags.set.NArg() != count {
+		return nil, errors.New(usage)
+	}
+	return flags.set.Args(), nil
+}

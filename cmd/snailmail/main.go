@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -91,18 +90,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 }
 
 func runInit(args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("init", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("init", stderr).withWorkspace()
 	name := flags.String("name", "", "workspace name")
 	forgeRepository := flags.String("forge-repo", "", "GitHub state repository (owner/name) for PR gates")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
-	}
-	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: *workspace, Name: *name, ForgeRepository: *forgeRepository}); err != nil {
+	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: flags.Root(), Name: *name, ForgeRepository: *forgeRepository}); err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -115,9 +109,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 		return errors.New("usage: snailmail setup <pypi|deb|helm> --name NAME --host <local|s3|github-pages> [host options]")
 	}
 	format := args[0]
-	flags := flag.NewFlagSet("setup "+format, flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("setup "+format, stderr).withWorkspace()
 	name := flags.String("name", "", "repository name")
 	output := flags.String("output", "", "workspace-relative published directory")
 	hostType := flags.String("host", "local", "host type: local, s3, or github-pages")
@@ -143,16 +135,13 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	suite := flags.String("suite", "stable", "Debian suite")
 	component := flags.String("component", "main", "Debian component")
 	architectures := flags.String("architectures", "amd64", "comma-separated Debian architectures")
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := flags.parse(args[1:]); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	resolvedApprovalKeys := splitList(*approvalKeys)
 	sort.Strings(resolvedApprovalKeys)
 	if err := engine.SetupRepository(engine.SetupRepositoryRequest{
-		Root: *workspace, Name: *name, Format: format, Output: *output,
+		Root: flags.Root(), Name: *name, Format: format, Output: *output,
 		HostType: *hostType, Visibility: *visibility, Gate: *gatePolicy, ApprovalKeys: resolvedApprovalKeys, SigningKey: *signingKey, AllowUnsigned: *allowUnsigned, Bucket: *bucket, Prefix: *prefix,
 		Region: *region, Endpoint: *endpoint, CanonicalEndpoint: *canonicalEndpoint,
 		UsePathStyle: *usePathStyle,
@@ -183,22 +172,17 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return errors.New("usage: snailmail keys new NAME [--algo openpgp-rsa4096] [--expires-in 17520h]")
 		}
 		name := args[1]
-		flags := flag.NewFlagSet("keys new", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		workspace := flags.String("workspace", ".", "workspace root")
+		flags := newCommandFlags("keys new", stderr).withWorkspace()
 		algorithm := flags.String("algo", "openpgp-rsa4096", "signing algorithm")
 		expiresIn := flags.Duration("expires-in", 2*365*24*time.Hour, "key validity duration")
-		if err := flags.Parse(args[2:]); err != nil {
+		if err := flags.parse(args[2:]); err != nil {
 			return err
-		}
-		if flags.NArg() != 0 {
-			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 		}
 		store, err := wire.NewSignerStore()
 		if err != nil {
 			return err
 		}
-		result, err := engine.NewKey(ctx, engine.NewKeyRequest{Root: *workspace, Name: name, Algorithm: *algorithm, ExpiresIn: *expiresIn, Keys: store})
+		result, err := engine.NewKey(ctx, engine.NewKeyRequest{Root: flags.Root(), Name: name, Algorithm: *algorithm, ExpiresIn: *expiresIn, Keys: store})
 		if err != nil {
 			return err
 		}
@@ -212,20 +196,15 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return errors.New("usage: snailmail keys publish NAME")
 		}
 		name := args[1]
-		flags := flag.NewFlagSet("keys publish", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		workspace := flags.String("workspace", ".", "workspace root")
-		if err := flags.Parse(args[2:]); err != nil {
+		flags := newCommandFlags("keys publish", stderr).withWorkspace()
+		if err := flags.parse(args[2:]); err != nil {
 			return err
-		}
-		if flags.NArg() != 0 {
-			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 		}
 		store, err := wire.NewSignerStore()
 		if err != nil {
 			return err
 		}
-		result, err := engine.PublishKey(ctx, engine.PublishKeyRequest{Root: *workspace, Name: name, Keys: store})
+		result, err := engine.PublishKey(ctx, engine.PublishKeyRequest{Root: flags.Root(), Name: name, Keys: store})
 		if err != nil {
 			return err
 		}
@@ -238,19 +217,14 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return errors.New("usage: snailmail keys rotate REPOSITORY --successor KEY [--minimum-refresh 720h] | --advance --yes")
 		}
 		repository := args[1]
-		flags := flag.NewFlagSet("keys rotate", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		workspace := flags.String("workspace", ".", "workspace root")
+		flags := newCommandFlags("keys rotate", stderr).withWorkspace()
 		successor := flags.String("successor", "", "successor signing key name")
 		advance := flags.Bool("advance", false, "advance the deployed rotation to its next phase")
 		minimumRefresh := flags.Duration("minimum-refresh", 30*24*time.Hour, "minimum client keyring refresh window")
 		expiresIn := flags.Duration("expires-in", 2*365*24*time.Hour, "new successor key validity")
 		confirmed := flags.Bool("yes", false, "confirm an advance transition")
-		if err := flags.Parse(args[2:]); err != nil {
+		if err := flags.parse(args[2:]); err != nil {
 			return err
-		}
-		if flags.NArg() != 0 {
-			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 		}
 		if *advance && !*confirmed {
 			return errors.New("keys rotate --advance requires --yes")
@@ -267,7 +241,7 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			}
 		}
 		result, err := engine.RotateKey(ctx, engine.RotateKeyRequest{
-			Root: *workspace, Repository: repository, Successor: *successor, Advance: *advance,
+			Root: flags.Root(), Repository: repository, Successor: *successor, Advance: *advance,
 			MinimumRefresh: *minimumRefresh, ExpiresIn: *expiresIn, Keys: keyGenerator,
 		})
 		if err != nil {
@@ -284,16 +258,11 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		}
 		return nil
 	case "audit":
-		flags := flag.NewFlagSet("keys audit", flag.ContinueOnError)
-		flags.SetOutput(stderr)
-		workspace := flags.String("workspace", ".", "workspace root")
-		if err := flags.Parse(args[1:]); err != nil {
+		flags := newCommandFlags("keys audit", stderr).withWorkspace()
+		if err := flags.parse(args[1:]); err != nil {
 			return err
 		}
-		if flags.NArg() != 0 {
-			return fmt.Errorf("unexpected argument %q", flags.Arg(0))
-		}
-		result, err := engine.AuditKeys(engine.PublishKeyRequest{Root: *workspace}, time.Time{})
+		result, err := engine.AuditKeys(engine.PublishKeyRequest{Root: flags.Root()}, time.Time{})
 		if err != nil {
 			return err
 		}
@@ -325,9 +294,7 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 }
 
 func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("add", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("add", stderr).withWorkspace()
 	track := flags.String("track", "stable", "placement track")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -336,7 +303,7 @@ func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		return errors.New("usage: snailmail add [--track stable] REPOSITORY ARTIFACT...")
 	}
 	result, err := engine.AddArtifacts(engine.AddArtifactsRequest{
-		Context: ctx, Root: *workspace, Repository: flags.Arg(0), Artifacts: flags.Args()[1:], Track: *track,
+		Context: ctx, Root: flags.Root(), Repository: flags.Arg(0), Artifacts: flags.Args()[1:], Track: *track,
 		Blobs: wire.NewBlobResolver(),
 	})
 	if err != nil {
@@ -355,9 +322,7 @@ func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 }
 
 func runPromote(args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("promote", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("promote", stderr).withWorkspace()
 	track := flags.String("track", "stable", "destination placement track")
 	distro := flags.String("distro", "", "Debian placement distro (defaults to repository suite)")
 	if err := flags.Parse(args); err != nil {
@@ -367,7 +332,7 @@ func runPromote(args []string, stdout, stderr io.Writer) error {
 		return errors.New("usage: snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	}
 	result, err := engine.Promote(engine.PlacementMutationRequest{
-		Root: *workspace, Repository: flags.Arg(0), Package: flags.Arg(1), Version: flags.Arg(2), Track: *track, Distro: *distro,
+		Root: flags.Root(), Repository: flags.Arg(0), Package: flags.Arg(1), Version: flags.Arg(2), Track: *track, Distro: *distro,
 	})
 	if err != nil {
 		return err
@@ -382,9 +347,7 @@ func runPromote(args []string, stdout, stderr io.Writer) error {
 }
 
 func runYank(args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("yank", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("yank", stderr).withWorkspace()
 	track := flags.String("track", "", "placement track to remove")
 	distro := flags.String("distro", "", "Debian placement distro (defaults to repository suite)")
 	all := flags.Bool("all", false, "remove every placement for the package version")
@@ -395,7 +358,7 @@ func runYank(args []string, stdout, stderr io.Writer) error {
 		return errors.New("usage: snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
 	}
 	result, err := engine.Yank(engine.PlacementMutationRequest{
-		Root: *workspace, Repository: flags.Arg(0), Package: flags.Arg(1), Version: flags.Arg(2), Track: *track, Distro: *distro, All: *all,
+		Root: flags.Root(), Repository: flags.Arg(0), Package: flags.Arg(1), Version: flags.Arg(2), Track: *track, Distro: *distro, All: *all,
 	})
 	if err != nil {
 		return err
@@ -416,9 +379,7 @@ func runPrune(args []string, stdout, stderr io.Writer) error {
 		return errors.New("usage: snailmail prune REPOSITORY --keep N")
 	}
 	repository := args[0]
-	flags := flag.NewFlagSet("prune", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("prune", stderr).withWorkspace()
 	keep := flags.Int("keep", 0, "versions to retain per package, track, and distro")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
@@ -426,7 +387,7 @@ func runPrune(args []string, stdout, stderr io.Writer) error {
 	if flags.NArg() != 0 || *keep < 1 {
 		return errors.New("usage: snailmail prune REPOSITORY --keep N")
 	}
-	result, err := engine.Prune(engine.PruneRequest{Root: *workspace, Repository: repository, Keep: *keep})
+	result, err := engine.Prune(engine.PruneRequest{Root: flags.Root(), Repository: repository, Keep: *keep})
 	if err != nil {
 		return err
 	}
@@ -441,9 +402,7 @@ func runPrune(args []string, stdout, stderr io.Writer) error {
 }
 
 func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("check", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("check", stderr).withWorkspace()
 	origins := flags.Bool("origins", false, "re-fetch recorded adopted origins")
 	maxOrigins := flags.Int("max-origins", 2, "maximum recorded origins to re-fetch (1-4)")
 	originOffset := flags.Int("origin-offset", 0, "skip this many sorted recorded origins")
@@ -453,7 +412,7 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if flags.NArg() != 0 {
 		return errors.New("usage: snailmail check [--workspace DIR] [--origins --max-origins N --origin-offset N]")
 	}
-	result, err := engine.CheckWorkspace(ctx, engine.CheckWorkspaceRequest{Root: *workspace, Blobs: wire.NewBlobResolver(), Origins: *origins, Sources: httpsource.New(), MaxOrigins: *maxOrigins, OriginOffset: *originOffset})
+	result, err := engine.CheckWorkspace(ctx, engine.CheckWorkspaceRequest{Root: flags.Root(), Blobs: wire.NewBlobResolver(), Origins: *origins, Sources: httpsource.New(), MaxOrigins: *maxOrigins, OriginOffset: *originOffset})
 	if err != nil {
 		return err
 	}
@@ -475,9 +434,7 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 }
 
 func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("status", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("status", stderr).withWorkspace()
 	jsonOutput := flags.Bool("json", false, "emit machine-readable JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -485,7 +442,7 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if flags.NArg() != 0 {
 		return errors.New("usage: snailmail status [--workspace DIR] [--json]")
 	}
-	result, err := engine.StatusWorkspace(ctx, engine.StatusWorkspaceRequest{Root: *workspace})
+	result, err := engine.StatusWorkspace(ctx, engine.StatusWorkspaceRequest{Root: flags.Root()})
 	if err != nil {
 		return err
 	}
@@ -509,8 +466,7 @@ func runDoctor(ctx context.Context, args []string, stdout, stderr io.Writer) err
 }
 
 func runDoctorWithFetcher(ctx context.Context, args []string, stdout, stderr io.Writer, fetcher source.Fetcher) error {
-	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags := newCommandFlags("doctor", stderr)
 	format := flags.String("format", "auto", "repository format: auto, pypi, deb, or helm")
 	project := flags.String("project", "", "PyPI project to inspect")
 	suite := flags.String("suite", "", "Debian suite")
@@ -561,9 +517,7 @@ func runAdopt(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 }
 
 func runAdoptWithFetcher(ctx context.Context, args []string, stdout, stderr io.Writer, fetcher source.Fetcher) error {
-	flags := flag.NewFlagSet("adopt", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("adopt", stderr).withWorkspace()
 	digest := flags.String("sha256", "", "required artifact SHA-256 pin")
 	filename := flags.String("filename", "", "artifact filename override")
 	track := flags.String("track", "", "placement track")
@@ -578,7 +532,7 @@ func runAdoptWithFetcher(ctx context.Context, args []string, stdout, stderr io.W
 		return errors.New("usage: snailmail adopt --sha256 HEX --public-origin [options] REPOSITORY URL")
 	}
 	result, err := engine.AdoptArtifact(ctx, engine.AdoptArtifactRequest{
-		Root: *workspace, Repository: flags.Arg(0), URL: flags.Arg(1), SHA256: *digest,
+		Root: flags.Root(), Repository: flags.Arg(0), URL: flags.Arg(1), SHA256: *digest,
 		Filename: *filename, Track: *track, Distro: *distro, DryRun: *dryRun, PublicOrigin: *publicOrigin, Fetcher: fetcher,
 	})
 	if err != nil {
@@ -606,22 +560,17 @@ func runBlobStore(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return errors.New("usage: snailmail blob-store <local|s3> [options]")
 	}
 	storeType := args[0]
-	flags := flag.NewFlagSet("blob-store "+storeType, flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("blob-store "+storeType, stderr).withWorkspace()
 	bucket := flags.String("bucket", "", "S3 blob bucket")
 	prefix := flags.String("prefix", "", "S3 blob prefix")
 	region := flags.String("region", "", "AWS region")
 	endpoint := flags.String("endpoint", "", "optional S3 API endpoint")
 	usePathStyle := flags.Bool("use-path-style", false, "use path-style S3 requests")
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := flags.parse(args[1:]); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
-	}
 	if err := engine.ConfigureBlobStore(ctx, engine.ConfigureBlobStoreRequest{
-		Root: *workspace, Type: storeType, Bucket: *bucket, Prefix: *prefix, Region: *region,
+		Root: flags.Root(), Type: storeType, Bucket: *bucket, Prefix: *prefix, Region: *region,
 		Endpoint: *endpoint, UsePathStyle: *usePathStyle, Blobs: wire.NewBlobResolver(),
 	}); err != nil {
 		return err
@@ -633,18 +582,13 @@ func runBlobStore(ctx context.Context, args []string, stdout, stderr io.Writer) 
 }
 
 func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("plan", stderr).withWorkspace()
 	output := flags.String("out", "snailmail.snailmail-plan.json", "plan output file")
 	generatedAtValue := flags.String("generated-at", "", "explicit RFC3339 repository generation time")
 	expires := flags.Duration("expires", 2*time.Hour, "plan lifetime")
 	structuralOnly := flags.Bool("structural-only", false, "review a plan without ecosystem client verification")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	generatedAt, err := optionalTime(*generatedAtValue)
 	if err != nil {
@@ -657,7 +601,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		return err
 	}
 	result, err := engine.PlanWorkspace(ctx, engine.PlanWorkspaceRequest{
-		Root: *workspace, Output: *output, GeneratedAt: generatedAt, ExpiresIn: *expires,
+		Root: flags.Root(), Output: *output, GeneratedAt: generatedAt, ExpiresIn: *expires,
 		Hosts: hosts, Blobs: wire.NewBlobResolver(), Signers: signers, VerificationMode: verificationMode(*structuralOnly),
 	})
 	if err != nil {
@@ -675,9 +619,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 }
 
 func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("apply", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("apply", stderr).withWorkspace()
 	plan := flags.String("plan", "snailmail.snailmail-plan.json", "reviewed plan file")
 	structuralOnly := flags.Bool("structural-only", false, "skip ecosystem client verification")
 	python := flags.String("python", "python3", "Python executable for PyPI verification")
@@ -686,11 +628,8 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	helmImage := flags.String("helm-image", engine.DefaultHelmVerificationImage, "digest-pinned Helm image")
 	maxWorkspaceMiB := flags.Int64("max-workspace-mib", 4096, "maximum Debian verification workspace in MiB")
 	approvalFile := flags.String("approvals", "", "approval evidence file (defaults beside plan)")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	hosts := wire.NewHostResolver()
 	defer hosts.Close()
@@ -699,10 +638,10 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		resolvedApprovalFile = *plan + ".approvals.json"
 	}
 	if !filepath.IsAbs(resolvedApprovalFile) {
-		resolvedApprovalFile = filepath.Join(*workspace, resolvedApprovalFile)
+		resolvedApprovalFile = filepath.Join(flags.Root(), resolvedApprovalFile)
 	}
 	result, err := engine.ApplyWorkspace(ctx, engine.ApplyWorkspaceRequest{
-		Root: *workspace, Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
+		Root: flags.Root(), Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
 		DebianImage: *debianImage, HelmImage: *helmImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
 		Hosts: hosts, Blobs: wire.NewBlobResolver(), Gates: gate.NewDefaultEvaluator(resolvedApprovalFile),
 	})
@@ -728,26 +667,21 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 }
 
 func runApprove(args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("approve", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("approve", stderr).withWorkspace()
 	plan := flags.String("plan", "snailmail.snailmail-plan.json", "reviewed plan file")
 	output := flags.String("out", "", "approval evidence output")
 	repository := flags.String("repository", "", "repository to approve")
 	keyFile := flags.String("key", "", "Ed25519 approval private key file")
 	expires := flags.Duration("expires", 30*time.Minute, "approval lifetime")
 	yes := flags.Bool("yes", false, "confirm approval of the exact plan ID")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	if !*yes {
 		return errors.New("approval requires --yes after reviewing the exact plan")
 	}
 	result, err := engine.ApprovePlan(engine.ApprovePlanRequest{
-		Root: *workspace, Plan: *plan, Output: *output, Repository: *repository,
+		Root: flags.Root(), Plan: *plan, Output: *output, Repository: *repository,
 		KeyFile: *keyFile, ExpiresIn: *expires,
 	})
 	if err != nil {
@@ -762,8 +696,7 @@ func runApprove(args []string, stdout, stderr io.Writer) error {
 }
 
 func runApprovalKey(args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("approval-key", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags := newCommandFlags("approval-key", stderr)
 	output := flags.String("out", "", "private key output file")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -783,18 +716,13 @@ func runApprovalKey(args []string, stdout, stderr io.Writer) error {
 }
 
 func runRender(args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("render", flag.ContinueOnError)
-	flags.SetOutput(stderr)
-	workspace := flags.String("workspace", ".", "workspace root")
+	flags := newCommandFlags("render", stderr).withWorkspace()
 	output := flags.String("output", "site", "status site output directory")
 	plan := flags.String("plan", "snailmail.snailmail-plan.json", "optional plan used for pending gates")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
-	}
-	result, err := engine.RenderStatus(engine.RenderStatusRequest{Root: *workspace, Output: *output, Plan: *plan})
+	result, err := engine.RenderStatus(engine.RenderStatusRequest{Root: flags.Root(), Output: *output, Plan: *plan})
 	if err != nil {
 		return err
 	}
@@ -821,16 +749,12 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 }
 
 func runBuildPyPI(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("build pypi", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags := newCommandFlags("build pypi", stderr)
 	input := flags.String("input", "", "directory containing wheels and source distributions")
 	output := flags.String("output", "", "directory to write the static repository")
 	generatedAtValue := flags.String("generated-at", defaultGeneratedAt, "explicit RFC3339 generation time")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	generatedAt, err := time.Parse(time.RFC3339, *generatedAtValue)
 	if err != nil {
@@ -852,19 +776,15 @@ func runBuildPyPI(ctx context.Context, args []string, stdout, stderr io.Writer) 
 }
 
 func runBuildDeb(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("build deb", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags := newCommandFlags("build deb", stderr)
 	input := flags.String("input", "", "directory containing Debian packages")
 	output := flags.String("output", "", "directory to write the static repository")
 	suite := flags.String("suite", "stable", "Debian suite/codename")
 	component := flags.String("component", "main", "Debian component")
 	architecturesValue := flags.String("architectures", "amd64", "comma-separated target architectures")
 	generatedAtValue := flags.String("generated-at", defaultGeneratedAt, "explicit RFC3339 generation time")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	generatedAt, err := time.Parse(time.RFC3339, *generatedAtValue)
 	if err != nil {
@@ -889,16 +809,12 @@ func runBuildDeb(ctx context.Context, args []string, stdout, stderr io.Writer) e
 }
 
 func runBuildHelm(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("build helm", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags := newCommandFlags("build helm", stderr)
 	input := flags.String("input", "", "directory containing packaged Helm charts")
 	output := flags.String("output", "", "directory to write the static repository")
 	generatedAtValue := flags.String("generated-at", defaultGeneratedAt, "explicit RFC3339 generation time")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	generatedAt, err := time.Parse(time.RFC3339, *generatedAtValue)
 	if err != nil {
@@ -932,16 +848,12 @@ func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) err
 }
 
 func runVerifyPyPI(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("verify pypi", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags := newCommandFlags("verify pypi", stderr)
 	repository := flags.String("repo", "", "generated repository directory")
 	python := flags.String("python", "python3", "Python executable whose pip client verifies installs")
 	structuralOnly := flags.Bool("structural-only", false, "verify files and indexes without invoking pip")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	result, err := engine.VerifyPyPI(ctx, engine.VerifyPyPIRequest{
 		Repository:     *repository,
@@ -963,18 +875,14 @@ func runVerifyPyPI(ctx context.Context, args []string, stdout, stderr io.Writer)
 }
 
 func runVerifyDeb(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("verify deb", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags := newCommandFlags("verify deb", stderr)
 	repository := flags.String("repo", "", "generated repository directory")
 	runner := flags.String("runner", "podman", "OCI runner executable")
 	image := flags.String("image", engine.DefaultDebianVerificationImage, "digest-pinned Debian client image")
 	maxWorkspaceMiB := flags.Int64("max-workspace-mib", 4096, "maximum temporary verification workspace in MiB")
 	structuralOnly := flags.Bool("structural-only", false, "verify files and indexes without invoking apt")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	result, err := engine.VerifyDeb(ctx, engine.VerifyDebRequest{
 		Repository:        *repository,
@@ -998,17 +906,13 @@ func runVerifyDeb(ctx context.Context, args []string, stdout, stderr io.Writer) 
 }
 
 func runVerifyHelm(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("verify helm", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags := newCommandFlags("verify helm", stderr)
 	repository := flags.String("repo", "", "generated repository directory")
 	runner := flags.String("runner", "podman", "OCI runner executable")
 	image := flags.String("image", engine.DefaultHelmVerificationImage, "digest-pinned Helm client image")
 	structuralOnly := flags.Bool("structural-only", false, "verify files and index without invoking Helm")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	result, err := engine.VerifyHelm(ctx, engine.VerifyHelmRequest{Repository: *repository, Runner: *runner, Image: *image, StructuralOnly: *structuralOnly})
 	if err != nil {
@@ -1026,15 +930,11 @@ func runVerifyHelm(ctx context.Context, args []string, stdout, stderr io.Writer)
 }
 
 func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags := newCommandFlags("serve", stderr)
 	repository := flags.String("repo", "", "generated repository directory")
 	listenAddress := flags.String("listen", "127.0.0.1:8080", "HTTP listen address")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args); err != nil {
 		return err
-	}
-	if flags.NArg() != 0 {
-		return fmt.Errorf("unexpected argument %q", flags.Arg(0))
 	}
 	absolute, err := filepath.Abs(*repository)
 	if err != nil {
