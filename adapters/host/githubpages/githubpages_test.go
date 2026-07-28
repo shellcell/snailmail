@@ -221,3 +221,47 @@ func sha256File(t *testing.T, filename string) string {
 }
 
 func errorsIsRefNotFound(err error) bool { return err == errRefNotFound }
+
+// A companion preview repository doubles what an operator must create, so it is
+// optional. Without one, Stage must not reach for a preview remote at all, and
+// the staged publication must offer no endpoint — the caller then verifies the
+// staged tree it already holds rather than fetching from a site that does not
+// exist.
+func TestGitHubPagesStagesWithoutAPreview(t *testing.T) {
+	ctx := context.Background()
+	production := createBareRepository(t, "production.git")
+	adapter := NewWithRemoteResolver(func(repository string) string {
+		if repository == "test/production" {
+			return production
+		}
+		t.Errorf("Stage resolved a preview remote %q when none is configured", repository)
+		return ""
+	})
+	repository := testRepository()
+	repository.PreviewRepository = ""
+	repository.PreviewBranch = ""
+	repository.PreviewEndpoint = ""
+
+	request := pagesStageFixture(t, "solo", "1.0.0")
+	staged, err := adapter.Stage(ctx, repository, request)
+	if err != nil {
+		t.Fatalf("staging without a preview failed: %v", err)
+	}
+	if staged.PreviewEndpoint != "" || staged.Access.Endpoint != "" || len(staged.Access.Routes) != 0 {
+		t.Fatalf("staged publication offers a preview that does not exist: %+v", staged.Access)
+	}
+
+	// Publication itself is unchanged: the preview is a review surface, not a
+	// step on the way to production.
+	committed, err := adapter.Commit(ctx, repository, staged, host.ExpectedRevision{})
+	if err != nil {
+		t.Fatalf("committing without a preview failed: %v", err)
+	}
+	if committed.Revision.TreeSHA256 != request.TreeSHA256 {
+		t.Fatalf("published tree is %q, want %q", committed.Revision.TreeSHA256, request.TreeSHA256)
+	}
+	observed, err := adapter.Observe(ctx, repository)
+	if err != nil || observed.TreeSHA256 != request.TreeSHA256 {
+		t.Fatalf("observation=%#v err=%v", observed, err)
+	}
+}

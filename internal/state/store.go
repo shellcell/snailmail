@@ -132,7 +132,9 @@ func Setup(root string, options SetupOptions) error {
 		if repository.Host.Branch == "" {
 			repository.Host.Branch = "gh-pages"
 		}
-		if repository.Host.PreviewBranch == "" {
+		// Only when a preview repository was actually asked for: defaulting the
+		// branch unconditionally would leave a half-configured preview behind.
+		if repository.Host.PreviewRepository != "" && repository.Host.PreviewBranch == "" {
 			repository.Host.PreviewBranch = "gh-pages"
 		}
 	}
@@ -462,16 +464,34 @@ func validateRepositoryHost(name string, repository Repository) error {
 		if repository.Host.Path != "" || repository.Host.Bucket != "" || repository.Host.Prefix != "" || repository.Host.Region != "" || repository.Host.Endpoint != "" || repository.Host.UsePathStyle || repository.Host.ReadAuth != "" || repository.Host.CredentialBroker != "" {
 			return fmt.Errorf("repository %q GitHub Pages host has incompatible configuration", name)
 		}
-		if !validGitHubRepository(repository.Host.Repository) || !validGitHubRepository(repository.Host.PreviewRepository) || strings.EqualFold(repository.Host.Repository, repository.Host.PreviewRepository) {
-			return fmt.Errorf("repository %q GitHub Pages host requires distinct production and preview owner/name repositories", name)
+		if !validGitHubRepository(repository.Host.Repository) {
+			return fmt.Errorf("repository %q GitHub Pages host requires an owner/name production repository", name)
 		}
-		if sameConfiguredEndpoint(repository.Host.CanonicalEndpoint, repository.Host.PreviewEndpoint) {
-			return fmt.Errorf("repository %q GitHub Pages production and preview endpoints must be distinct", name)
-		}
-		if !validGitBranch(repository.Host.Branch) || !validGitBranch(repository.Host.PreviewBranch) {
+		if !validGitBranch(repository.Host.Branch) {
 			return fmt.Errorf("repository %q GitHub Pages host has an invalid branch", name)
 		}
-		for _, configured := range []struct{ label, endpoint string }{{"canonical", repository.Host.CanonicalEndpoint}, {"preview", repository.Host.PreviewEndpoint}} {
+		configuredPreview := repository.Host.PreviewRepository != "" || repository.Host.PreviewBranch != "" || repository.Host.PreviewEndpoint != ""
+		// A preview is where a reviewer looks before production changes, so a
+		// gate that waits for a human cannot do without one. An auto gate has no
+		// reviewer, and the staged tree is still verified — locally rather than
+		// over the network. See the apply path for what that costs.
+		if !configuredPreview && repository.Gate != "auto" && repository.Gate != "" {
+			return fmt.Errorf("repository %q gate %q reviews a preview, so a companion preview repository is required", name, repository.Gate)
+		}
+		endpoints := []struct{ label, endpoint string }{{"canonical", repository.Host.CanonicalEndpoint}}
+		if configuredPreview {
+			if !validGitHubRepository(repository.Host.PreviewRepository) || strings.EqualFold(repository.Host.Repository, repository.Host.PreviewRepository) {
+				return fmt.Errorf("repository %q GitHub Pages host requires distinct production and preview owner/name repositories", name)
+			}
+			if sameConfiguredEndpoint(repository.Host.CanonicalEndpoint, repository.Host.PreviewEndpoint) {
+				return fmt.Errorf("repository %q GitHub Pages production and preview endpoints must be distinct", name)
+			}
+			if !validGitBranch(repository.Host.PreviewBranch) {
+				return fmt.Errorf("repository %q GitHub Pages host has an invalid branch", name)
+			}
+			endpoints = append(endpoints, struct{ label, endpoint string }{"preview", repository.Host.PreviewEndpoint})
+		}
+		for _, configured := range endpoints {
 			label, endpoint := configured.label, configured.endpoint
 			if err := validateHTTPURL(endpoint); err != nil {
 				return fmt.Errorf("repository %q %s endpoint: %w", name, label, err)

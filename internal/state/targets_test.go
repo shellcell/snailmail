@@ -109,3 +109,62 @@ func TestPublicationTargetErrorNamesBothRepositories(t *testing.T) {
 		}
 	}
 }
+
+// A companion preview repository doubles the GitHub repositories an operator
+// creates — two per format. It is required only where something reviews it.
+func TestPagesPreviewIsOptionalForAnAutoGate(t *testing.T) {
+	withoutPreview := Repository{
+		Format: "raw", Gate: "auto", Visibility: "public",
+		Host: HostConfig{
+			Type: "github-pages", Repository: "shellcell/postoffice", Branch: "gh-pages",
+			CanonicalEndpoint: "https://dl.shellcell.dev/",
+		},
+	}
+	if err := validateRepositoryHost("releases", withoutPreview); err != nil {
+		t.Fatalf("an auto-gated repository was refused without a preview: %v", err)
+	}
+
+	// A gate that waits for a human needs somewhere for them to look.
+	for _, gate := range []string{"pr", "approval"} {
+		gated := withoutPreview
+		gated.Gate = gate
+		if err := validateRepositoryHost("releases", gated); err == nil {
+			t.Errorf("gate %q was accepted with no preview to review", gate)
+		}
+	}
+}
+
+// Any one of the three preview fields means a preview was intended, so a
+// half-filled one is a mistake rather than an absent preview.
+func TestPagesPreviewMustBeWholeOrAbsent(t *testing.T) {
+	base := Repository{
+		Format: "raw", Gate: "auto", Visibility: "public",
+		Host: HostConfig{
+			Type: "github-pages", Repository: "shellcell/postoffice", Branch: "gh-pages",
+			CanonicalEndpoint: "https://dl.shellcell.dev/",
+		},
+	}
+	for name, host := range map[string]HostConfig{
+		"branch only":     {PreviewBranch: "gh-pages"},
+		"endpoint only":   {PreviewEndpoint: "https://preview.example/"},
+		"repository only": {PreviewRepository: "shellcell/postoffice-preview"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			partial := base
+			partial.Host.PreviewRepository = host.PreviewRepository
+			partial.Host.PreviewBranch = host.PreviewBranch
+			partial.Host.PreviewEndpoint = host.PreviewEndpoint
+			if err := validateRepositoryHost("releases", partial); err == nil {
+				t.Fatal("a half-configured preview was accepted")
+			}
+		})
+	}
+
+	whole := base
+	whole.Host.PreviewRepository = "shellcell/postoffice-preview"
+	whole.Host.PreviewBranch = "gh-pages"
+	whole.Host.PreviewEndpoint = "https://preview.example/"
+	if err := validateRepositoryHost("releases", whole); err != nil {
+		t.Fatalf("a complete preview was refused: %v", err)
+	}
+}
