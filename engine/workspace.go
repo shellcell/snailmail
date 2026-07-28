@@ -829,7 +829,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if access.Endpoint == "" {
 			access.Endpoint = item.hostStage.PreviewEndpoint
 		}
-		if _, _, err := app.VerifyPyPIClientEndpointAccess(ctx, item.stage, access, request.Python); err != nil {
+		if err := verifyEndpointClient(ctx, item.repository, item.stage, access, request); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
 	}
@@ -1215,12 +1215,35 @@ func verifyCanonicalClient(ctx context.Context, root string, repository state.Re
 		_, err = verifyStaged(ctx, repository.Format, output, request)
 		return err
 	}
+	return verifyEndpointClient(ctx, repository, staged, access, request)
+}
+
+// verifyEndpointClient runs the ecosystem's official client against the tree a
+// host is serving. Each format needs its own client, so the pair must be
+// declared before the attempt rather than discovered by a nil dispatch.
+func verifyEndpointClient(ctx context.Context, repository state.Repository, staged string, access host.ClientAccess, request ApplyWorkspaceRequest) error {
 	if !host.Supports(repository.Host.Type, repository.Format).RemoteClientVerification {
-		return fmt.Errorf("canonical client verification is not implemented for format %q on host %q",
+		return fmt.Errorf("client verification is not implemented for format %q on host %q",
 			repository.Format, repository.Host.Type)
 	}
-	_, _, err := app.VerifyPyPIClientEndpointAccess(ctx, staged, access, request.Python)
-	return err
+	switch repository.Format {
+	case "pypi":
+		_, _, err := app.VerifyPyPIClientEndpointAccess(ctx, staged, access, request.Python)
+		return err
+	case "deb":
+		image := request.DebianImage
+		if image == "" {
+			image = DefaultDebianVerificationImage
+		}
+		maximum := request.MaxWorkspaceBytes
+		if maximum == 0 {
+			maximum = 4 << 30
+		}
+		_, _, err := app.VerifyDebClientEndpointAccess(ctx, staged, access, request.Runner, image, maximum)
+		return err
+	default:
+		return fmt.Errorf("client verification is not implemented for format %q", repository.Format)
+	}
 }
 
 func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt, signatureTime time.Time, output string, blobStore blob.Store, keys map[string]state.SigningKey, plannedSigning []state.PlanSigning, signers signer.Resolver) (BuildResult, error) {

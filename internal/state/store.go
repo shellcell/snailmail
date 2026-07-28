@@ -216,7 +216,13 @@ func ValidateInstallDocument(root, name string, repository Repository) error {
 	return nil
 }
 
+// installDocumentContent renders the consumer instructions for a repository.
+// ARCHITECTURE §6.5 requires these to be generated rather than hand-written,
+// so they cannot advertise a layout the repository does not serve.
 func installDocumentContent(name string, repository Repository) []byte {
+	if repository.Format == "deb" {
+		return debInstallDocument(name, repository)
+	}
 	endpoint := strings.TrimSuffix(repository.Host.CanonicalEndpoint, "/") + "/simple/"
 	credentialNote := ""
 	if repository.Visibility == "private" {
@@ -225,6 +231,38 @@ func installDocumentContent(name string, repository Repository) []byte {
 	}
 	return []byte("# Install from " + name + "\n\n" + credentialNote +
 		"```sh\npython -m pip install --index-url " + shellQuote(endpoint) + " PACKAGE\n```\n")
+}
+
+// debInstallDocument emits a deb822 .sources stanza. The keyring is fetched
+// from the repository itself so the instructions carry no key material, and
+// Signed-By names the exact keyring the repository publishes rather than
+// installing a key into the system-wide trusted set, which would let this
+// repository vouch for every other one.
+func debInstallDocument(name string, repository Repository) []byte {
+	endpoint := strings.TrimSuffix(repository.Host.CanonicalEndpoint, "/")
+	keyring := "/usr/share/keyrings/" + name + "-archive-keyring.gpg"
+	architectures := strings.Join(repository.Architectures, " ")
+
+	var document strings.Builder
+	document.WriteString("# Install from " + name + "\n\n")
+	if len(repository.SigningKeys) == 0 {
+		document.WriteString("This repository is unsigned. apt will refuse it unless the source is\n" +
+			"marked trusted, which disables the integrity check the signature provides.\n\n")
+		document.WriteString("```sh\nsudo tee /etc/apt/sources.list.d/" + name + ".sources >/dev/null <<'SOURCES'\n")
+		document.WriteString("Types: deb\nURIs: " + endpoint + "\nSuites: " + repository.Suite +
+			"\nComponents: " + repository.Component + "\nArchitectures: " + architectures + "\nTrusted: yes\nSOURCES\n")
+		document.WriteString("sudo apt-get update\nsudo apt-get install PACKAGE\n```\n")
+		return []byte(document.String())
+	}
+	document.WriteString("```sh\nsudo install -d -m 0755 /usr/share/keyrings\n")
+	document.WriteString("sudo curl -fsSL -o " + shellQuote(keyring) + " " +
+		shellQuote(endpoint+"/"+filepath.ToSlash(repository.SigningKeyring)) + "\n\n")
+	document.WriteString("sudo tee /etc/apt/sources.list.d/" + name + ".sources >/dev/null <<'SOURCES'\n")
+	document.WriteString("Types: deb\nURIs: " + endpoint + "\nSuites: " + repository.Suite +
+		"\nComponents: " + repository.Component + "\nArchitectures: " + architectures +
+		"\nSigned-By: " + keyring + "\nSOURCES\n")
+	document.WriteString("sudo apt-get update\nsudo apt-get install PACKAGE\n```\n")
+	return []byte(document.String())
 }
 
 func shellQuote(value string) string {

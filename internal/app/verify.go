@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,6 +22,7 @@ import (
 	"path"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -187,13 +189,10 @@ func VerifyPyPIClientEndpointAccess(ctx context.Context, root string, access hos
 	if access.Credential != nil {
 		defer access.Credential.Destroy()
 	}
-	parsed, err := url.Parse(access.Endpoint)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return buildgraph.RepositoryManifest{}, 0, errors.New("PyPI verification endpoint must be an HTTP(S) URL")
+	if _, err := validateClientEndpoint(access.Endpoint); err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
 	}
-	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname())) {
-		return buildgraph.RepositoryManifest{}, 0, errors.New("PyPI verification endpoint must use HTTPS")
-	}
+	var err error
 	username, password := "", ""
 	private := access.Credential != nil
 	if private {
@@ -213,27 +212,13 @@ func VerifyPyPIClientEndpointAccess(ctx context.Context, root string, access hos
 		return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("repository format is %q, not %q", manifest.Format, pypi.FormatID)
 	}
 	if len(access.Routes) == 0 {
-		access.Routes, err = defaultPyPIClientRoutes(access.Endpoint, manifest.Files)
+		access.Routes, err = defaultClientRoutes(access.Endpoint, manifest.Files)
 		if err != nil {
 			return buildgraph.RepositoryManifest{}, 0, err
 		}
 	}
-	deadline := time.Now().Add(access.PropagationTimeout)
-	for {
-		err = verifyHostedPyPIBytes(ctx, access, username, password, private)
-		if err == nil {
-			break
-		}
-		if access.PropagationTimeout <= 0 || !time.Now().Before(deadline) {
-			return buildgraph.RepositoryManifest{}, 0, err
-		}
-		timer := time.NewTimer(2 * time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return buildgraph.RepositoryManifest{}, 0, ctx.Err()
-		case <-timer.C:
-		}
+	if err := awaitHostedBytes(ctx, access, username, password, private); err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
 	}
 	installed, err := verifyPyPICases(ctx, manifest, blobs, strings.TrimSuffix(access.Endpoint, "/"), python, username, password, private)
 	return manifest, installed, err
@@ -364,7 +349,50 @@ func verifyPyPICases(ctx context.Context, manifest buildgraph.RepositoryManifest
 	return len(manifest.VerificationCases), nil
 }
 
-func verifyHostedPyPIBytes(ctx context.Context, access host.ClientAccess, username, password string, private bool) error {
+// validateClientEndpoint accepts only an endpoint a package client may be
+// pointed at: no credentials in the URL, no query or fragment, and HTTPS unless
+// it is loopback, so verification cannot be satisfied by a plaintext origin an
+// attacker controls.
+func validateClientEndpoint(endpoint string) (*url.URL, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, errors.New("verification endpoint must be an HTTP(S) URL")
+	}
+	if parsed.Scheme != "https" && !isLoopbackHost(parsed.Hostname()) {
+		return nil, errors.New("verification endpoint must use HTTPS")
+	}
+	return parsed, nil
+}
+
+// awaitHostedBytes waits for the host to serve exactly the reviewed tree. A
+// host that publishes through a CDN or a Pages build is eventually consistent,
+// so a first mismatch is retried until the propagation budget runs out; a
+// mismatch after that is a real difference, not latency.
+func awaitHostedBytes(ctx context.Context, access host.ClientAccess, username, password string, private bool) error {
+	deadline := time.Now().Add(access.PropagationTimeout)
+	for {
+		err := verifyHostedBytes(ctx, access, username, password, private)
+		if err == nil {
+			return nil
+		}
+		if access.PropagationTimeout <= 0 || !time.Now().Before(deadline) {
+			return err
+		}
+		timer := time.NewTimer(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+// verifyHostedBytes checks that every route serves the exact reviewed bytes.
+// It is format-neutral: what differs per ecosystem is the client install that
+// follows, not whether the host returns the digests that were verified.
+func verifyHostedBytes(ctx context.Context, access host.ClientAccess, username, password string, private bool) error {
 	endpoint, err := url.Parse(access.Endpoint)
 	if err != nil {
 		return errors.New("invalid PyPI verification endpoint")
@@ -416,7 +444,10 @@ func verifyHostedPyPIBytes(ctx context.Context, access host.ClientAccess, userna
 	return nil
 }
 
-func defaultPyPIClientRoutes(endpoint string, files []buildgraph.ManifestFile) ([]host.ClientRoute, error) {
+// defaultClientRoutes covers every file in the tree when a host supplies no
+// route list of its own. The index-page rewrite is harmless for formats without
+// directory indexes, whose paths never end in index.html.
+func defaultClientRoutes(endpoint string, files []buildgraph.ManifestFile) ([]host.ClientRoute, error) {
 	routes := make([]host.ClientRoute, 0, len(files))
 	for _, file := range files {
 		routePath := file.Path
@@ -551,7 +582,9 @@ func verifyDebCase(ctx context.Context, runner, image, snapshot string, workspac
 		"--env", "SNAILMAIL_VERSION=" + verification.Version,
 		"--env", "SNAILMAIL_SIGNING_KEY=" + manifest.Install.SigningKeyPath,
 		"--tmpfs", "/tmp:rw,size=64m,mode=1777",
-		"--tmpfs", "/target:rw,size=" + strconv.FormatInt(workspaceBytes, 10) + ",mode=0755",
+		// exec is explicit because runtimes mount tmpfs noexec by default and the
+		// chroot below runs apt-get and dpkg-query out of this mount.
+		"--tmpfs", "/target:rw,exec,size=" + strconv.FormatInt(workspaceBytes, 10) + ",mode=0755",
 		image,
 		"sh", "-euc", `
 for directory in bin etc lib lib64 sbin usr var; do
@@ -676,103 +709,101 @@ func VerifyHelmClient(ctx context.Context, root, runner, image string) (buildgra
 	if !digestPinnedImage(image) {
 		return buildgraph.RepositoryManifest{}, 0, errors.New("a digest-pinned Helm verification image is required")
 	}
+	// Helm needs an HTTP repository, and the pinned image ships no static
+	// server: its busybox has no httpd applet and its nc has no -e. Serve the
+	// snapshot from here instead, which also removes a shell-scripted HTTP
+	// implementation from the trusted path.
+	snapshotHTTP, err := serveSnapshot(snapshot)
+	if err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
+	}
+	defer snapshotHTTP.stop()
 	verificationCases := manifest.VerificationCases
 	if len(verificationCases) == 0 {
 		verificationCases = []domain.VerificationCase{{}}
 	}
 	for _, verification := range verificationCases {
-		if err := verifyHelmCase(ctx, runner, image, snapshot, verification); err != nil {
+		if err := verifyHelmCase(ctx, runner, image, snapshotHTTP, verification); err != nil {
 			return buildgraph.RepositoryManifest{}, 0, err
 		}
 	}
 	return manifest, len(manifest.VerificationCases), nil
 }
 
-func verifyHelmCase(ctx context.Context, runner, image, snapshot string, verification domain.VerificationCase) error {
-	caseCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+// snapshotServer is a verified tree served to a client running in a container,
+// plus how that container reaches it.
+//
+// There is no single mechanism that works everywhere. Where the runtime runs
+// containers directly on the host — Linux, docker or podman — the container can
+// share the host network namespace and read loopback, which keeps the socket
+// unreachable from anywhere else. Where the runtime is a virtual machine, that
+// namespace is the machine's rather than the host's, so the container instead
+// resolves a mapped gateway alias and the socket has to accept it.
+type snapshotServer struct {
+	// endpoint is the URL as the container sees it.
+	endpoint string
+	// runnerArguments make the endpoint reachable from inside.
+	runnerArguments []string
+	stop            func()
+}
+
+const snapshotAlias = "snailmail-snapshot.invalid"
+
+func serveSnapshot(snapshot string) (snapshotServer, error) {
+	sharesHostNamespace := runtime.GOOS == "linux"
+	address := ":0"
+	if sharesHostNamespace {
+		address = "127.0.0.1:0"
+	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return snapshotServer{}, fmt.Errorf("serve verification snapshot: %w", err)
+	}
+	_, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		_ = listener.Close()
+		return snapshotServer{}, err
+	}
+	server := &http.Server{Handler: http.FileServer(http.Dir(snapshot)), ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = server.Serve(listener) }()
+
+	result := snapshotServer{stop: func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}}
+	if sharesHostNamespace {
+		result.endpoint = "http://127.0.0.1:" + port
+		result.runnerArguments = []string{"--network=host"}
+		return result, nil
+	}
+	result.endpoint = "http://" + snapshotAlias + ":" + port
+	result.runnerArguments = []string{"--add-host", snapshotAlias + ":host-gateway"}
+	return result, nil
+}
+
+func verifyHelmCase(ctx context.Context, runner, image string, snapshotHTTP snapshotServer, verification domain.VerificationCase) error {
+	caseCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
-	arguments := []string{
-		"run", "--rm", "--pull=missing", "--network=none",
+	arguments := []string{"run", "--rm", "--pull=missing"}
+	arguments = append(arguments, snapshotHTTP.runnerArguments...)
+	arguments = append(arguments,
 		"--read-only", "--memory=768m", "--cpus=2", "--pids-limit=256",
 		"--ulimit", "fsize=536870912:536870912", "--ulimit", "nofile=1024:1024",
 		"--security-opt", "no-new-privileges",
-		"--volume", snapshot + ":/repo:ro,Z",
-		"--tmpfs", "/tmp:rw,size=640m,mode=1777",
+		"--tmpfs", "/tmp:rw,exec,size=640m,mode=1777",
 		"--tmpfs", "/home/helm:rw,size=32m,mode=0700",
 		"--env", "HOME=/home/helm",
 		"--env", "HELM_CACHE_HOME=/home/helm/cache",
 		"--env", "HELM_CONFIG_HOME=/home/helm/config",
 		"--env", "HELM_DATA_HOME=/home/helm/data",
-		"--env", "SNAILMAIL_CHART=" + verification.Project,
-		"--env", "SNAILMAIL_VERSION=" + verification.Version,
+		"--env", "SNAILMAIL_ENDPOINT="+snapshotHTTP.endpoint,
+		"--env", "SNAILMAIL_CHART="+verification.Project,
+		"--env", "SNAILMAIL_VERSION="+verification.Version,
 		"--entrypoint", "/bin/sh",
 		image,
 		"-euc", `
-cat >/tmp/http-handler <<'HANDLER'
-#!/bin/sh
-IFS=' ' read -r method target protocol
-carriage_return=$(printf '\r')
-while IFS= read -r header; do
-    test "$header" = "$carriage_return" && break
-done
-target=${target%%\?*}
-case "$target" in
-    /*) ;;
-    *) target=/invalid ;;
-esac
-case "$target" in
-    *..*) target=/invalid ;;
-esac
-file="/repo$target"
-if test -f "$file"; then
-    size=$(wc -c <"$file")
-    type=application/octet-stream
-    case "$file" in
-        *.yaml) type=application/x-yaml ;;
-        *.tgz) type=application/gzip ;;
-    esac
-    printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\nContent-Type: %s\r\nConnection: close\r\n\r\n' "$size" "$type"
-    cat "$file"
-else
-    printf 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
-fi
-HANDLER
-chmod 0700 /tmp/http-handler
-# busybox httpd is a real static file server and is present in any
-# busybox-based image. The nc handler stays as the fallback: -e and -k vary
-# between nc implementations, which is why it is not the first choice.
-server=""
-if command -v busybox >/dev/null 2>&1 && busybox httpd --help >/dev/null 2>&1; then
-    busybox httpd -f -p 127.0.0.1:8879 -h /repo &
-    server=$!
-    sleep 1
-    if ! kill -0 "$server" 2>/dev/null; then
-        server=""
-    fi
-fi
-if test -z "$server"; then
-    nc -lk -s 127.0.0.1 -p 8879 -e /tmp/http-handler &
-    server=$!
-fi
-trap 'kill "$server" 2>/dev/null' EXIT
-# Fail with the image contract rather than an opaque Helm error when whichever
-# server was chosen never comes up.
-if command -v wget >/dev/null 2>&1; then
-    ready=""
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
-        if wget -q -O /dev/null http://127.0.0.1:8879/index.yaml 2>/dev/null; then
-            ready=yes
-            break
-        fi
-        sleep 1
-    done
-    if test -z "$ready"; then
-        echo "verification image provides no usable static HTTP server;" >&2
-        echo "it needs busybox httpd, or an nc supporting -l -k -s -p -e" >&2
-        exit 1
-    fi
-fi
-helm repo add staged http://127.0.0.1:8879
+helm repo add staged "$SNAILMAIL_ENDPOINT"
 helm repo update staged
 if test -n "$SNAILMAIL_CHART"; then
     mkdir -p /tmp/chart
@@ -781,8 +812,7 @@ if test -n "$SNAILMAIL_CHART"; then
     helm lint "/tmp/chart/$SNAILMAIL_CHART"
     helm template snailmail "/tmp/chart/$SNAILMAIL_CHART" >/tmp/rendered.yaml
 fi
-`,
-	}
+`)
 	command := exec.CommandContext(caseCtx, runner, arguments...)
 	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()

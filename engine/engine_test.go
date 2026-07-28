@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -272,23 +273,21 @@ func TestBuildDebIsByteDeterministic(t *testing.T) {
 }
 
 func TestVerifyDebInstallsWithApt(t *testing.T) {
-	runner, err := exec.LookPath("podman")
-	if err != nil {
-		t.Skip("podman is unavailable")
-	}
-	if err := exec.Command(runner, "image", "exists", DefaultDebianVerificationImage).Run(); err != nil {
-		t.Skip("pinned Debian verification image is unavailable")
-	}
+	runner := availableContainerRunner(t)
+	// Built for the host architecture: asking a runtime to resolve a
+	// manifest-list digest under a foreign --platform is refused, so a
+	// cross-architecture repository cannot be verified locally today.
+	architecture := hostDebianArchitecture(t)
 	input := t.TempDir()
-	if _, err := testutil.WriteDeb(input, "snail-demo", "1.2.3-1", "amd64", nil); err != nil {
+	if _, err := testutil.WriteDeb(input, "snail-demo", "1.2.3-1", architecture, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := testutil.WriteDeb(input, "snail-demo", "1.2.4-1", "amd64", nil); err != nil {
+	if _, err := testutil.WriteDeb(input, "snail-demo", "1.2.4-1", architecture, nil); err != nil {
 		t.Fatal(err)
 	}
 	output := filepath.Join(t.TempDir(), "repository")
 	if _, err := BuildDeb(context.Background(), BuildDebRequest{
-		Input: input, Output: output, Suite: "stable", Component: "main", Architectures: []string{"amd64"},
+		Input: input, Output: output, Suite: "stable", Component: "main", Architectures: []string{architecture},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -357,13 +356,7 @@ func TestBuildHelmIsByteDeterministic(t *testing.T) {
 }
 
 func TestVerifyHelmWithClient(t *testing.T) {
-	runner, err := exec.LookPath("podman")
-	if err != nil {
-		t.Skip("podman is unavailable")
-	}
-	if err := exec.Command(runner, "image", "exists", DefaultHelmVerificationImage).Run(); err != nil {
-		t.Skip("pinned Helm verification image is unavailable")
-	}
+	runner := availableContainerRunner(t)
 	input := t.TempDir()
 	if _, err := testutil.WriteHelmChart(input, "snail-demo", "1.2.3"); err != nil {
 		t.Fatal(err)
@@ -431,4 +424,34 @@ func readTree(t *testing.T, root string) map[string]string {
 		t.Fatal(err)
 	}
 	return files
+}
+
+// availableContainerRunner finds a container runtime. Requiring podman
+// specifically, and requiring the image to be present already, meant these
+// tests skipped on any machine with only docker — which is most CI, and is why
+// a noexec tmpfs broke this path unnoticed. --pull=missing fetches the image.
+func availableContainerRunner(t *testing.T) string {
+	t.Helper()
+	for _, candidate := range []string{"podman", "docker"} {
+		if _, err := exec.LookPath(candidate); err == nil {
+			return candidate
+		}
+	}
+	t.Skip("no container runner is available")
+	return ""
+}
+
+// hostDebianArchitecture is the Debian name for the architecture these tests
+// run on.
+func hostDebianArchitecture(t *testing.T) string {
+	t.Helper()
+	switch runtime.GOARCH {
+	case "amd64":
+		return "amd64"
+	case "arm64":
+		return "arm64"
+	default:
+		t.Skipf("no Debian architecture mapping for %s", runtime.GOARCH)
+		return ""
+	}
 }

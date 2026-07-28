@@ -47,8 +47,13 @@ var formatSupport = map[string]map[string]FormatSupport{
 	"s3": {
 		"pypi": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 	},
+	// Pages commits by moving a publish ref to an orphan commit of the whole
+	// tree, which is atomic and format-neutral, so a suite's Release and its
+	// Packages and pool become live together. That is what Debian needs and
+	// what an object store cannot offer without an ordered multi-object commit.
 	"github-pages": {
 		"pypi": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		"deb":  {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 	},
 }
 

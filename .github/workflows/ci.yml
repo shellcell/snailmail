@@ -33,6 +33,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # macOS runners ship no Go at all, and a runner's ambient Go can be older
+      # than go.mod requires. Install exactly what go.mod asks for.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
       - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go test -race -count=1 ./...
@@ -56,6 +61,9 @@ jobs:
         target: [linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, freebsd/amd64]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
       - run: GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}" go build ./...
         env:
           TARGET: ${{ matrix.target }}
@@ -75,7 +83,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # A pinned Go tool on the runner's preinstalled toolchain rather than a
-      # third-party action: one less action to trust, no SHA to keep current,
-      # and the identical command runs locally.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      # A pinned Go tool rather than a third-party action: one less action to
+      # trust, and the identical command runs locally. Runners provide
+      # shellcheck, which actionlint invokes on every run block.
       - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 examples/*.yml
