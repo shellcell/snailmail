@@ -1116,7 +1116,10 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			}
 			continue
 		}
-		if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
+		// The publication locks are held for this whole loop, so Git cannot move
+		// the branch under it; confirming HEAD is enough and keeps the cost of a
+		// publication independent of how many repositories it covers.
+		if err := state.AssertGitHeadRevision(root, applyGitRevision); err != nil {
 			return result, err
 		}
 		if err := authorize(item); err != nil {
@@ -1176,7 +1179,10 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 				return result, fmt.Errorf("canonical client probe failed: %w", probeErr)
 			}
 		}
-		if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
+		// The publication locks are held for this whole loop, so Git cannot move
+		// the branch under it; confirming HEAD is enough and keeps the cost of a
+		// publication independent of how many repositories it covers.
+		if err := state.AssertGitHeadRevision(root, applyGitRevision); err != nil {
 			return result, err
 		}
 		deployments = append(deployments, deploymentRecordFor(item.planned, item.deployment, item.observed, item.signingState, committed.Revision.NativeRevision, plan.PlanID, plan.Payload.CreatedAt, request.currentTime()))

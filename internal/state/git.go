@@ -461,6 +461,24 @@ func AssertGitRevisionContext(ctx context.Context, root, expected string) error 
 	return nil
 }
 
+// AssertGitHeadRevision checks only that HEAD still names the expected commit.
+//
+// It is for callers holding the locks AcquireGitRevisionLock takes, which
+// already prevent Git from moving the branch, updating the index or checking
+// anything out. Under those locks the full workspace validation cannot find
+// anything new, and repeating it once per repository made a publication cost
+// grow with the square of the repository count.
+func AssertGitHeadRevision(root, expected string) error {
+	current, err := gitOutput(root, "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("read Git revision during publication: %w", err)
+	}
+	if current != expected {
+		return errors.New("Git revision changed during operation")
+	}
+	return nil
+}
+
 // AcquireGitRevisionLock blocks normal branch, index, and checkout updates while
 // a verified target is switched to the tree authorized by expectedRevision.
 func AcquireGitRevisionLock(root, expectedRevision string) (func(), error) {
