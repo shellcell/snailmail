@@ -136,6 +136,9 @@ func Setup(root string, options SetupOptions) error {
 			repository.Host.PreviewBranch = "gh-pages"
 		}
 	}
+	if err := checkPublicationTargets(manifest, options.Name, repository); err != nil {
+		return err
+	}
 	if err := validateRepositoryHost(options.Name, repository); err != nil {
 		return err
 	}
@@ -1371,4 +1374,67 @@ func hasIgnoreRule(content []byte, rule string) bool {
 		}
 	}
 	return false
+}
+
+// publicationTargets returns the places a repository writes to.
+//
+// A repository owns what it publishes: a local host replaces a managed release
+// directory, and a Pages host force-updates a branch to an orphan commit of the
+// whole tree. Two repositories aimed at one target therefore do not merge, they
+// take turns destroying each other, and the loser looks published right up until
+// someone fetches it.
+func publicationTargets(repository Repository) []string {
+	switch repository.Host.Type {
+	case "s3":
+		return []string{"s3 bucket " + repository.Host.Bucket + " under prefix /" + strings.Trim(repository.Host.Prefix, "/")}
+	case "github-pages":
+		targets := []string{"GitHub Pages branch " + repository.Host.Branch + " of " + repository.Host.Repository}
+		if repository.Host.PreviewRepository != "" {
+			targets = append(targets, "GitHub Pages branch "+repository.Host.PreviewBranch+" of "+repository.Host.PreviewRepository)
+		}
+		return targets
+	default:
+		return []string{"directory " + path.Clean(repository.Host.Path)}
+	}
+}
+
+// checkPublicationTargets refuses a repository that would publish where another
+// already does. Nested directories and prefixes count: publishing into a parent
+// replaces everything below it.
+func checkPublicationTargets(manifest Manifest, name string, candidate Repository) error {
+	for _, existingName := range sortedRepositoryNames(manifest.Repositories) {
+		if existingName == name {
+			continue
+		}
+		existing := manifest.Repositories[existingName]
+		for _, target := range publicationTargets(candidate) {
+			for _, occupied := range publicationTargets(existing) {
+				if !targetsOverlap(target, occupied) {
+					continue
+				}
+				return fmt.Errorf("repository %q would publish to %s, which repository %q already owns",
+					name, target, existingName)
+			}
+		}
+	}
+	return nil
+}
+
+// targetsOverlap reports whether writing to one target disturbs the other. Two
+// targets of the same kind whose paths nest are an overlap, because a managed
+// release replaces a whole directory rather than merging into it.
+func targetsOverlap(left, right string) bool {
+	if left == right {
+		return true
+	}
+	return strings.HasPrefix(left, right+"/") || strings.HasPrefix(right, left+"/")
+}
+
+func sortedRepositoryNames(repositories map[string]Repository) []string {
+	names := make([]string, 0, len(repositories))
+	for name := range repositories {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

@@ -173,7 +173,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 
 func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail keys <new|publish|rotate|audit> [options]")
+		return errors.New("usage: snailmail keys <new|publish|attach|rotate|audit> [options]")
 	}
 	switch args[0] {
 	case "new":
@@ -202,6 +202,28 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		fmt.Fprintf(stdout, "📦  generated signing key %s\n", result.Name)
 		fmt.Fprintf(stdout, "✉️   fingerprint %s; expires %s\n", result.Fingerprint, result.ExpiresAt)
 		fmt.Fprintf(stdout, "    key reference %s\n", result.Reference)
+		return nil
+	case "attach":
+		if len(args) < 2 {
+			return errors.New("usage: snailmail keys attach REPOSITORY --key NAME")
+		}
+		repository := args[1]
+		flags := newCommandFlags("keys attach", stderr).withWorkspace().withJSON()
+		key := flags.String("key", "", "signing key name to attach")
+		if err := flags.parse(args[2:]); err != nil {
+			return err
+		}
+		result, err := engine.AttachKey(engine.AttachKeyRequest{Root: flags.Root(), Repository: repository, Key: *key})
+		if err != nil {
+			return err
+		}
+		if done, err := flags.emit(stdout, result); done || err != nil {
+			return err
+		}
+		printBrand(stdout)
+		fmt.Fprintf(stdout, "📦  %s is now signed by %s\n", result.Repository, result.Key)
+		fmt.Fprintf(stdout, "✉️   fingerprint %s\n", result.Fingerprint)
+		fmt.Fprintf(stdout, "    clients install %s\n", result.Keyring)
 		return nil
 	case "publish":
 		if len(args) < 2 {
@@ -1149,6 +1171,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")
 	fmt.Fprintln(output, "  snailmail keys new NAME [--algo openpgp-rsa4096]")
 	fmt.Fprintln(output, "  snailmail keys publish NAME")
+	fmt.Fprintln(output, "  snailmail keys attach REPOSITORY --key NAME")
 	fmt.Fprintln(output, "  snailmail keys rotate REPOSITORY --successor KEY [--minimum-refresh 720h]")
 	fmt.Fprintln(output, "  snailmail keys rotate REPOSITORY --advance --yes")
 	fmt.Fprintln(output, "  snailmail keys audit")

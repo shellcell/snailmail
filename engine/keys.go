@@ -9,8 +9,10 @@ import (
 	"os"
 	"reflect"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/internal/knowledge"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/signer"
@@ -370,4 +372,81 @@ func sortedSigningKeyNames(keys map[string]state.SigningKey) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+type AttachKeyRequest struct {
+	Root       string
+	Repository string
+	Key        string
+}
+
+type AttachKeyResult struct {
+	Repository  string `json:"repository"`
+	Key         string `json:"key"`
+	Fingerprint string `json:"fingerprint"`
+	Keyring     string `json:"keyring"`
+}
+
+// AttachKey signs a repository that was configured without a key.
+//
+// Starting unsigned and adding signing once a key exists is the ordinary
+// adoption path, and it had no command: setup only creates repositories, and
+// rotate needs a current key to replace, so an unsigned repository could never
+// become signed except by editing the manifest by hand.
+//
+// Replacing a key that is already in use is deliberately not this operation.
+// Clients trust what they have already fetched, so a live key changes through
+// rotation, which serves both keys for an overlap before retiring the old one.
+func AttachKey(request AttachKeyRequest) (AttachKeyResult, error) {
+	root, err := workspaceRoot(request.Root)
+	if err != nil {
+		return AttachKeyResult{}, err
+	}
+	if err := state.RequireGitRepository(root); err != nil {
+		return AttachKeyResult{}, err
+	}
+	unlock, err := state.AcquireWorkspaceLock(root)
+	if err != nil {
+		return AttachKeyResult{}, err
+	}
+	defer unlock()
+	manifest, err := state.LoadManifest(root)
+	if err != nil {
+		return AttachKeyResult{}, err
+	}
+	repository, exists := manifest.Repositories[request.Repository]
+	if !exists {
+		return AttachKeyResult{}, fmt.Errorf("repository %q is not configured", request.Repository)
+	}
+	key, exists := manifest.Keys[request.Key]
+	if !exists {
+		return AttachKeyResult{}, fmt.Errorf("unknown signing key %q", request.Key)
+	}
+	selected, err := formats.For(repository.Format)
+	if err != nil {
+		return AttachKeyResult{}, err
+	}
+	if !selected.ImplementsSigning() {
+		return AttachKeyResult{}, fmt.Errorf("snailmail does not produce repository signatures for format %q", repository.Format)
+	}
+	if len(repository.SigningKeys) != 0 {
+		return AttachKeyResult{}, fmt.Errorf(
+			"repository %q is already signed by %s; use `snailmail keys rotate` so clients keep trusting it through the change",
+			request.Repository, strings.Join(repository.SigningKeys, ", "))
+	}
+	if key.PublicKeyPath == "" {
+		return AttachKeyResult{}, fmt.Errorf("signing key %q has no published public form; run `snailmail keys publish %s` first", request.Key, request.Key)
+	}
+	// The keyring is what a client installs, so it is derived from the key the
+	// workspace already recorded rather than asked for a second time.
+	repository.SigningKeys = []string{request.Key}
+	repository.SigningKeyring = key.PublicKeyPath
+	manifest.Repositories[request.Repository] = repository
+	if err := state.WriteManifest(root, manifest); err != nil {
+		return AttachKeyResult{}, err
+	}
+	return AttachKeyResult{
+		Repository: request.Repository, Key: request.Key,
+		Fingerprint: key.Fingerprint, Keyring: key.PublicKeyPath,
+	}, nil
 }
