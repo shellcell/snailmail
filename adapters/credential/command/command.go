@@ -183,7 +183,7 @@ func (broker *Broker) Issue(ctx context.Context, scope host.ReadScope) (host.Bas
 	if err != nil || !expiresAt.After(time.Now().UTC()) || expiresAt.After(time.Now().UTC().Add(15*time.Minute)) || response.Username == "" || response.Password == "" {
 		return nil, errors.New("credential broker returned invalid or excessive credentials")
 	}
-	return &credential{username: response.Username, password: response.Password, expiresAt: expiresAt}, nil
+	return &credential{username: []byte(response.Username), password: []byte(response.Password), expiresAt: expiresAt}, nil
 }
 
 func brokerEnvironment() []string {
@@ -230,27 +230,32 @@ func (buffer *limitedBuffer) Write(content []byte) (int, error) {
 	return len(content), nil
 }
 
+// credential holds its secret as bytes so Destroy can actually overwrite it.
+// Go strings are immutable, so assigning "" only drops a reference and leaves
+// the secret readable in the heap until the collector happens to reuse it.
 type credential struct {
 	mutex     sync.Mutex
-	username  string
-	password  string
+	username  []byte
+	password  []byte
 	expiresAt time.Time
 }
 
 func (credential *credential) Basic(_ context.Context) (string, string, error) {
 	credential.mutex.Lock()
 	defer credential.mutex.Unlock()
-	if credential.username == "" || credential.password == "" || !time.Now().UTC().Before(credential.expiresAt) {
+	if len(credential.username) == 0 || len(credential.password) == 0 || !time.Now().UTC().Before(credential.expiresAt) {
 		return "", "", errors.New("private read credential is unavailable or expired")
 	}
-	return credential.username, credential.password, nil
+	return string(credential.username), string(credential.password), nil
 }
 
 func (credential *credential) Destroy() {
 	credential.mutex.Lock()
 	defer credential.mutex.Unlock()
-	credential.username = ""
-	credential.password = ""
+	clear(credential.username)
+	clear(credential.password)
+	credential.username = nil
+	credential.password = nil
 	credential.expiresAt = time.Time{}
 }
 

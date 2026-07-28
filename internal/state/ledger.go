@@ -167,10 +167,6 @@ func parseLedger(reader io.Reader) ([]PublicationRecord, error) {
 	return records, nil
 }
 
-func recordIdentity(record PublicationRecord) string {
-	return record.Repository + "\x00" + record.PlanID + "\x00" + record.ChangeID + "\x00" + record.Package + "\x00" + record.Version + "\x00" + strings.Join(record.BlobSHA256, ",") + "\x00" + record.TreeSHA256 + "\x00" + record.RecordedAt
-}
-
 func publicationRecordKey(record PublicationRecord) string {
 	return record.PlanID + "\x00" + record.ChangeID + "\x00" + record.Package + "\x00" + record.Version
 }
@@ -307,22 +303,6 @@ func PreparePublicationRecords(root, baseRevision, repository, planID, changeID,
 		return fmt.Errorf("publication ledger %q differs from the reviewed base", repository)
 	}
 	return atomicWrite(name, expectedContent, 0o644)
-}
-
-func ValidatePreparedPublicationLedger(root, baseRevision, repository, planID, changeID, treeSHA, recordedAt string, lock RepositoryLock) error {
-	expectedContent, err := expectedPublicationLedger(root, baseRevision, repository, planID, changeID, treeSHA, recordedAt, lock)
-	if err != nil {
-		return err
-	}
-	name, err := ledgerPath(root, repository)
-	if err != nil {
-		return err
-	}
-	actualContent, err := os.ReadFile(name)
-	if err != nil {
-		return err
-	}
-	return comparePublicationLedger(repository, expectedContent, actualContent)
 }
 
 func ValidateCommittedPublicationLedger(root, baseRevision, committedRevision, repository, planID, changeID, treeSHA, recordedAt string, lock RepositoryLock) error {

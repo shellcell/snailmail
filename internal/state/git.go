@@ -54,10 +54,6 @@ func RequireGitRepositoryContext(ctx context.Context, root string) error {
 	return nil
 }
 
-func RequireCompleteGitHistory(root string) error {
-	return requireCompleteGitHistoryContext(context.Background(), root)
-}
-
 func RequireCompleteGitHistoryContext(ctx context.Context, root string) error {
 	return requireCompleteGitHistoryContext(ctx, root)
 }

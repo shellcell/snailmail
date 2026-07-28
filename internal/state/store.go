@@ -868,7 +868,9 @@ func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob
 	if !placementExists {
 		lock.Placement = append(lock.Placement, Placement{Package: packageName, Version: version, Track: track, Distro: distro})
 	}
-	canonicalizeLock(lock)
+	// Canonical order is a property of the written file, and WriteLock
+	// establishes it. Sorting here instead re-sorted the whole lock once per
+	// added artifact, which made `snailmail add` quadratic in an existing lock.
 	return !blobExists || !placementExists, nil
 }
 
@@ -1243,7 +1245,7 @@ func ensureGitignore(root string) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if strings.Contains(string(content), ".snailmail/") {
+	if hasIgnoreRule(content, ".snailmail/") {
 		return nil
 	}
 	if len(content) != 0 && content[len(content)-1] != '\n' {
@@ -1251,4 +1253,17 @@ func ensureGitignore(root string) error {
 	}
 	content = append(content, []byte(block)...)
 	return atomicWrite(name, content, 0o644)
+}
+
+// hasIgnoreRule reports whether rule is present as its own directive. A
+// substring search also matched the rule inside a comment or, worse, inside a
+// "!.snailmail/" negation that re-includes exactly what must stay ignored.
+func hasIgnoreRule(content []byte, rule string) bool {
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if line == rule || line == "/"+rule {
+			return true
+		}
+	}
+	return false
 }

@@ -1121,6 +1121,10 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return result, err
 		}
 		if committed.Access.Credential != nil {
+			// The deferred destroy covers the error paths below, which return
+			// immediately. Successful iterations destroy their own credential at
+			// the end so that a multi-repository apply does not accumulate live
+			// short-lived credentials until the whole apply finishes.
 			defer committed.Access.Credential.Destroy()
 		}
 		result.Applied++
@@ -1170,6 +1174,9 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return result, err
 		}
 		deployments = append(deployments, deploymentRecordFor(item.planned, item.deployment, item.observed, item.signingState, committed.Revision.NativeRevision, plan.PlanID, plan.Payload.CreatedAt, request.currentTime()))
+		if committed.Access.Credential != nil {
+			committed.Access.Credential.Destroy()
+		}
 	}
 	if unlockGit != nil {
 		unlockGit()
@@ -1552,25 +1559,6 @@ func materializeLockedArtifact(ctx context.Context, output string, generatedAt t
 		return BuildResult{}, err
 	}
 	return BuildResult{Format: manifest.Format, Output: output, TreeSHA256: manifest.TreeSHA256, ManifestSHA256: manifestSHA256}, nil
-}
-
-func activePackageVersions(lock state.RepositoryLock) []state.PackageVersion {
-	active := make(map[string]bool)
-	for _, placement := range lock.Placement {
-		active[placement.Package+"\x00"+placement.Version] = true
-	}
-	var result []state.PackageVersion
-	for _, packageVersion := range lock.PackageVersion {
-		if active[packageVersion.Package+"\x00"+packageVersion.Version] {
-			result = append(result, packageVersion)
-		}
-	}
-	return result
-}
-
-func activeLock(lock state.RepositoryLock) state.RepositoryLock {
-	lock.PackageVersion = activePackageVersions(lock)
-	return lock
 }
 
 func visiblePackageVersions(lock state.RepositoryLock, repository state.Repository) []state.PackageVersion {

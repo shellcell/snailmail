@@ -222,10 +222,6 @@ func LoadBlobContext(ctx context.Context, root, format string, locked LockedBlob
 	return result, name, nil
 }
 
-func ValidateLockedBlobFile(name, format string, locked LockedBlob) (domain.Blob, error) {
-	return validateLockedBlob(name, format, locked)
-}
-
 func ValidateLockedBlobReference(format string, locked LockedBlob) error {
 	decoded, err := hex.DecodeString(locked.SHA256)
 	if err != nil || len(decoded) != sha256.Size || locked.SHA256 != strings.ToLower(locked.SHA256) {
@@ -239,10 +235,6 @@ func ValidateLockedBlobReference(format string, locked LockedBlob) error {
 		return fmt.Errorf("%w: blob sha256:%s exceeds format size limit", blob.ErrCorrupt, locked.SHA256)
 	}
 	return nil
-}
-
-func ValidateLockedBlobOpen(file *os.File, info os.FileInfo, name, format string, locked LockedBlob) (domain.Blob, error) {
-	return validateLockedBlobOpen(file, info, name, format, locked)
 }
 
 func ValidateLockedBlobOpenContext(ctx context.Context, file *os.File, info os.FileInfo, name, format string, locked LockedBlob) (domain.Blob, error) {
