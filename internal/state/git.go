@@ -1078,7 +1078,7 @@ func describeGitLockConflict(blocked string, names []string, cause error) error 
 		return fmt.Errorf("%s is held by another Git process", blocked)
 	}
 	details := strings.ReplaceAll(strings.TrimSpace(string(content)), "\n", " ")
-	if owner, found := gitLockOwnerProcess(content); found && processExists(owner) {
+	if owner, found := gitLockOwnerProcess(content); found && gitLockOwnerIsRunning(owner) {
 		return fmt.Errorf("%s is held by a running snailmail process (%s)", blocked, details)
 	}
 	return fmt.Errorf("%s was left behind by a snailmail run that did not finish (%s); "+
@@ -1095,6 +1095,12 @@ func gitLockOwnerProcess(content []byte) (int, bool) {
 	}
 	return 0, false
 }
+
+// gitLockOwnerIsRunning is a variable so tests can decide the answer instead of
+// depending on which process ids happen to exist. Signalling a live process
+// also answers differently for root and for an ordinary user, so no literal pid
+// gives the same result everywhere.
+var gitLockOwnerIsRunning = processExists
 
 // processExists reports whether a process id is live. A recycled id can make
 // this a false positive, which is why the caller only uses it to soften the

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestForEachObjectRunsEveryIndexOnce(t *testing.T) {
@@ -31,27 +32,36 @@ func TestForEachObjectRunsEveryIndexOnce(t *testing.T) {
 	}
 }
 
-func TestForEachObjectActuallyOverlaps(t *testing.T) {
-	var inFlight, peak atomic.Int64
-	if err := forEachObject(context.Background(), 64, func(_ context.Context, _ int) error {
-		current := inFlight.Add(1)
-		for {
-			previous := peak.Load()
-			if current <= previous || peak.CompareAndSwap(previous, current) {
-				break
-			}
+// The pool must have several requests in flight at once. This waits for a
+// rendezvous rather than sampling a counter: sampling measures parallelism,
+// which a single-CPU machine cannot show even when the pool is working
+// correctly, whereas independent progress is what the pool actually promises.
+func TestForEachObjectOverlapsRequests(t *testing.T) {
+	const overlapping = 2
+	arrived := make(chan struct{}, overlapping)
+	release := make(chan struct{})
+	go func() {
+		for range overlapping {
+			<-arrived
 		}
-		// Hold the slot so other workers have a chance to overlap.
-		for i := 0; i < 20000; i++ {
-			_ = i
+		close(release)
+	}()
+	err := forEachObject(context.Background(), 8, func(_ context.Context, index int) error {
+		if index >= overlapping {
+			return nil
 		}
-		inFlight.Add(-1)
-		return nil
-	}); err != nil {
+		arrived <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-time.After(30 * time.Second):
+			// Only reachable if the pool ran these one after another, since the
+			// release waits for both to have started.
+			return fmt.Errorf("request %d ran alone; the pool did not overlap requests", index)
+		}
+	})
+	if err != nil {
 		t.Fatal(err)
-	}
-	if peak.Load() < 2 {
-		t.Fatalf("peak concurrency was %d; work did not overlap", peak.Load())
 	}
 }
 

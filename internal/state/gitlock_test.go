@@ -7,6 +7,36 @@ import (
 	"testing"
 )
 
+func withGitLockOwnerRunning(t *testing.T, running func(int) bool) {
+	t.Helper()
+	previous := gitLockOwnerIsRunning
+	gitLockOwnerIsRunning = running
+	t.Cleanup(func() { gitLockOwnerIsRunning = previous })
+}
+
+// A lock whose owner is still alive is reported as busy, not as recoverable
+// wreckage, so the message must not invite anyone to delete it.
+func TestGitLockConflictReportsRunningOwnerAsBusy(t *testing.T) {
+	directory := t.TempDir()
+	blocked := filepath.Join(directory, "index.lock")
+	withGitLockOwnerRunning(t, func(int) bool { return true })
+	held := gitLockOwnerPrefix + "\npid=4242\nsince=2026-01-01T00:00:00Z\n"
+	if err := os.WriteFile(blocked, []byte(held), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := acquireGitLock(blocked)
+	if err == nil {
+		t.Fatal("expected acquiring an existing lock to fail")
+	}
+	message := describeGitLockConflict(blocked, []string{blocked}, err).Error()
+	if !strings.Contains(message, "running snailmail process") {
+		t.Fatalf("message %q does not report a live owner", message)
+	}
+	if strings.Contains(message, "remove") {
+		t.Fatalf("a lock a live process holds must not be recommended for removal: %q", message)
+	}
+}
+
 func TestGitLockRecordsItsOwner(t *testing.T) {
 	name := filepath.Join(t.TempDir(), "index.lock")
 	release, err := acquireGitLock(name)
@@ -35,7 +65,8 @@ func TestGitLockConflictExplainsAbandonedLock(t *testing.T) {
 	blocked := filepath.Join(directory, "index.lock")
 	names := []string{blocked, filepath.Join(directory, "HEAD.lock")}
 
-	abandoned := gitLockOwnerPrefix + "\npid=1\nsince=2026-01-01T00:00:00Z\n"
+	withGitLockOwnerRunning(t, func(int) bool { return false })
+	abandoned := gitLockOwnerPrefix + "\npid=4242\nsince=2026-01-01T00:00:00Z\n"
 	if err := os.WriteFile(blocked, []byte(abandoned), 0o600); err != nil {
 		t.Fatal(err)
 	}
