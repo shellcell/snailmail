@@ -705,6 +705,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		hostStage      host.StagedPublication
 		stageRoot      string
 		stage          string
+		stagedManifest buildgraph.RepositoryManifest
 		current        bool
 		deployment     state.DeploymentRecord
 		signingState   deploymentSigningState
@@ -885,10 +886,11 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if buildErr == nil && !signingContentsEqual(staged.Signing, planned.Signing) {
 			buildErr = errors.New("stale plan: signing recipe changed")
 		}
+		var stagedManifest buildgraph.RepositoryManifest
 		if buildErr == nil {
 			structuralRequest := request
 			structuralRequest.StructuralOnly = true
-			buildErr = verifyStaged(ctx, repository.Format, stageOutput, structuralRequest)
+			stagedManifest, buildErr = verifyStaged(ctx, repository.Format, stageOutput, structuralRequest)
 		}
 		if buildErr != nil {
 			_ = os.RemoveAll(stage)
@@ -897,7 +899,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			}
 			return ApplyWorkspaceResult{}, buildErr
 		}
-		item.stageRoot, item.stage = stage, stageOutput
+		item.stageRoot, item.stage, item.stagedManifest = stage, stageOutput, stagedManifest
 		prepared = append(prepared, item)
 	}
 	defer func() {
@@ -947,7 +949,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if item.current {
 			continue
 		}
-		files, err := stagedHostFiles(item.stage)
+		files, err := stagedHostFiles(item.stage, item.stagedManifest)
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
@@ -966,7 +968,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			continue
 		}
 		if item.hostRepository.Type == "local" {
-			if err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
+			if _, err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
 				return ApplyWorkspaceResult{}, err
 			}
 			continue
@@ -1446,7 +1448,8 @@ func verifyCanonicalClient(ctx context.Context, root string, repository state.Re
 		if err != nil {
 			return err
 		}
-		return verifyStaged(ctx, repository.Format, output, request)
+		_, err = verifyStaged(ctx, repository.Format, output, request)
+		return err
 	}
 	if repository.Format != "pypi" {
 		return fmt.Errorf("canonical client verification is not implemented for format %q", repository.Format)
@@ -1664,19 +1667,19 @@ func planAcquisitionsForVersions(versions []state.PackageVersion) []state.PlanAc
 	return acquisitions
 }
 
-func verifyStaged(ctx context.Context, format, repository string, request ApplyWorkspaceRequest) error {
+func verifyStaged(ctx context.Context, format, repository string, request ApplyWorkspaceRequest) (buildgraph.RepositoryManifest, error) {
 	switch format {
 	case "pypi":
-		_, err := VerifyPyPI(ctx, VerifyPyPIRequest{Repository: repository, Python: request.Python, StructuralOnly: request.StructuralOnly})
-		return err
+		result, err := VerifyPyPI(ctx, VerifyPyPIRequest{Repository: repository, Python: request.Python, StructuralOnly: request.StructuralOnly})
+		return result.Manifest, err
 	case "deb":
-		_, err := VerifyDeb(ctx, VerifyDebRequest{Repository: repository, Runner: request.Runner, Image: request.DebianImage, MaxWorkspaceBytes: request.MaxWorkspaceBytes, StructuralOnly: request.StructuralOnly})
-		return err
+		result, err := VerifyDeb(ctx, VerifyDebRequest{Repository: repository, Runner: request.Runner, Image: request.DebianImage, MaxWorkspaceBytes: request.MaxWorkspaceBytes, StructuralOnly: request.StructuralOnly})
+		return result.Manifest, err
 	case "helm":
-		_, err := VerifyHelm(ctx, VerifyHelmRequest{Repository: repository, Runner: request.Runner, Image: request.HelmImage, StructuralOnly: request.StructuralOnly})
-		return err
+		result, err := VerifyHelm(ctx, VerifyHelmRequest{Repository: repository, Runner: request.Runner, Image: request.HelmImage, StructuralOnly: request.StructuralOnly})
+		return result.Manifest, err
 	default:
-		return fmt.Errorf("unsupported repository format %q", format)
+		return buildgraph.RepositoryManifest{}, fmt.Errorf("unsupported repository format %q", format)
 	}
 }
 
@@ -1811,11 +1814,10 @@ func repositoryInstallDocDigest(root, name string, repository state.Repository) 
 	return state.HashFile(filename)
 }
 
-func stagedHostFiles(directory string) ([]host.File, error) {
-	manifest, err := app.VerifyRepository(directory)
-	if err != nil {
-		return nil, err
-	}
+// stagedHostFiles enumerates a stage that this apply has already verified in
+// full. The host verifies the directory again when it stages it, so the file
+// list is a convenience here rather than the integrity boundary.
+func stagedHostFiles(directory string, manifest buildgraph.RepositoryManifest) ([]host.File, error) {
 	files := make([]host.File, 0, len(manifest.Files)+1)
 	for _, file := range manifest.Files {
 		files = append(files, host.File{Path: file.Path, Size: file.Size, SHA256: file.SHA256})

@@ -1128,12 +1128,31 @@ func snapshotRepository(ctx context.Context, source string, manifest buildgraph.
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return "", err
 		}
-		if err := copyFile(name, target, file.Size); err != nil {
+		if err := linkOrCopyFile(name, target, file.Size); err != nil {
 			return "", err
 		}
 	}
 	keep = true
 	return snapshot, nil
+}
+
+// linkOrCopyFile prefers a hard link, so snapshotting a repository that can
+// reach the 4 GiB verification limit does not duplicate every byte. The link
+// shares the inode with an immutable release file, and the snapshot is only
+// ever read, so the two stay identical by construction. A link across
+// filesystems, or onto one that does not support them, falls back to copying.
+func linkOrCopyFile(sourceName, targetName string, expectedSize int64) error {
+	if err := os.Link(sourceName, targetName); err == nil {
+		info, statErr := os.Lstat(targetName)
+		if statErr != nil {
+			return statErr
+		}
+		if !info.Mode().IsRegular() || info.Size() != expectedSize {
+			return fmt.Errorf("repository file %q changed while snapshotting", sourceName)
+		}
+		return nil
+	}
+	return copyFile(sourceName, targetName, expectedSize)
 }
 
 func copyFile(sourceName, targetName string, expectedSize int64) error {
