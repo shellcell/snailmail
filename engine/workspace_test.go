@@ -855,7 +855,7 @@ func TestApprovalGateBlocksBeforeStageAndAcceptsBoundEvidence(t *testing.T) {
 	}
 	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
 		Root: root, Plan: planName, now: now.Add(2 * time.Minute), StructuralOnly: true,
-		Gates: gate.NewDefaultEvaluator(approvalName),
+		Gates: gate.NewDefaultEvaluator(approvalName, nil),
 	})
 	if err != nil || result.Applied != 1 {
 		t.Fatalf("approved apply result=%#v err=%v", result, err)

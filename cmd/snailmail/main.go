@@ -700,7 +700,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	result, err := engine.ApplyWorkspace(ctx, engine.ApplyWorkspaceRequest{
 		Root: flags.Root(), Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
 		DebianImage: *debianImage, HelmImage: *helmImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
-		Hosts: hosts, Blobs: wire.NewBlobResolver(), Gates: gate.NewDefaultEvaluator(resolvedApprovalFile),
+		Hosts: hosts, Blobs: wire.NewBlobResolver(), Gates: gate.NewDefaultEvaluator(resolvedApprovalFile, wire.NewForgeResolver()),
 	})
 	if err != nil {
 		if result.Applied != 0 || result.Current != 0 {

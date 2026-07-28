@@ -10,10 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"time"
 
+	"github.com/shellcell/snailmail/forge"
 	"github.com/shellcell/snailmail/internal/jsonstrict"
 )
 
@@ -49,10 +49,13 @@ type ApprovalFile struct {
 
 type DefaultEvaluator struct {
 	approvalFile string
+	forges       forge.Resolver
 }
 
-func NewDefaultEvaluator(approvalFile string) *DefaultEvaluator {
-	return &DefaultEvaluator{approvalFile: approvalFile}
+// NewDefaultEvaluator builds an evaluator that reads merged-PR evidence through
+// forges. A nil resolver refuses PR gates rather than allowing them.
+func NewDefaultEvaluator(approvalFile string, forges forge.Resolver) *DefaultEvaluator {
+	return &DefaultEvaluator{approvalFile: approvalFile, forges: forges}
 }
 
 func (evaluator *DefaultEvaluator) Authorize(ctx context.Context, requirement Requirement) error {
@@ -89,7 +92,7 @@ func (evaluator *DefaultEvaluator) requireApproval(requirement Requirement) erro
 }
 
 func (evaluator *DefaultEvaluator) requireMergedPR(ctx context.Context, requirement Requirement) error {
-	return verifyMergedPR(ctx, requirement.Root, requirement.ForgeRepository, requirement.GitRevision)
+	return verifyMergedPR(ctx, evaluator.forges, requirement.Root, requirement.ForgeRepository, requirement.GitRevision)
 }
 
 type PrivateKeyFile struct {
@@ -164,53 +167,40 @@ func approvalKeyID(publicKey []byte) string {
 	return fmt.Sprintf("ed25519:%x", digest[:])
 }
 
-func verifyMergedPR(ctx context.Context, root, forgeRepository, revision string) error {
+// verifyMergedPR proves that a revision reached the default branch through a
+// merged pull request. Every failure to read review state is a refusal:
+// ARCHITECTURE §18 requires an unavailable provider to render unknown and never
+// silently authorize.
+func verifyMergedPR(ctx context.Context, forges forge.Resolver, root, forgeRepository, revision string) error {
 	if forgeRepository == "" {
 		return errors.New("PR gate has no reviewed forge repository")
 	}
-	view := exec.CommandContext(ctx, "gh", "api", "--hostname", "github.com", "repos/"+forgeRepository)
-	view.Dir = root
-	output, err := view.Output()
+	if forges == nil {
+		return errors.New("PR gate has no configured forge")
+	}
+	target := forge.Repository{Name: forgeRepository, WorkingDirectory: root}
+	provider, err := forges.Resolve(ctx, target)
 	if err != nil {
-		return errors.New("PR gate requires an authenticated GitHub repository")
+		return fmt.Errorf("PR gate could not select a forge: %w", err)
 	}
-	var repository struct {
-		FullName      string `json:"full_name"`
-		DefaultBranch string `json:"default_branch"`
+	repository, err := provider.Repository(ctx, target)
+	if err != nil {
+		return errors.New("PR gate could not identify the state repository")
 	}
-	if err := decodeJSON(output, &repository); err != nil || repository.FullName != forgeRepository || repository.DefaultBranch == "" {
-		return errors.New("PR gate could not identify the GitHub state repository")
-	}
-	request := exec.CommandContext(ctx, "gh", "api", "--hostname", "github.com", "-H", "Accept: application/vnd.github+json", "repos/"+forgeRepository+"/commits/"+revision+"/pulls")
-	request.Dir = root
-	output, err = request.Output()
+	pullRequests, err := provider.PullRequestsForRevision(ctx, target, revision)
 	if err != nil {
 		return errors.New("PR gate could not query review evidence")
 	}
-	var pullRequests []struct {
-		Number   int     `json:"number"`
-		MergedAt *string `json:"merged_at"`
-		Base     struct {
-			Ref string `json:"ref"`
-		} `json:"base"`
-	}
-	if err := decodeJSON(output, &pullRequests); err != nil {
-		return errors.New("PR gate received invalid review evidence")
-	}
 	for _, pullRequest := range pullRequests {
-		if pullRequest.Number > 0 && pullRequest.MergedAt != nil && *pullRequest.MergedAt != "" && pullRequest.Base.Ref == repository.DefaultBranch {
-			compare := exec.CommandContext(ctx, "gh", "api", "--hostname", "github.com", "repos/"+forgeRepository+"/compare/"+revision+"..."+repository.DefaultBranch)
-			compare.Dir = root
-			comparison, compareErr := compare.Output()
-			var result struct {
-				Status          string `json:"status"`
-				MergeBaseCommit struct {
-					SHA string `json:"sha"`
-				} `json:"merge_base_commit"`
-			}
-			if compareErr == nil && decodeJSON(comparison, &result) == nil && (result.Status == "ahead" || result.Status == "identical") && result.MergeBaseCommit.SHA == revision {
-				return nil
-			}
+		if pullRequest.Number <= 0 || !pullRequest.Merged || pullRequest.BaseBranch != repository.DefaultBranch {
+			continue
+		}
+		// A merged pull request is not enough on its own: the revision must
+		// still be reachable from the default branch, so a later force-push
+		// cannot leave stale review evidence standing.
+		ancestry, err := provider.RevisionAncestry(ctx, target, revision, repository.DefaultBranch)
+		if err == nil && ancestry.Contains && ancestry.MergeBase == revision {
+			return nil
 		}
 	}
 	return fmt.Errorf("Git revision %s was not merged through a PR into %s", revision, repository.DefaultBranch)

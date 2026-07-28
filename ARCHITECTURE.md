@@ -94,6 +94,7 @@ There are three trust and availability boundaries:
 | Workspace topology and policy | `snailmail.toml` in Git | yes | Repositories, remotes, mappings, gates, and host references. |
 | Owned repository contents | `repos/<repo>.lock.toml` in Git | yes | Package versions, blobs, and placements. |
 | Published-version bindings | `publications/<destination>.jsonl` plus Git history | yes | Append-only evidence that a native version has been submitted or bound to bytes. |
+| Deployment receipts | `deployments/<repo>.json` in Git | yes | Post-verification evidence that a specific tree was observed live; separate from the pre-effect ledger and never proof of current host state. |
 | Artifact bytes | Blob store by SHA-256 | yes | Immutable; location is replaceable. |
 | Public keys | Git | yes | Private key material is never in workspace state. |
 | Private keys | Key backend | yes | Referenced by opaque `KeyRef`. |
@@ -115,10 +116,15 @@ snailmail.toml                 workspace manifest
 repos/<repo>.lock.toml        one canonical lock per owned repository
 publications/<destination>.jsonl
                               append-only owned and foreign publication bindings
-keys/<key>.*.pub              generated public key forms
+deployments/<repo>.json       post-verification deployment receipts
+keys/<key>.gpg, keys/<key>.asc
+                              committed binary and armored public key forms
+keys/<repo>-archive-keyring.gpg
+                              stable multi-identity keyring during rotation
 docs/install-<repo>.md        generated consumer instructions
-.github/workflows/...         generated integration, when GitHub is selected
-.gitlab/...                   generated integration, when GitLab is selected
+.github/workflows/...         planned generated integration; today a pinned
+                              template ships at examples/github-actions.yml
+.gitlab/...                   planned generated integration, when GitLab is selected
 ```
 
 Blobs, private keys, built trees, caches, and temporary plans do not belong in
@@ -217,34 +223,64 @@ flowchart TD
 
 Dependencies point inward. Application services define the ports they consume;
 adapters implement those ports. The application layer never imports concrete
-GitHub, S3, Docker, or OpenPGP adapter packages.
+GitHub, S3, Docker, or OpenPGP adapter packages, with one sanctioned exception:
+the local directory host is dependency-free, is the zero-configuration default,
+and is used by the engine as the fallback host resolver. Every remote adapter
+is wired only in `internal/wire` at the composition root.
 
-### 5.2 Proposed Go package layout
+### 5.2 Go package layout
+
+The layout as built. Where it diverges from the originally proposed layout, the
+divergence was a feasibility decision and the reason is recorded here rather
+than left as drift:
 
 ```text
 cmd/snailmail/                 CLI composition root
-engine/                        small public facade and request/response DTOs
-internal/domain/               entities, values, invariants, domain errors
-internal/app/                  use cases and effect orchestration
-internal/plan/                 plan schema, planner, validation, DAG
+engine/                        public facade and request/response DTOs
+forge/                         review-evidence port (default branch, PRs,
+                               revision ancestry)
+gate/                          publication gates over approval and forge
+                               evidence
+host/, blob/, signer/, source/ effect ports consumed by the application layer
+internal/domain/               entities, values, invariants
+internal/app/                  effect orchestration: materialize, verify,
+                               client probes
+internal/state/                manifest, locks, ledgers, receipts, plans, CAS,
+                               and their Git transactions
 internal/buildgraph/           deterministic repository build evaluator
-internal/config/               manifest and lock decoding, schema migrations
-internal/gitstate/             atomic workspace edits and Git transactions
+internal/factscache/           in-process memo of verified package facts
 internal/knowledge/            immutable compatibility data bundles
+internal/jsonstrict/           bounded strict JSON decoding
 internal/wire/                 registries and dependency construction
-formats/deb/                   pure Debian rules and render operations
-formats/pypi/                  pure PyPI rules and render operations
-formats/helm/                  pure Helm rules and render operations
-formats/...                    later compiled formats
-adapters/blob/{local,oras,s3}/
-adapters/host/{local,pages,s3,registry}/
-adapters/source/{local,http,github}/
-adapters/key/{file,kms,pkcs11}/
-adapters/forge/{github,gitlab,forgejo,plain}/
-adapters/remote/{aur,homebrew,nixpkgs,...}/
-adapters/runner/{docker,podman}/
-adapters/notify/{webhook,...}/
+formats/                       the Format interface and registry; conformance
+                               suite every registered format must pass
+formats/{pypi,deb,helm}/       pure per-ecosystem rules; satisfy the interface
+                               structurally, importing only domain and signer
+adapters/blob/s3/
+adapters/host/{local,githubpages,s3}/
+adapters/source/http/
+adapters/signer/file/
+adapters/forge/{github,plain}/
+adapters/credential/command/   compiled credential-broker helper protocol
 ```
+
+Two proposed subdivisions were deliberately not made:
+
+- `internal/state` was proposed as separate `config`, `gitstate`, and `plan`
+  packages. Measured against the code, the most coupled files — publication
+  ledgers, deployment receipts, CAS — belong to none of the three: they are Git
+  transactions over workspace-encoded state by nature. Splitting along that
+  axis would separate the code that jointly enforces the publication safety
+  invariants. If `state` is subdivided later, the real seams are manifest
+  schema and migration, repository and host validation, and lock mutation.
+- `adapters/key` was proposed while the port table below names the port
+  `Signer`. The port name is right — the boundary is "sign this canonical
+  payload", not key management — so the adapter follows it as
+  `adapters/signer`.
+
+Further adapters — registry hosts, more signer backends and forges, Phase 4
+remotes and notifiers — slot in beside these without moving anything above them.
+`PLAN.md` §11.1 lists the intended targets per driver.
 
 Only `engine` is a supported in-process API. Internal packages can evolve while
 the domain is proven. The future external plugin protocol is separate from the
@@ -252,7 +288,11 @@ Go package API.
 
 ### 5.3 Application services
 
-Application services are cohesive use cases, not one global engine object:
+Application services are cohesive use cases, not one global engine object. The
+current facade realizes each row as request/response functions on `engine`
+rather than service types; the table is the responsibility map those functions
+must keep honoring, and grouping them into types is warranted only when a
+second consumer (the optional server) needs to inject or fake one as a unit:
 
 | Service | Responsibility |
 |---|---|
@@ -300,6 +340,21 @@ type Format interface {
 format conventions while allowing vendored packages that have no Product. The
 actual interfaces should be split by capability so tests and commands only
 depend on what they use. The combined form above documents the boundary.
+
+The implemented boundary lives in `formats` as an interface plus registry that
+every format satisfies structurally, with a conformance suite each registered
+format inherits. It covers identity, artifact size bounds, filename
+recognition, name normalization, inspection, version comparison, the artifact
+coordinate that decides intra-version uniqueness, distro support, signing
+support, commit paths, and index building. `NameFor`, `MapVersion`, and
+`RenderRequirement` are absent by decision, not omission: they consume Product,
+Mapping, and Requirement entities that do not exist yet, and this document
+forbids speculative methods (§17). The signing capability method is named
+`ImplementsSigning` rather than `SupportsSigning` because it answers a narrower
+question than the knowledge bundle: the bundle records what an ecosystem
+defines (Helm defines `.prov`), the interface records what this implementation
+produces, and the conformance suite enforces that implementing implies the
+bundle permits — never the reverse.
 
 ### 6.1 Explicit render inputs
 
@@ -373,12 +428,12 @@ verification and is an accepted availability tradeoff visible in the plan.
 
 ### 6.4 Attestations
 
-A `PackageVersion` may carry `AttestationRef` values containing kind, predicate
-type, subject blob digests, and the digest of attestation bytes in CAS. SBOMs,
-provenance, and detached upstream signatures use this path. They are immutable
-with the package version, appear in locks and plans, and are published as
-adjacent files or index metadata when the format supports them. Repository index
-signatures are build outputs, not PackageVersion attestations.
+Planned for Phase 5. SBOMs, provenance, and detached upstream signatures attach
+to a `PackageVersion` as references to immutable CAS bytes naming exact subject
+blob digests. Two constraints hold whenever they arrive: an attestation is
+immutable with its package version and cannot be moved to another after
+publication, and repository index signatures are build outputs rather than
+package-version attestations.
 
 ### 6.5 Repository artifact
 
@@ -409,16 +464,20 @@ configuration validation rather than midway through apply.
 
 | Port | Required semantics |
 |---|---|
-| `BlobStore` | `Has`, digest-validating `Put`, and digest-validating `Open`; writes are idempotent. |
-| `KnowledgeStore` | Load an immutable, signature-verified bundle by digest. |
-| `Source` | Separate watch and fetch capabilities; fetched bytes are not trusted until hashed. |
+| `BlobStore` | Digest-validating fetch and idempotent digest-validating put. |
+| `Source` | Fetch pinned bytes; nothing fetched is trusted until hashed. Watch joins when the Release model exists. |
 | `Signer` | Report public identity and sign an explicit canonical request without exposing key bytes. |
 | `Host` | Observe revision, stage with a faithful preview, conditionally commit or restore, abort stage, and report capabilities. |
-| `RemoteObserver` | Return present, missing, or unknown with freshness and native version. |
-| `RemotePublisher` | Plan and execute recipe or upload changes with native preconditions. |
-| `Forge` | Git refs, reviews, CI wiring, secret references, environments, and approval evidence. |
-| `Runner` | Execute a pinned image with explicit mounts, network policy, limits, and captured output. |
-| `Notifier` | Deliver typed events; notification failure cannot rewrite publish outcome. |
+| `Forge` | Read review evidence: default branch, pull requests containing a revision, revision ancestry. An unavailable forge is unknown, never authorization. |
+
+Knowledge data is an embedded digest-pinned bundle today; a durable
+`KnowledgeStore` port appears with `knowledge update`. The container runner is
+invoked directly by the application layer with a pinned image digest and an
+allowlisted environment; it becomes a port when a second runner needs
+injection. `RemoteObserver`, `RemotePublisher`, and `Notifier` are Phase 4 and
+are specified when implemented, under the same rule as everything else here:
+unknown never collapses into success, and notification failure cannot rewrite a
+publish outcome.
 
 A driver must return typed errors that preserve whether an operation is safe to
 retry. Provider-specific SDK values do not escape the adapter.
@@ -451,25 +510,18 @@ still being the failed revision, preventing rollback from overwriting a newer
 publisher. A host that cannot retain and restore the prior revision reports that
 capability and never receives an automatic-rollback promise.
 
-`Commit` is the client-visible point. Its guarantees depend on the host:
+`Commit` is the client-visible point. Its guarantees, and the preview each host
+serves before it, depend on the host class:
 
-| Host class | Commit behavior |
-|---|---|
-| Local directory | Rename a complete staged directory on the same filesystem. |
-| Git-backed Pages | Move the publish ref to a complete orphan commit. |
-| Object storage | Upload payload first, publish root metadata last with conditional writes, then defer deletion. |
-| `rsync` host | Transfer payload first and metadata last; no claim of strict atomicity. |
-| Native registry | Use the registry's digest and tag commit protocol. |
+| Host class | Commit | Preview |
+|---|---|---|
+| Local directory | Atomic directory-entry exchange on one filesystem. | Engine HTTP server over the staged directory. |
+| Git-backed Pages | Move the publish ref to a complete orphan commit. | A dedicated preview Pages site provisioned with the same settings; production's ref moves only after verification. |
+| Object storage | Upload payload first, publish root metadata last with conditional writes, defer deletion. | A unique staging prefix used as the repository base. |
+| `rsync` host | Payload first, metadata last; no strict atomicity claim. | A versioned release directory behind a configured preview URL, then switch the canonical symlink. Without that layout it is not Tier 1. |
+| Native registry | The registry's digest and tag commit protocol. | An unadvertised temporary tag verified by digest before the canonical tag moves. |
 
-The corresponding preview mechanisms are:
-
-| Host class | Preview behavior |
-|---|---|
-| Local directory | Engine HTTP server over the staged directory. |
-| Git-backed Pages | Publish to a dedicated preview Pages site provisioned with the same provider settings, then move the production site's publish ref only after verification. |
-| Object storage | Upload to a unique staging prefix and use that origin or CDN prefix as the repository base. |
-| `rsync` host | Upload to a versioned release directory exposed by a configured preview base URL, then switch the canonical symlink or metadata. Without that layout it is not Tier 1. |
-| Native registry | Push an unadvertised temporary tag or manifest and verify by digest before moving the canonical tag. |
+Only the first three are built.
 
 Pages staging never changes the production site's ref. `setup` provisions a
 companion preview site or rejects pre-publication verification for that host.
@@ -803,9 +855,13 @@ Every status cell is one of `current`, `lagging`, `missing`, `pending`,
 `failed`, or `unknown`. Cached observations carry age and origin. `unknown` can
 never be collapsed into `missing`.
 
-The manifest stores each destination's allowed lag duration. Status maps the
-selected upstream release into the destination's native version and compares it
-with `Format.CompareVersions`. An older observed version is `current` during
+This version-derived half of status is blocked on the Release/Source model:
+no entity records the selected upstream release, and no manifest field yet
+stores a destination's allowed lag. Until both exist, status honestly reports
+committed placements, binding completeness, and deployment receipts only. Once
+they do: the manifest stores each destination's allowed lag duration, and
+status maps the selected upstream release into the destination's native version
+and compares it with `Format.CompareVersions`. An older observed version is `current` during
 the tolerance measured from the upstream release time, then `lagging`.
 Equivalent or newer destination versions are `current`; absent packages are
 `missing`; stale or failed observations are `unknown`. Pending gates and failed
@@ -832,13 +888,11 @@ events, or included in crash output. Long-lived host, provider, and signing
 credentials are never exposed to verification containers.
 
 Private-repository verification uses a one-time, read-only credential scoped to
-the staged revision. `Host.Stage` obtains it through a credential broker and
-returns an opaque secret handle, not token bytes. The current PyPI S3 slice
-injects Basic credentials through a mode-0600 netrc under pip's isolated
-temporary home, scrubs that file when pip exits, masks derived values from
-output, and destroys the handle. Containerized clients use the runner's
-in-memory secret channel instead. The token has no publish permission and
-expires with the stage. A host that cannot issue such a scoped credential is
+the staged revision, obtained by `Host.Stage` through a credential broker that
+returns an opaque handle rather than token bytes. It carries no publish
+permission and expires with the stage. However a client receives it — an
+isolated scrubbed netrc, a runner secret channel — the credential is masked from
+output and destroyed after use. A host that cannot issue such a credential is
 unsupported for pre-publication verification of private content.
 
 Adapters request the narrowest credential for one operation. OIDC federation is
@@ -867,29 +921,10 @@ jobs inherently perform privileged effects.
 
 ## 12. Optional server
 
-The server exposes native write protocols and the same application requests as
-the CLI. Its write path is:
-
-```mermaid
-sequenceDiagram
-    participant P as Publisher
-    participant S as Server adapter
-    participant A as Application services
-    participant B as Blob store
-    participant G as Git workspace
-    participant H as Host
-
-    P->>S: authenticated publish
-    S->>A: typed ingest request
-    A->>B: put immutable bytes
-    A->>G: commit lock transaction
-    A->>A: plan and verify under repository policy
-    A->>H: staged publication
-    A-->>S: typed result
-    S-->>P: native protocol response
-```
-
-The server has no authoritative database. Authentication sessions and transient
+The server is Phase 5 and exists only for native write protocols (`npm
+publish`, `twine upload`) and private reads. Its write path is the CLI's: put
+immutable bytes, commit a lock transaction, plan and verify under repository
+policy, stage, publish. The server has no authoritative database. Authentication sessions and transient
 rate-limit state may use external infrastructure, but repository truth remains
 Git, CAS, and live targets. Per-workspace writes are serialized and use the same
 expected-revision rules as CLI operations.
@@ -905,59 +940,54 @@ implementation.
 
 ## 13. Deployment topologies
 
-All supported topologies use the same manifest, locks, plan schema, build graph,
-and repository artifact:
-
-| Topology | Control plane | Blob store | Read plane |
-|---|---|---|---|
-| Solo | local CLI | local CAS | local directory/server |
-| Forge-native | CLI container in forge CI | registry or releases | forge Pages |
-| Cloud static | any CI | object store CAS | object storage plus CDN |
-| Server | optional server | object store or registry | static host or registry |
-| Hybrid | CLI and server | object store or registry | CDN for reads, server for writes |
-
-Changing topology is a driver configuration change. A topology-specific feature
-must not alter the lock schema or repository output for the same explicit render
-inputs.
+Every supported topology — solo laptop, forge-native CI, cloud object storage,
+and later the optional server — uses the same manifest, locks, plan schema,
+build graph, and repository artifact (`PLAN.md` §11.7 tabulates them). Changing
+topology is a driver configuration change. A topology-specific feature must not
+alter the lock schema or repository output for the same explicit render inputs.
 
 ## 14. Failure model and observability
 
-Errors have stable categories and machine-readable fields:
+Errors carry a stable category so a caller can decide whether to retry. The
+host port defines these today, and they are the ones a driver must return:
 
 | Category | Meaning | Retry expectation |
 |---|---|---|
-| `invalid_state` | Schema or domain invariant failed. | Fix state. |
+| `invalid_configuration` | Schema or domain invariant failed. | Fix state. |
 | `stale_plan` | Git, target revision, recipe, or approval changed. | Re-plan and review. |
-| `auth_failure` | Credential absent, expired, or insufficient. | Fix credential. |
 | `infrastructure_failure` | Network, image pull, provider outage, or quota. | Usually retryable. |
-| `build_failure` | Deterministic render or signing contract failed. | Fix inputs or implementation. |
-| `verification_failure` | Generated or deployed repository failed a real client check. | Block commit, or conditionally restore after a canonical failure. |
-| `target_rejected` | Foreign service rejected a valid attempted change. | Inspect target response. |
-| `partial_apply` | Some independent target commits succeeded. | Reconcile remaining targets. |
+| `indeterminate` | An effect may or may not have landed. | Observe before acting; never blindly repeat. |
 
-Every command emits structured events internally. Human logs and `--json`
-results are two renderers over those events. Events include plan ID, repository,
-change ID, target revision, duration, retryability, and redacted cause. They do
-not include secrets or full artifact payloads.
+`indeterminate` is the load-bearing one. It exists so an interrupted
+irreversible effect is never retried on a guess.
 
-There is no required telemetry service. CI logs and result artifacts are enough
-for the initial implementation. OpenTelemetry export can be an optional adapter
-later.
+Categories the model still owes, as their subjects are built: `auth_failure`,
+`build_failure`, `verification_failure` (today a plain apply failure that blocks
+commit or triggers a conditional restore), `target_rejected` and `partial_apply`
+(Phase 4 foreign targets).
+
+Every command reports a typed result, rendered as human output or `--json` from
+the same value so the two cannot drift. Results carry plan ID, repository,
+change ID, and target revision; they never carry secrets or artifact payloads.
+A structured internal event stream is not yet built — CI logs plus those typed
+results are the current observability, and OpenTelemetry export can be an
+optional adapter later.
 
 ## 15. Testing strategy
 
 Architecture claims are enforced by test layers:
 
-| Test layer | Required coverage |
-|---|---|
-| Domain unit tests | Identity, immutability, placement, mapping, gate, and reversibility invariants. |
-| Format unit/property tests | Version mapping/comparison, name normalization, dependency rendering, and parser fuzzing. |
-| Golden repository tests | Byte-for-byte trees from fixed inputs, including timestamps and signatures. |
-| Format conformance | Official clients install from every Tier 1 golden tree in pinned containers. |
-| Adapter contract tests | CAS idempotence, host stage/commit/CAS behavior, signer identity, and remote unknown handling. |
-| Planner tests | Canonical plan IDs, complete preconditions, change ordering, and irreversible labels. |
-| Apply failure-injection tests | Crash before/after each effect, stale revision, failed verification, and rollback behavior. |
-| Topology end-to-end tests | Local and one forge-native path from `setup` through client install. |
+| Test layer | Required coverage | Status |
+|---|---|---|
+| Domain unit tests | Identity, immutability, placement, and gate invariants. | built |
+| Format unit/property tests | Version comparison, name normalization, and parser fuzzing. | built |
+| Format conformance | One suite every registered format inherits: identity, bounds, ordering, coordinates, commit paths, deterministic empty build. | built |
+| Deterministic build tests | Byte-for-byte trees from fixed inputs, including signatures. | built |
+| Adapter contract tests | CAS idempotence, host stage/commit/restore, signer identity, forge unknown handling. | built |
+| Planner tests | Canonical plan IDs, complete preconditions, and staleness rejection. | built |
+| Apply failure-injection tests | Interruption before and after each effect, stale revision, failed verification, rollback. | built |
+| Client install tests | Official clients install from a freshly generated repository in pinned containers. | built for Tier 1 formats |
+| Topology end-to-end tests | Local and one forge-native path from `setup` through client install. | not built |
 
 Additional mandatory checks:
 
@@ -966,12 +996,10 @@ Additional mandatory checks:
    its plan.
 3. Verify every Tier 1 `InstallSpec` against staging and execute the exact
    generated canonical text in the post-commit probe.
-4. Run the same fixture through local and forge-native topology adapters and
-   compare client-visible trees.
-5. Simulate unavailable remotes and assert status is `unknown`.
+4. Assert an unavailable provider renders `unknown` and cannot authorize.
 
-Golden tests alone do not grant Tier 1. The official package client is the final
-conformance authority.
+Determinism tests alone do not grant Tier 1. The official package client is the
+final conformance authority.
 
 ## 16. Scaling and evolution
 
@@ -993,9 +1021,10 @@ Incremental rendering, if added, is a cache over the same build DAG. A clean
 full build must produce the identical artifact digest. It cannot introduce a
 second output path.
 
-Federated workspaces may reference locks in several Git repositories. Each lock
-retains its own revision and plan precondition. Cross-repository apply is
-explicitly non-atomic; centralizing locks remains the default.
+Federated workspaces — locks living in several Git repositories — remain
+unbuilt and centralizing locks is the default. If added, each lock keeps its own
+revision and plan precondition, and cross-repository apply is explicitly
+non-atomic.
 
 ## 17. Initial implementation slice
 
@@ -1009,22 +1038,21 @@ The phase numbers below use the canonical roadmap in `PLAN.md` §14:
    manifest, Git state, or remote hosting is needed for this proof.
 2. **Phase 1:** add the manifest, locks, local CAS, publication ledger, exact
    plan/apply, and local managed release switching.
-3. **Phase 2:** add the provider-neutral host port and owned remote hosting.
-   Public S3-compatible PyPI is the first slice; private-capable S3, public
-   GitHub Pages, shared remote blob storage, publication gates, the public
-   status renderer, and containerized CI distribution complete the phase. The
-   implemented slice includes all of these components for the current PyPI
-   remote-host scope.
+3. **Phase 2:** add the provider-neutral host port and owned remote hosting:
+   public and private S3-compatible PyPI, public GitHub Pages, shared remote
+   blob storage, publication gates, the public status renderer, and
+   containerized CI distribution. Implemented for the PyPI remote-host scope.
 4. **Phase 3:** add explicit signing and key operations, operational status and
-   adoption commands, the knowledge bundle, and additional Tier 1 formats. The
-   implemented first slice provides encrypted file-backed RSA4096 OpenPGP keys,
-   committed public forms, compatibility audit data, plan-resolved deterministic
-   signer responses, and signed Debian `InRelease`/`Release.gpg` assembly. Each
-   signing node records its ID, dependencies, scheme, payload digest, allowed
-   output path, response digest, and a content-addressed recipe digest. Signing
-   identity and plan state are list-shaped for future overlap rotation, while
-   the first backend currently permits one active key. Apply replays those
-   public responses and never resolves private key references.
+   adoption commands, the knowledge bundle, and additional Tier 1 formats.
+   Implemented: encrypted file-backed RSA4096 identities with committed public
+   forms, and plan-resolved deterministic signer responses that apply replays
+   without ever resolving a private key reference. Each signing node records
+   its ID, dependencies, scheme, payload digest, allowed output path, response
+   digest, and a content-addressed recipe digest; signing identity and plan
+   state are list-shaped for rotation overlap while the first backend permits
+   one active key. Remote hosts still serve PyPI only, so signed Debian output
+   currently publishes to local targets — closing that is Phase 3 work, not a
+   footnote.
 
    Debian key rotation is a receipt-backed state machine. `introducing` keeps
    the old active signer and publishes an ordered old-plus-successor binary

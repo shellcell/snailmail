@@ -137,7 +137,11 @@ go run ./cmd/snailmail apply
 The file backend stores encrypted private keys under
 `$XDG_DATA_HOME/snailmail/private-keys` (or
 `~/.local/share/snailmail/private-keys`) with mode `0600`. Passphrases must
-contain at least 24 bytes and should come from a secret manager. `keys publish`
+contain at least 24 bytes and should come from a secret manager. In a container,
+prefer `SNAILMAIL_KEY_PASSPHRASE_FILE` pointing at a mounted file: a container's
+environment stays readable through the runtime's inspection API for as long as
+the container exists, whereas a file can be read once and removed. Setting both
+variables is rejected rather than resolved silently. `keys publish`
 recreates missing public forms after validating the private identity. Planning
 compiles content-addressed `InRelease` and `Release.gpg` signing nodes over the
 exact Debian `Release` bytes, signs each node twice to prove deterministic
@@ -302,9 +306,10 @@ That drops the stripped binary from about 20.6 MB to 12.8 MB. S3 hosts and S3
 blob stores then report that the build has no S3 support; every other format,
 host, and command is unaffected. The default build keeps S3.
 
-`Dockerfile` builds the runtime image; `.github/workflows/snailmail.yml` is a
-pinned template with read-only PR testing and a protected default-branch apply
-job. Configure `AWS_ROLE_ARN`/`AWS_REGION` repository variables for OIDC-backed
+`Dockerfile` builds the runtime image. `examples/github-actions.yml` is a pinned
+workflow template to copy into your own workspace repository, with read-only PR
+testing and a protected default-branch apply job; this repository is not itself
+a snailmail workspace yet, so the template is linted here rather than run. Configure `AWS_ROLE_ARN`/`AWS_REGION` repository variables for OIDC-backed
 S3 access. Cross-repository Pages writes need `SNAILMAIL_GITHUB_TOKEN`. Approval
 jobs need `SNAILMAIL_APPROVAL_REPOSITORIES` and the
 `SNAILMAIL_APPROVAL_PRIVATE_KEY` secret. Private S3 requires an organization
@@ -334,6 +339,8 @@ The short version:
   served index is a build artifact. Rollback is `git revert`.
 - **Declarative.** One manifest says what should be published where; `plan` and
   `apply` reconcile against it.
+- **Scriptable.** Every command that reports a result accepts `--json`, so CI
+  is the CLI in a container.
 - **Gated per repository.** `auto`, provider-bound merged-PR evidence, and
   plan-bound Ed25519 approval evidence share the same apply graph.
 - **Verified.** Apply verifies staged bytes structurally and, unless explicitly

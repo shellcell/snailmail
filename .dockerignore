@@ -1,4 +1,6 @@
 .git
+.github
+examples
 .snailmail
 site
 *.snailmail-plan.json

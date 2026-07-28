@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	githubforge "github.com/shellcell/snailmail/adapters/forge/github"
+	plainforge "github.com/shellcell/snailmail/adapters/forge/plain"
 )
 
 func TestApprovalEvidenceBindsPlanRepositoryAndExpiry(t *testing.T) {
@@ -25,7 +28,7 @@ func TestApprovalEvidenceBindsPlanRepositoryAndExpiry(t *testing.T) {
 	if err := WriteApprovals(filename, evidence); err != nil {
 		t.Fatal(err)
 	}
-	evaluator := NewDefaultEvaluator(filename)
+	evaluator := NewDefaultEvaluator(filename, nil)
 	requirement := Requirement{Policy: "approval", PlanID: strings.Repeat("a", 64), Repository: "python", Now: now, ApprovalKeys: []string{publicKey}}
 	if err := evaluator.Authorize(context.Background(), requirement); err != nil {
 		t.Fatal(err)
@@ -74,10 +77,34 @@ esac
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", directory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	evaluator := NewDefaultEvaluator("")
+	evaluator := NewDefaultEvaluator("", githubforge.NewResolver())
 	if err := evaluator.Authorize(context.Background(), Requirement{
 		Policy: "pr", GitRevision: strings.Repeat("b", 40), Root: directory, ForgeRepository: "shellcell/state",
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A gate with no configured forge must refuse rather than pass: review evidence
+// that cannot be read is unknown, and ARCHITECTURE §18 forbids collapsing
+// unknown into success.
+func TestPRGateRefusesWithoutAForge(t *testing.T) {
+	evaluator := NewDefaultEvaluator("", nil)
+	err := evaluator.Authorize(context.Background(), Requirement{
+		Policy: "pr", GitRevision: strings.Repeat("b", 40), Root: t.TempDir(), ForgeRepository: "shellcell/state",
+	})
+	if err == nil {
+		t.Fatal("a PR gate with no forge authorized publication")
+	}
+}
+
+// A remote with no review API must refuse for the same reason.
+func TestPRGateRefusesOnAForgeWithoutReviewAPI(t *testing.T) {
+	evaluator := NewDefaultEvaluator("", plainforge.NewResolver())
+	err := evaluator.Authorize(context.Background(), Requirement{
+		Policy: "pr", GitRevision: strings.Repeat("b", 40), Root: t.TempDir(), ForgeRepository: "example/state",
+	})
+	if err == nil {
+		t.Fatal("a PR gate against a plain remote authorized publication")
 	}
 }

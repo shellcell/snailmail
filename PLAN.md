@@ -474,7 +474,7 @@ that nobody can debug.
                 Key
 ```
 
-Because `Format.BuildIndex` is pure and returns a *static file tree*:
+Because the format layer is pure and returns a *static file tree*:
 
 - GitHub Pages hosting is free — dump the tree.
 - So is S3, R2, Netlify, `rsync`, a USB stick.
@@ -521,21 +521,13 @@ installs from a freshly generated repository using the exact instructions the
 tool prints. Tier 2 means it generates and is spot-checked. Tier 3 is an
 out-of-tree plugin. No format claims Tier 1 without the test.
 
-```go
-type Format interface {
-    Facts(blob Blob) (PackageFacts, error)   // name, version, arch, deps — derived
-    NormalizeName(name string) string        // PEP 503 folding, npm casing, …
-    NameFor(p Product, role Role) string     // convention template; Mapping overrides
-    MapVersion(up Version, d Distro) (string, error)   // 0.1.2 → 1:0.1.2-1~bookworm1
-    CompareVersions(a, b string) int         // dpkg / rpmvercmp / PEP 440 / semver
-    RenderRequirement(r Requirement, d Distro) (string, error)
-    Distros() []Distro                       // empty for formats without the notion
-    BuildIndex(pl []Placement, k KeyRef) (fs.FS, error)   // pure
-    SigningRequirements() SigReq
-    InstallSnippet(r Repository, d Distro) string   // the same string verify runs
-    Verify(ctx, r Repository, matrix []Platform) error
-}
-```
+The Format boundary is code: the interface and its registry live in `formats/`,
+with a conformance suite every registered format inherits. `ARCHITECTURE.md` §6
+is the normative shape — in particular, a single `BuildIndex(placements, key)`
+call was rejected there because formats like RPM sign in several rounds, and
+`Verify` lives outside the format because formats own no containers. Name
+mapping, version transforms, and dependency rendering join the interface when
+the Product/Mapping model exists (§3.5, §3.7), not before.
 
 ## 6. Git is the state
 
@@ -677,7 +669,7 @@ The verbs, and which part of the model each one touches:
 | `promote <pv> <repo>/<track>` | Placement (add) | ✅ |
 | `demote` / `yank` | Placement (remove), version stays recorded | ✅ |
 | `prune <repo> --keep 5` | Placements, then blob GC | ✅ until GC |
-| `check` | Sources — newer Release? adopted bytes still match their pin? | read-only |
+| `check` | adopted bytes still match their pin? artifacts intact? (release watching awaits Sources) | read-only |
 | `status` | committed repository evidence; live remotes deferred | read-only |
 | `plan` / `apply` | writes the plan / executes exactly it | per-change |
 | `verify` | container install from the staged tree | read-only |
@@ -702,6 +694,11 @@ stateless rebuild-and-deploy has no diff, and wants a deployment gate. Keeping
 both, as per-repository data rather than workflow shape, is the point.
 
 ## 10. Manifest
+
+Target schema. The workspace, repository, and key sections below are
+implemented; the `[product.*]` sections — sources, requirements, and mappings —
+are the design for the unbuilt Release/Mapping half of the model and gate the
+status matrix (§13).
 
 ```toml
 [workspace]
@@ -803,17 +800,17 @@ A Go module holding the domain model, the planner, and **nine driver
 interfaces**. Those interfaces are also the complete answer to "what does this
 thing talk to":
 
-| Driver | Responsibility | Implementations |
+| Driver | Responsibility | Today / representative targets |
 |---|---|---|
-| **Format** | index generation, versions, names, deps | deb, rpm, apk, pypi, npm, helm, oci, cargo, go, maven, nuget, nix, raw |
-| **Source** | watch releases, fetch bytes | github, gitlab, forgejo, git tags, http template, local dir, upstream repo |
-| **BlobStore** | content-addressed bytes | oci/ORAS, forge releases, s3/r2/minio, gcs, azblob, local |
-| **Host** | where a built tree lands | pages (any forge), s3/r2, gcs, rsync+ssh, git branch, oci registry, local |
-| **Forge** | git hosting, PRs, CI, secrets, environments | github, gitlab, forgejo/gitea, plain git |
-| **KeyBackend** | hold or use private key material | file, age/SOPS, pass, 1Password, CI secret, KMS, PKCS#11 |
-| **Remote** | foreign repositories | aur, homebrew tap, nixpkgs, npmjs, pypi, crates.io, ghcr, repology |
-| **Runner** | containers for verify and sandboxed builds | docker, podman, nerdctl, remote CI |
-| **Notifier** | gate pending, verify failed, upstream lag | forge issue/comment, slack, webhook, smtp |
+| **Format** | index generation, versions, names, deps | pypi, deb, helm; then raw, rpm, apk (§5 tiers) |
+| **Source** | watch releases, fetch bytes | pinned HTTPS fetch; watch awaits the Release model |
+| **BlobStore** | content-addressed bytes | local CAS, S3-compatible; ORAS/registry later |
+| **Host** | where a built tree lands | local dir, S3-compatible, GitHub Pages; rsync/registry later |
+| **Forge** | review evidence for gates | github, plain git; gitlab/forgejo later |
+| **Signer** | hold or use private key material | encrypted file; KMS/PKCS#11 later |
+| **Remote** | foreign repositories | Phase 4: aur, homebrew, nixpkgs, npmjs, pypi, ghcr |
+| **Runner** | containers for verify | docker, podman |
+| **Notifier** | gate pending, verify failed, upstream lag | Phase 4 |
 
 Nothing above the engine may know which implementation is in use. That is the
 rule that keeps GitHub from quietly becoming a requirement.
@@ -912,7 +909,7 @@ first-class.
 | Static host | Pages | Pages | Pages | rsync / S3 |
 | Blob store | Releases, ghcr | Releases, Generic Packages, registry | Releases, Packages | S3 / local |
 | Approval gate | Environments | protected env / manual job | manual job | interactive confirm |
-| Secrets | Actions secrets | CI variables | Actions secrets | env / KeyBackend |
+| Secrets | Actions secrets | CI variables | Actions secrets | env / signer backend |
 | OIDC to cloud | ✅ | ✅ | partial | — |
 
 Two things fall out that are easy to miss:
@@ -950,23 +947,15 @@ passing.
 
 ### 11.6 Two webs, not one
 
-| | Public page | Management console |
-|---|---|---|
-| Generated by | `snailmail render` | server |
-| Infrastructure | none — static files | server + auth |
-| Audience | your users | you |
-| Content | status matrix, install instructions, package browser, key fingerprints, badges, `status.json` | the same, plus mutations, gate approvals, key ops, audit log |
-| Phase | 2 | 5 |
+The public page is `snailmail render`: static files, no infrastructure — the
+status matrix, generated install instructions, key fingerprints, and a
+`status.json` for badges. Install instructions generated from what was actually
+built and verified (§7) retire the hand-maintained page that advertises
+packages the repo does not serve.
 
-The public page is the user-facing face of every repository you publish, and it
-should be good — install instructions generated from what was actually built
-and verified (§7) retire the hand-maintained page that advertises packages the
-repo does not serve. It also emits `status.json` so badges and other dashboards
-have something to read.
-
-**Console rule: it is a strict view over the engine.** Every button is a CLI
-command with `--json`. Nothing may be doable only through the console, or the
-console grows private logic and the CLI stops being the product.
+A management console is Phase 5, exists only with the server, and is bound by
+one rule: **it is a strict view over the engine** — every button is a CLI
+command with `--json`, and nothing may be doable only through the console.
 
 ### 11.7 Topologies
 
@@ -1054,8 +1043,8 @@ entirely. **Never require a broadly-scoped personal token**; if an operation
 needs org-wide access, that is what the forge app (component 17) is for, and
 until it exists the operation is manual.
 
-The signing key is the one that matters. §8's `KeyBackend` exists so that with
-KMS or a hardware token the engine never holds it — and the fact that adopting
+The signing key is the one that matters. §8's signer backends exist so that
+with KMS or a hardware token the engine never holds it — and the fact that adopting
 selected third-party bytes (§3.8) means signing them with that key is precisely why it
 deserves this much care.
 
@@ -1085,7 +1074,9 @@ places where the long tail is genuinely unbounded.
 **The CLI is the product.** `--json` on everything, so CI is the CLI in a
 container. The TUI and web page are views over the same engine.
 
-**TUI** (bubbletea). The headline view is the matrix — Products × destinations:
+**The headline view is the matrix** — Products × destinations — served today
+by `status --json` and the rendered page, and later by a TUI over the same
+engine:
 
 ```
               apt      dnf      apk      aur      aur-bin  brew     nixpkgs
@@ -1098,9 +1089,9 @@ container. The TUI and web page are views over the same engine.
 ```
 
 One screen answering a question that currently costs four repos and three CI
-tabs. Drill into a cell for logs, the recipe diff, and available actions.
-Pending gates appear in the same view, so an unmerged bump PR is as visible as
-a failing repository.
+tabs, with pending gates as visible as failing repositories. Filling the
+version cells requires the Release model (§3.1); until then status reports
+committed placements, binding completeness, and deployment receipts.
 
 **Web, read-only**: `snailmail render` emits the same matrix as a static page
 beside the repositories, with badges and generated install instructions. No
@@ -1123,22 +1114,21 @@ becoming a second system:
 Every mutation — CLI, CI, web UI, `npm publish` — becomes the same lock commit.
 One state model, one audit log, one rollback mechanism. Run the server and the
 repositories keep working exactly as they did static, because the output is
-still a tree. An escape hatch (`direct` mode: write to object storage, snapshot
-to git periodically) exists for write rates where per-publish commits are
-absurd — off by default, and it costs you the revert story.
+still a tree. Write rates where per-publish commits are absurd are out of scope
+until proven real; any escape hatch costs the revert story and needs its own
+design first.
 
 ```
-snailmail init
-snailmail setup <format>          # wizard; every prompt is also a flag
-snailmail add | promote | yank | prune
-snailmail check | status
-snailmail plan | apply | verify
-snailmail serve                   # local http over the built tree
+snailmail init | setup <format>     # wizard; every prompt is also a flag
+snailmail add | adopt | promote | yank | prune
+snailmail check | status | doctor <url>
+snailmail plan | approve | apply | verify
 snailmail keys new|publish|audit|rotate
-snailmail doctor <url>            # diagnose any repository, no config needed
-snailmail import <url>            # adopt an existing repo into a manifest
-snailmail render | ui | server
+snailmail approval-key | blob-store | render | serve
 ```
+
+Planned: `import <url>` (adopt an existing repository into a manifest), `ui`,
+`server`. Every command that reports a result accepts `--json`.
 
 ## 14. Phases
 
@@ -1164,12 +1154,8 @@ GitHub Pages, `auto`/`pr`/`approval` gates, generated install and status pages,
 and containerized CI distribution. The private five-minute target uses
 authenticated object storage or a CDN, not GitHub Pages.
 
-The implemented Phase 2 slice now includes those completion items: scoped Basic
-gateway credentials for private S3, workspace-scoped shared S3 CAS, public
-GitHub Pages with an isolated preview repository, merged-PR and Ed25519 approval
-gates, generated install/status artifacts with post-probe deployment receipts,
-and a pinned container/CI template. Additional formats and repository signing
-remain Phase 3 work rather than hidden Phase 2 prerequisites.
+Status: implemented as specified, for the PyPI remote-host scope. `README.md`
+records the exact surface.
 
 **Phase 3 — signing, operations, and breadth.** Add explicit signer effects,
 key backends, the compatibility table, and `keys new|publish|audit|rotate`;
@@ -1179,32 +1165,19 @@ and apk first, followed by nix cache, cargo, go, and maven. Name mapping and
 dependency translation arrive only with formats that prove those abstractions
 are needed.
 
-The first Phase 3 slice is implemented: encrypted file-backed RSA4096 OpenPGP
-identities, committed binary and armored public forms, the versioned signing
-compatibility table, `keys new|publish|audit|rotate`, deterministic plan-resolved
-signature responses, and Debian `InRelease` plus `Release.gpg` verified through
-apt `signed-by`. The persisted key and signing-effect collections are
-rotation-ready. Debian `keys rotate` now implements receipt-backed successor
-introduction, activation, overlap, and retirement with a stable multi-identity
-keyring and one active `InRelease` signer. Repository-local `promote` and `yank`
-now mutate exact placements, with each repository rendering only its configured
-track and Debian suite. Final visible-placement removal produces deterministic
-empty output without discarding package versions, blobs, or publication history.
-Placement-only `prune --keep N` now uses native PEP 440, Debian, and SemVer
-ordering per package/track/distro while deferring physical blob GC. Read-only
-`check` now audits all retained artifact bytes and immutable publication
-bindings against the configured blob authority; upstream freshness remains
-deferred until origin state exists. Read-only `status` now exposes deterministic
-human and JSON summaries of committed placements, publication bindings, and
-deployment receipts without claiming live provider state. Workspace-independent
-`doctor` now performs bounded public-HTTPS inspection of
-PyPI, Debian, and Helm indexes plus selected referenced artifacts, with explicit
-unverified-signature findings. Single-artifact `adopt` now requires a preselected
-SHA-256 and explicit non-secret public-origin confirmation, stores the selected
-URL in lock schema 2, exposes acquisitions in plan schema 10, and supports
-bounded explicit `check --origins`; repository import and upstream release
-discovery remain deferred. Additional backends, remaining operational
-commands, and format expansion remain subsequent Phase 3 slices.
+Status: the signing and operations slices are implemented — encrypted
+file-backed RSA4096 keys with committed public forms, the versioned signing
+compatibility table, `keys new|publish|audit|rotate` with receipt-backed Debian
+rotation, plan-resolved deterministic signatures verified through apt
+`signed-by`, and `promote`/`yank`/`prune`/`check`/`status`/`doctor`/`adopt`.
+`README.md` records the exact surface.
+
+One sequencing debt is now visible and is the next slice, not a footnote:
+remote hosts serve PyPI only, so a signed Debian repository can publish only to
+a local directory. Format breadth and host breadth are coupled through that
+matrix; a signed apt repository that cannot be served remotely is most of the
+Phase 3 value still owed. Remaining after that: additional key backends,
+raw/rpm/apk, `import`, and the TUI.
 
 **Phase 4 — foreign remotes.** Implement `observe` roles first for read-only
 drift detection, then irreversible `target` operations for AUR, Homebrew,
@@ -1254,6 +1227,10 @@ pain is visibility, policy, and setup, not mechanics.
 
 ## 16. Open questions
 
+Resolved since the first draft: the capability table is vendored as a versioned
+knowledge bundle, digest-pinned in every plan; and the tool is a library
+(`engine`) with a thin CLI, as the server will require. Still open:
+
 - **Does the lock shard?** 10k placements is a 40k-line TOML and a miserable
   diff. Per-track files? Per-package? A `.jsonl` that diffs well?
 - **Is `raw` too good?** If the escape hatch is comfortable enough, nobody uses
@@ -1264,9 +1241,6 @@ pain is visibility, policy, and setup, not mechanics.
 - **Rollout: real object or derived view?** Deriving it from Placements is
   cheaper and can't go stale; storing it allows "0.1.2 was released on ‹date›,
   approved by ‹person›" as a fact rather than an inference.
-- **Where does the capability table live?** Vendored (versioned, reviewable,
-  goes stale) or fetched (fresh, a network dependency in a tool that prides
-  itself on purity)? Leaning vendored with an update command.
 - **Is `adopt` at scale just mirroring?** Adopting a handful of upstream
   artifacts and running a pull-through cache of all of PyPI differ in degree,
   not in kind. The model already supports the first. Deciding where the line
@@ -1277,9 +1251,6 @@ pain is visibility, policy, and setup, not mechanics.
   it or merely consumes its output.
 - **Full upstream mirroring** (a pull-through cache of PyPI or Debian) is large,
   adjacent, and commonly wanted. Is it a separate product rather than a phase?
-- **One binary, or library plus thin CLI?** Matters if individual projects'
-  release workflows should import it. Leaning library — the server needs it
-  anyway.
 - **Where does snailmail's own manifest live?** Its own repo with a published
   action, or vendored into the packages repo? Leaning own repo: the manifest
   sits above any one repository.

@@ -1,3 +1,30 @@
+# Template: publish a snailmail workspace from GitHub Actions.
+#
+# This is an example to copy into your own workspace repository as
+# .github/workflows/snailmail.yml — it is not this repository's CI, which lives
+# in .github/workflows/ci.yml. Copying it verbatim is the intent; the notes
+# below are the parts you must supply.
+#
+# Requires in the copying repository:
+#   - a committed snailmail.toml and repos/*.lock.toml (see `snailmail init`)
+#   - full history: publication ledgers are validated against reachable history
+#
+# Configure only what your hosts need:
+#   vars.AWS_ROLE_ARN, vars.AWS_REGION           OIDC-backed S3 access
+#   secrets.SNAILMAIL_GITHUB_TOKEN               cross-repository Pages writes
+#   vars.SNAILMAIL_SIGNING_KEY_REF               <workspace-id>/<key-name>
+#   secrets.SNAILMAIL_SIGNING_PRIVATE_KEY        encrypted private key
+#   secrets.SNAILMAIL_KEY_PASSPHRASE             passphrase, >= 24 bytes
+#                                                (mounted as a file, not an env
+#                                                value — see the plan job)
+#   vars.SNAILMAIL_APPROVAL_REPOSITORIES         comma-separated, approval gates
+#   secrets.SNAILMAIL_APPROVAL_PRIVATE_KEY       Ed25519 approval key
+#
+# The apply job mounts the Docker socket so `--runner docker` can run
+# verification containers. That grants the container root-equivalent control of
+# the runner while it also holds cloud credentials and a write-scoped token;
+# prefer a rootless runner or a dedicated build host if that trade is too wide.
+
 name: snailmail
 
 on:
@@ -10,6 +37,11 @@ on:
         required: true
         type: boolean
         default: false
+
+# A job added later inherits this rather than the repository default; each job
+# below still narrows it further.
+permissions:
+  contents: read
 
 concurrency:
   group: snailmail-${{ github.ref }}
@@ -49,6 +81,7 @@ jobs:
         env:
           SIGNING_KEY_REF: ${{ vars.SNAILMAIL_SIGNING_KEY_REF }}
           SIGNING_PRIVATE_KEY: ${{ secrets.SNAILMAIL_SIGNING_PRIVATE_KEY }}
+          SIGNING_PASSPHRASE: ${{ secrets.SNAILMAIL_KEY_PASSPHRASE }}
         run: |
           test -n "$SIGNING_PRIVATE_KEY"
           case "$SIGNING_KEY_REF" in
@@ -57,24 +90,29 @@ jobs:
           mkdir -p "$RUNNER_TEMP/snailmail-private-keys/$(dirname "$SIGNING_KEY_REF")"
           printf '%s' "$SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/snailmail-private-keys/$SIGNING_KEY_REF.asc"
           chmod 600 "$RUNNER_TEMP/snailmail-private-keys/$SIGNING_KEY_REF.asc"
-          sudo chown -R 0:0 "$RUNNER_TEMP/snailmail-private-keys"
+          # A container's environment stays readable through the runtime's
+          # inspection API for as long as the container exists, so the
+          # passphrase goes in a file the container reads once.
+          install -m 600 /dev/null "$RUNNER_TEMP/snailmail-passphrase"
+          printf '%s' "$SIGNING_PASSPHRASE" > "$RUNNER_TEMP/snailmail-passphrase"
+          sudo chown -R 0:0 "$RUNNER_TEMP/snailmail-private-keys" "$RUNNER_TEMP/snailmail-passphrase"
       - name: Plan
         run: >-
           docker run --rm
           -v "$PWD:/workspace"
           -v "$RUNNER_TEMP/snailmail-private-keys:/root/.local/share/snailmail/private-keys"
+          -v "$RUNNER_TEMP/snailmail-passphrase:/run/snailmail-passphrase:ro"
           -w /workspace
           -e GH_TOKEN
           -e AWS_ACCESS_KEY_ID
           -e AWS_SECRET_ACCESS_KEY
           -e AWS_SESSION_TOKEN
           -e AWS_REGION
-          -e SNAILMAIL_KEY_PASSPHRASE
+          -e SNAILMAIL_KEY_PASSPHRASE_FILE=/run/snailmail-passphrase
           snailmail-ci:${GITHUB_SHA}
           plan --out snailmail.snailmail-plan.json
         env:
           GH_TOKEN: ${{ secrets.SNAILMAIL_GITHUB_TOKEN || github.token }}
-          SNAILMAIL_KEY_PASSPHRASE: ${{ secrets.SNAILMAIL_KEY_PASSPHRASE }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: snailmail-plan-${{ github.sha }}

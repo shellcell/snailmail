@@ -1,0 +1,78 @@
+# CI for this repository. The user-facing publishing template lives in
+# examples/github-actions.yml and is linted here rather than executed, because
+# this repository is not yet a snailmail workspace.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A job added later inherits this rather than the repository default.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Runs on macOS as well as Linux because several publication paths are
+  # platform-specific — the atomic directory-entry exchange behind a managed
+  # release, and executing a retained credential-broker snapshot. Both have
+  # produced darwin-only breakage that a Linux-only suite cannot see.
+  #
+  # Tests skip what the platform lacks, so this leg proves the Go paths; the
+  # container job below is what exercises the real apt, pip and gpgv clients.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+      # The S3 adapters are build-tagged out for smaller binaries; that
+      # configuration has to keep compiling and passing.
+      - run: go vet -tags nos3 ./... && go test -tags nos3 -count=1 ./...
+
+  # Builds the image and runs the suite inside it, which also exercises the
+  # signed-Debian stage against a real apt.
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: docker build --target test --tag snailmail-ci-test:${GITHUB_SHA} .
+
+  # The binary is distributed for platforms no test job runs on.
+  cross-compile:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, freebsd/amd64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}" go build ./...
+        env:
+          TARGET: ${{ matrix.target }}
+
+  # A reachable advisory in a signing dependency is the failure this catches;
+  # one shipped in circl and was found by hand rather than by CI.
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+  lint-template:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # A pinned Go tool on the runner's preinstalled toolchain rather than a
+      # third-party action: one less action to trust, no SHA to keep current,
+      # and the identical command runs locally.
+      - run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 examples/*.yml
