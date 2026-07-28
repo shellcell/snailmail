@@ -76,7 +76,7 @@ func restoreBlobFromOrigin(ctx context.Context, root, format string, locked stat
 	}
 	if response.URL != "" {
 		finalURL, parseErr := url.Parse(response.URL)
-		if parseErr != nil || source.ValidatePublicURL(finalURL) != nil {
+		if parseErr != nil || source.ValidateRedirectURL(finalURL) != nil {
 			return domain.Blob{}, "", errors.New("origin redirected to an unsafe URL")
 		}
 	}

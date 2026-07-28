@@ -35,6 +35,12 @@ func TestVerifyDebInstallsForForeignArchitecture(t *testing.T) {
 		// without it nothing was checked, so there is nothing to report.
 		t.Skipf("cannot resolve the %s image: %v", foreign, err)
 	}
+	if errors.Is(err, app.ErrForeignPlatformUnsupported) {
+		// Resolving the image is not enough: executing it needs QEMU and
+		// binfmt_misc, which Docker Desktop registers and a plain Linux runner
+		// does not. That is a property of the host, not of the repository.
+		t.Skipf("host cannot execute %s containers: %v", foreign, err)
+	}
 	if err != nil {
 		t.Fatalf("verifying a %s repository from %s failed: %v", foreign, runtime.GOARCH, err)
 	}

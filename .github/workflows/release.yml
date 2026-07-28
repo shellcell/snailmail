@@ -1,13 +1,14 @@
 # Builds a tagged snailmail release and publishes it as a GitHub Release.
 #
 # This workflow does not publish a package repository. Distribution is the job
-# of the shellcell/packages workspace, which adopts these assets by digest and
-# serves them from shellcell.dev. Keeping the two apart is what lets snailmail
+# of the shellcell/postoffice workspace, which adopts these assets by digest and
+# serves them from dl.shellcell.dev. Keeping the two apart is what lets snailmail
 # be one tool among several rather than a special case.
 #
-# The assets are named for snailmail's own raw convention
-# (<name>_<version>_<os>_<arch>.<ext>), so the adopting workspace needs no
-# identity flags: the filename already says what the artifact is.
+# Assets carry the names their formats expect — the raw convention
+# <name>_<version>_<os>_<arch>.<ext> for archives, and the Debian convention for
+# packages — so the adopting workspace needs no identity flags: each filename
+# already says what the artifact is.
 name: release
 
 on:
@@ -174,3 +175,27 @@ jobs:
             --title "$TAG" \
             --generate-notes \
             --verify-tag
+
+      # The release is now durable and public, which is what postoffice adopts
+      # from. It pins each asset to the digest in SHA256SUMS and publishes to
+      # dl.shellcell.dev; this repository never writes there itself.
+      #
+      # github.token cannot dispatch across repositories. This needs a token with
+      # Contents: write on the workspace repository — the dispatches endpoint is
+      # gated on Contents, not on pull-request permission. Without the secret the
+      # release still succeeds and the publication is simply run by hand.
+      - name: Ask postoffice to publish
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          WORKSPACE: ${{ vars.POSTOFFICE_REPOSITORY || 'shellcell/postoffice' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "no dispatch token configured; publish postoffice by hand"
+            exit 0
+          fi
+          gh api "repos/${WORKSPACE}/dispatches" \
+            --field event_type=release \
+            --field "client_payload[repository]=${GITHUB_REPOSITORY}" \
+            --field "client_payload[tag]=${TAG}"

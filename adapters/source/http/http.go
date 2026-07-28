@@ -37,7 +37,10 @@ func New() *Fetcher {
 			if len(prior) >= maximumRedirects {
 				return errors.New("too many repository redirects")
 			}
-			return ValidatePublicURL(request.URL)
+			// A redirect target is the server's choice and may carry a signature
+			// in its query, which is how release and object-storage downloads
+			// work; the operator's URL is still held to the stricter rule.
+			return source.ValidateRedirectURL(request.URL)
 		},
 	}
 	return fetcher

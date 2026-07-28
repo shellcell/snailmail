@@ -11,11 +11,32 @@ import (
 
 var ErrLimit = errors.New("source response exceeds limit")
 
+// ValidatePublicURL accepts a URL an operator supplied. It refuses a query
+// string because that URL is recorded as an artifact's origin and committed, and
+// a query is where a credential would hide.
 func ValidatePublicURL(value *url.URL) error {
+	if value != nil && value.RawQuery != "" {
+		return errors.New("source URL must not contain credentials, query, or fragment")
+	}
+	return validateURL(value)
+}
+
+// ValidateRedirectURL accepts a location a server chose rather than the operator.
+//
+// It permits a query string, because that is where object storage puts its
+// signature: GitHub release assets, S3 presigned URLs and Azure SAS all redirect
+// to one. Refusing it made every GitHub Release asset unfetchable. The redirect
+// target is never recorded — the operator's URL is what the lock pins — so a
+// signature cannot leak into the workspace, and every other protection holds.
+func ValidateRedirectURL(value *url.URL) error {
+	return validateURL(value)
+}
+
+func validateURL(value *url.URL) error {
 	if value == nil || value.Scheme != "https" || value.Host == "" || value.Hostname() == "" {
 		return errors.New("source URL must be an absolute HTTPS URL")
 	}
-	if value.User != nil || value.RawQuery != "" || value.Fragment != "" {
+	if value.User != nil || value.Fragment != "" {
 		return errors.New("source URL must not contain credentials, query, or fragment")
 	}
 	hostname := strings.TrimSuffix(strings.ToLower(value.Hostname()), ".")

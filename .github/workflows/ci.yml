@@ -38,6 +38,17 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+      # Cross-architecture verification executes a foreign-architecture
+      # container, which the kernel refuses without binfmt_misc handlers. The
+      # tests skip when they are absent, so without this the coverage silently
+      # disappears rather than failing.
+      - name: Register emulation for foreign architectures
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-user-static binfmt-support
+          test -e /proc/sys/fs/binfmt_misc/qemu-aarch64
       - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go vet ./...
       - run: go test -race -count=1 ./...

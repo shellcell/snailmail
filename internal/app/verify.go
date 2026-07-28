@@ -624,6 +624,10 @@ fi
 	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()
 	if err != nil {
+		if foreignPlatformUnsupported(output) {
+			return fmt.Errorf("%w: verifying %s needs QEMU and binfmt_misc registered for it",
+				ErrForeignPlatformUnsupported, verification.Architecture)
+		}
 		return fmt.Errorf("Debian client verification for %s=%s/%s: %w\n%s", verification.Package, verification.Version, verification.Architecture, err, strings.TrimSpace(string(output)))
 	}
 	return nil

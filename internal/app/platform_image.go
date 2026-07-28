@@ -16,6 +16,22 @@ import (
 // workstation with no registry access — match on it rather than on message text.
 var ErrPlatformUnresolved = errors.New("container platform image could not be resolved")
 
+// ErrForeignPlatformUnsupported reports that the host cannot execute the
+// requested architecture. Resolving the right image is not enough: running a
+// foreign-architecture container needs binfmt_misc handlers and QEMU registered
+// on the host, which Docker Desktop provides and a plain Linux runner does not
+// until qemu-user-static is installed. Nothing was verified and nothing was
+// found wrong, so callers that can proceed without the check match on this
+// rather than on message text.
+var ErrForeignPlatformUnsupported = errors.New("host cannot run containers for this architecture")
+
+// foreignPlatformUnsupported reports whether a runner failed because the image
+// could not be executed at all. The kernel refuses the binary before any of the
+// verification script runs, so this is never a repository problem.
+func foreignPlatformUnsupported(output []byte) bool {
+	return strings.Contains(strings.ToLower(string(output)), "exec format error")
+}
+
 // platformImage resolves a pinned image reference to one that can run as the
 // requested platform.
 //
@@ -78,7 +94,22 @@ func childManifestDigest(ctx context.Context, runner, image, platform string) (s
 		}
 		return "", fmt.Errorf("%s manifest inspect: %w", runner, err)
 	}
-	var index struct {
+	digest, err := selectPlatformDigest(output, platform)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", image, err)
+	}
+	return digest, nil
+}
+
+// selectPlatformDigest picks the child manifest for a platform out of an index.
+//
+// A platform name usually carries no variant, while the index entry does: the
+// official images publish linux/arm64 as variant v8 and linux/arm as v5 and v7.
+// Requiring the variants to be equal therefore matched nothing for exactly the
+// architectures that need a variant, so an unqualified request accepts any
+// variant and prefers an exact match when the index offers one.
+func selectPlatformDigest(index []byte, platform string) (string, error) {
+	var parsed struct {
 		Manifests []struct {
 			Digest   string `json:"digest"`
 			Platform struct {
@@ -88,27 +119,36 @@ func childManifestDigest(ctx context.Context, runner, image, platform string) (s
 			} `json:"platform"`
 		} `json:"manifests"`
 	}
-	if err := json.Unmarshal(output, &index); err != nil {
-		return "", fmt.Errorf("read %s manifest index: %w", image, err)
+	if err := json.Unmarshal(index, &parsed); err != nil {
+		return "", fmt.Errorf("read manifest index: %w", err)
 	}
-	if len(index.Manifests) == 0 {
+	if len(parsed.Manifests) == 0 {
 		// A single-platform image, or a runtime that printed nothing useful.
-		return "", fmt.Errorf("image %s carries no manifest index", image)
+		return "", errors.New("carries no manifest index")
 	}
 	wantOS, wantArchitecture, wantVariant := splitPlatform(platform)
-	for _, manifest := range index.Manifests {
-		if manifest.Platform.OS != wantOS || manifest.Platform.Architecture != wantArchitecture {
+	fallback := ""
+	for _, manifest := range parsed.Manifests {
+		// Attestation entries ride along as unknown/unknown. Nothing would ask
+		// for that platform, but selecting one would hand back a reference that
+		// cannot run, so they are refused rather than merely unmatched.
+		if manifest.Platform.OS == "unknown" || manifest.Platform.Architecture == "unknown" {
 			continue
 		}
-		if manifest.Platform.Variant != wantVariant {
+		if manifest.Digest == "" || manifest.Platform.OS != wantOS || manifest.Platform.Architecture != wantArchitecture {
 			continue
 		}
-		if manifest.Digest == "" {
-			continue
+		if manifest.Platform.Variant == wantVariant {
+			return manifest.Digest, nil
 		}
-		return manifest.Digest, nil
+		if wantVariant == "" && fallback == "" {
+			fallback = manifest.Digest
+		}
 	}
-	return "", fmt.Errorf("image %s has no %s manifest", image, platform)
+	if fallback != "" {
+		return fallback, nil
+	}
+	return "", fmt.Errorf("has no %s manifest", platform)
 }
 
 // splitPlatform parses "linux/amd64" or "linux/arm/v7".

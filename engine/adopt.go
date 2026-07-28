@@ -127,7 +127,7 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	}
 	if response.URL != "" {
 		finalURL, parseErr := url.Parse(response.URL)
-		if parseErr != nil || source.ValidatePublicURL(finalURL) != nil {
+		if parseErr != nil || source.ValidateRedirectURL(finalURL) != nil {
 			return AdoptArtifactResult{}, errors.New("adopt fetcher returned an unsafe final URL")
 		}
 	}
