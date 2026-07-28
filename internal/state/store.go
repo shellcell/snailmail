@@ -23,6 +23,7 @@ import (
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/shellcell/snailmail/blob"
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/source"
 )
 
@@ -81,7 +82,7 @@ func Setup(root string, options SetupOptions) error {
 	if err := ValidateRepositoryName(options.Name); err != nil {
 		return err
 	}
-	if options.Format != "pypi" && options.Format != "deb" && options.Format != "helm" {
+	if !formats.Supported(options.Format) {
 		return fmt.Errorf("unsupported repository format %q", options.Format)
 	}
 	hostType := options.HostType
@@ -100,7 +101,11 @@ func Setup(root string, options SetupOptions) error {
 	if err != nil {
 		return err
 	}
-	if options.Format == "deb" && len(options.SigningKeys) == 0 && !options.AllowUnsigned {
+	selectedFormat, err := formats.For(options.Format)
+	if err != nil {
+		return err
+	}
+	if selectedFormat.ImplementsSigning() && len(options.SigningKeys) == 0 && !options.AllowUnsigned {
 		return errors.New("new Debian repository requires a signing key or explicit unsigned opt-out")
 	}
 	if _, exists := manifest.Repositories[options.Name]; exists {
@@ -301,7 +306,7 @@ func LoadManifest(root string) (Manifest, error) {
 		if !identifierPattern.MatchString(name) {
 			return Manifest{}, fmt.Errorf("invalid repository name %q", name)
 		}
-		if repository.Format != "pypi" && repository.Format != "deb" && repository.Format != "helm" {
+		if !formats.Supported(repository.Format) {
 			return Manifest{}, fmt.Errorf("repository %q has unsupported format %q", name, repository.Format)
 		}
 		if !placementCoordinatePattern.MatchString(repository.Track) {
@@ -562,7 +567,11 @@ func validateRepositorySigning(name string, repository Repository, keys map[stri
 		}
 		return nil
 	}
-	if repository.Format != "deb" {
+	selected, err := formats.For(repository.Format)
+	if err != nil {
+		return fmt.Errorf("repository %q: %w", name, err)
+	}
+	if !selected.ImplementsSigning() {
 		return fmt.Errorf("repository %q: repository signing is currently implemented for Debian only", name)
 	}
 	if len(repository.SigningKeys) != 1 {
@@ -818,6 +827,10 @@ func WriteLock(root string, repository Repository, lock RepositoryLock) error {
 }
 
 func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob, packageName, version string) (bool, error) {
+	selectedFormat, err := formats.For(format)
+	if err != nil {
+		return false, err
+	}
 	if track == "" {
 		track = "stable"
 	}
@@ -848,11 +861,13 @@ func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob
 			blobExists = true
 			break
 		}
-		conflicts := existing.Filename == blob.Filename
-		if format == "helm" || (format == "deb" && existing.Architecture == blob.Architecture) {
-			conflicts = true
-		}
-		if conflicts {
+		existingCoordinate := selectedFormat.ArtifactCoordinate(formats.Artifact{
+			Filename: existing.Filename, Architecture: existing.Architecture,
+		})
+		addedCoordinate := selectedFormat.ArtifactCoordinate(formats.Artifact{
+			Filename: blob.Filename, Architecture: blob.Architecture,
+		})
+		if existing.Filename == blob.Filename || existingCoordinate == addedCoordinate {
 			return false, fmt.Errorf("package %s@%s is already bound to different bytes", packageName, version)
 		}
 	}
@@ -958,7 +973,11 @@ func validatePlacementCoordinates(format, track, distro string) error {
 	if !placementCoordinatePattern.MatchString(track) {
 		return fmt.Errorf("invalid placement track %q", track)
 	}
-	if format == "deb" {
+	selected, err := formats.For(format)
+	if err != nil {
+		return err
+	}
+	if selected.SupportsDistros() {
 		if !placementCoordinatePattern.MatchString(distro) {
 			return fmt.Errorf("invalid Debian placement distro %q", distro)
 		}
@@ -1133,6 +1152,10 @@ func ValidateLock(lock RepositoryLock, expectedRepository, format string) error 
 	if lock.SchemaVersion != LockSchema || lock.Repository != expectedRepository {
 		return fmt.Errorf("lock repository identity does not match %q", expectedRepository)
 	}
+	selectedFormat, err := formats.For(format)
+	if err != nil {
+		return err
+	}
 	versions := make(map[string]bool)
 	for _, packageVersion := range lock.PackageVersion {
 		if packageVersion.Package == "" || packageVersion.Version == "" || packageVersion.State != "draft" || len(packageVersion.Blobs) == 0 {
@@ -1157,13 +1180,9 @@ func ValidateLock(lock RepositoryLock, expectedRepository, format string) error 
 					return errors.New("invalid locked blob origin")
 				}
 			}
-			coordinate := blob.Filename
-			if format == "deb" {
-				coordinate = blob.Architecture
-			}
-			if format == "helm" {
-				coordinate = "chart"
-			}
+			coordinate := selectedFormat.ArtifactCoordinate(formats.Artifact{
+				Filename: blob.Filename, Architecture: blob.Architecture,
+			})
 			if coordinates[coordinate] {
 				return fmt.Errorf("duplicate blob coordinate for %s@%s", packageVersion.Package, packageVersion.Version)
 			}

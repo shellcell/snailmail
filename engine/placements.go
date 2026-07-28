@@ -81,10 +81,8 @@ func mutatePlacement(request PlacementMutationRequest, promote bool) (PlacementM
 	}
 	packageName := nativePackageName(repository.Format, request.Package)
 	distro := request.Distro
-	if repository.Format == "deb" && !request.All {
-		if distro == "" {
-			distro = repository.Suite
-		}
+	if !request.All {
+		distro = defaultPlacementDistro(repository, distro)
 	}
 	changed := 0
 	if promote {

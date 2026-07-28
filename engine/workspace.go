@@ -17,9 +17,7 @@ import (
 
 	localhost "github.com/shellcell/snailmail/adapters/host/local"
 	"github.com/shellcell/snailmail/blob"
-	debformat "github.com/shellcell/snailmail/formats/deb"
-	helmformat "github.com/shellcell/snailmail/formats/helm"
-	"github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/gate"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
@@ -290,10 +288,7 @@ func AddArtifacts(request AddArtifactsRequest) (AddArtifactsResult, error) {
 				return AddArtifactsResult{}, closeErr
 			}
 		}
-		distro := ""
-		if repository.Format == "deb" {
-			distro = repository.Suite
-		}
+		distro := defaultPlacementDistro(repository, "")
 		packageName := nativePackageName(repository.Format, blob.Facts.Name)
 		added, err := state.AddBlob(&lock, repository.Format, request.Track, distro, state.ToLockedBlob(blob), packageName, blob.Facts.Version)
 		if err != nil {
@@ -1266,45 +1261,33 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		defer os.RemoveAll(temporary)
 		output = filepath.Join(temporary, "repository")
 	}
+	selected, err := formats.For(repository.Format)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	if err := requireSigningSupport(selected, repository, plannedSigning); err != nil {
+		return BuildResult{}, err
+	}
 	if len(active) == 0 {
-		var artifact domain.RepositoryArtifact
-		switch repository.Format {
-		case "pypi":
-			if len(plannedSigning) != 0 || len(repository.SigningKeys) != 0 {
-				return BuildResult{}, errors.New("PyPI repository cannot contain repository signing effects")
-			}
-			artifact, err = pypi.Build(nil)
-		case "deb":
-			artifact, err = debformat.Build(nil, debformat.BuildOptions{
-				Suite: repository.Suite, Component: repository.Component, Architectures: repository.Architectures, GeneratedAt: generatedAt,
-			})
-			if err == nil {
-				var signing []state.PlanSigning
-				artifact, signing, err = applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers)
-				if err == nil {
-					result, materializeErr := materializeLockedArtifact(ctx, output, generatedAt, artifact)
-					result.Signing = signing
-					return result, materializeErr
-				}
-			}
-		case "helm":
-			if len(plannedSigning) != 0 || len(repository.SigningKeys) != 0 {
-				return BuildResult{}, errors.New("Helm repository signing is not implemented")
-			}
-			artifact, err = helmformat.Build(nil, helmformat.BuildOptions{GeneratedAt: generatedAt})
-		default:
-			return BuildResult{}, fmt.Errorf("unsupported repository format %q", repository.Format)
-		}
+		artifact, err := selected.Build(nil, formats.BuildOptions{
+			Repository: formatRepository(repository), GeneratedAt: generatedAt,
+		})
 		if err != nil {
 			return BuildResult{}, err
 		}
-		return materializeLockedArtifact(ctx, output, generatedAt, artifact)
+		if !selected.ImplementsSigning() {
+			return materializeLockedArtifact(ctx, output, generatedAt, artifact)
+		}
+		artifact, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers)
+		if err != nil {
+			return BuildResult{}, err
+		}
+		result, materializeErr := materializeLockedArtifact(ctx, output, generatedAt, artifact)
+		result.Signing = signing
+		return result, materializeErr
 	}
 	switch repository.Format {
 	case "pypi":
-		if len(plannedSigning) != 0 || len(repository.SigningKeys) != 0 {
-			return BuildResult{}, errors.New("PyPI repository cannot contain repository signing effects")
-		}
 		return BuildPyPI(ctx, BuildPyPIRequest{Input: input, Output: output, GeneratedAt: generatedAt})
 	case "deb":
 		var resolved []state.PlanSigning
@@ -1316,13 +1299,46 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		result.Signing = resolved
 		return result, err
 	case "helm":
-		if len(plannedSigning) != 0 || len(repository.SigningKeys) != 0 {
-			return BuildResult{}, errors.New("Helm repository signing is not implemented")
-		}
 		return BuildHelm(ctx, BuildHelmRequest{Input: input, Output: output, GeneratedAt: generatedAt})
 	default:
 		return BuildResult{}, fmt.Errorf("unsupported repository format %q", repository.Format)
 	}
+}
+
+// requireSigningSupport rejects signing state a format cannot express, keeping
+// the reason specific to the format rather than a generic capability message.
+// defaultPlacementDistro resolves the distribution coordinate a placement
+// takes when none was requested: the repository's own suite where the format
+// has the notion, and nothing where it does not.
+func defaultPlacementDistro(repository state.Repository, requested string) string {
+	if requested != "" {
+		return requested
+	}
+	selected, err := formats.For(repository.Format)
+	if err != nil || !selected.SupportsDistros() {
+		return ""
+	}
+	return repository.Suite
+}
+
+// formatSupportsSigning reports whether a format name can carry repository
+// signatures, treating an unknown format as unable to.
+func formatSupportsSigning(name string) bool {
+	selected, err := formats.For(name)
+	return err == nil && selected.ImplementsSigning()
+}
+
+func requireSigningSupport(selected formats.Format, repository state.Repository, plannedSigning []state.PlanSigning) error {
+	if selected.ImplementsSigning() || (len(plannedSigning) == 0 && len(repository.SigningKeys) == 0) {
+		return nil
+	}
+	switch selected.Name() {
+	case "pypi":
+		return errors.New("PyPI repository cannot contain repository signing effects")
+	case "helm":
+		return errors.New("Helm repository signing is not implemented")
+	}
+	return fmt.Errorf("format %q cannot contain repository signing effects", selected.Name())
 }
 
 func materializeLockedArtifact(ctx context.Context, output string, generatedAt time.Time, artifact domain.RepositoryArtifact) (BuildResult, error) {
@@ -1515,10 +1531,11 @@ func workspaceRoot(root string) (string, error) {
 }
 
 func nativePackageName(format, name string) string {
-	if format == "pypi" {
-		return pypi.NormalizeName(name)
+	selected, err := formats.For(format)
+	if err != nil {
+		return name
 	}
-	return name
+	return selected.NormalizeName(name)
 }
 
 func optionalSigningKeys(name string) []string {
@@ -1605,22 +1622,19 @@ func stagedHostFiles(directory string, manifest buildgraph.RepositoryManifest) (
 }
 
 func repositoryCommitPaths(repository state.Repository) []string {
-	switch repository.Format {
-	case "pypi":
-		return []string{"simple/index.html"}
-	case "helm":
-		return []string{"index.yaml"}
-	case "deb":
-		if len(repository.SigningKeys) != 0 {
-			return []string{
-				filepath.ToSlash(filepath.Join("dists", repository.Suite, "InRelease")),
-				filepath.ToSlash(filepath.Join("dists", repository.Suite, "Release")),
-				filepath.ToSlash(filepath.Join("dists", repository.Suite, "Release.gpg")),
-			}
-		}
-		return []string{filepath.ToSlash(filepath.Join("dists", repository.Suite, "Release"))}
-	default:
+	selected, err := formats.For(repository.Format)
+	if err != nil {
 		return nil
+	}
+	return selected.CommitPaths(formatRepository(repository))
+}
+
+// formatRepository projects a configured repository onto the fields a format
+// reasons about.
+func formatRepository(repository state.Repository) formats.Repository {
+	return formats.Repository{
+		Suite: repository.Suite, Component: repository.Component,
+		Architectures: repository.Architectures, Signed: len(repository.SigningKeys) != 0,
 	}
 }
 
@@ -1712,7 +1726,7 @@ func validateApplyPlan(plan state.Plan) error {
 			return fmt.Errorf("plan repository %q has unsupported dual signing", repository.Name)
 		}
 		for _, signing := range repository.Signing {
-			if repository.Format != "deb" || signing.KeyName == "" || signing.Algorithm != signer.AlgorithmOpenPGPRSA4096 || !validFingerprint(signing.Fingerprint) ||
+			if !formatSupportsSigning(repository.Format) || signing.KeyName == "" || signing.Algorithm != signer.AlgorithmOpenPGPRSA4096 || !validFingerprint(signing.Fingerprint) ||
 				!validSHA256(signing.PublicKeySHA256) || !validSHA256(signing.PublicArmorSHA256) || !validSHA256(signing.RecipeSHA256) || signing.PublicKeyPath == "" || signing.PublicArmorPath == "" || len(signing.Nodes) != 2 {
 				return fmt.Errorf("plan repository %q has invalid signing metadata", repository.Name)
 			}

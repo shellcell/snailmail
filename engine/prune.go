@@ -3,9 +3,7 @@ package engine
 import (
 	"fmt"
 
-	debformat "github.com/shellcell/snailmail/formats/deb"
-	helmformat "github.com/shellcell/snailmail/formats/helm"
-	pypiformat "github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/internal/state"
 )
 
@@ -59,17 +57,11 @@ func Prune(request PruneRequest) (PruneResult, error) {
 	if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
 		return PruneResult{}, err
 	}
-	var compare state.VersionComparator
-	switch repository.Format {
-	case "pypi":
-		compare = pypiformat.CompareVersions
-	case "deb":
-		compare = debformat.CompareVersions
-	case "helm":
-		compare = helmformat.CompareVersions
-	default:
+	selected, err := formats.For(repository.Format)
+	if err != nil {
 		return PruneResult{}, fmt.Errorf("repository %q has unsupported format %q", request.Repository, repository.Format)
 	}
+	compare := state.VersionComparator(selected.CompareVersions)
 	removed, err := state.PrunePlacements(&lock, request.Keep, compare)
 	if err != nil {
 		return PruneResult{}, fmt.Errorf("prune repository %q: %w", request.Repository, err)

@@ -16,9 +16,7 @@ import (
 	"strings"
 
 	"github.com/shellcell/snailmail/blob"
-	"github.com/shellcell/snailmail/formats/deb"
-	"github.com/shellcell/snailmail/formats/helm"
-	"github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/factscache"
 )
@@ -462,27 +460,17 @@ func ToLockedBlob(blob domain.Blob) LockedBlob {
 }
 
 func inspect(format, filename string, reader io.ReaderAt, size int64) (domain.PackageFacts, error) {
-	switch format {
-	case "pypi":
-		return pypi.Inspect(filename, reader, size)
-	case "deb":
-		return deb.Inspect(filename, reader, size)
-	case "helm":
-		return helm.Inspect(filename, reader, size)
-	default:
+	selected, err := formats.For(format)
+	if err != nil {
 		return domain.PackageFacts{}, fmt.Errorf("unsupported format %q", format)
 	}
+	return selected.Inspect(filename, reader, size)
 }
 
 func formatMaximum(format string) (int64, error) {
-	switch format {
-	case "pypi":
-		return pypi.MaxArtifactSize, nil
-	case "deb":
-		return deb.MaxArtifactSize, nil
-	case "helm":
-		return helm.MaxArtifactSize, nil
-	default:
+	selected, err := formats.For(format)
+	if err != nil {
 		return 0, fmt.Errorf("unsupported format %q", format)
 	}
+	return selected.MaxArtifactSize(), nil
 }

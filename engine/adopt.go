@@ -143,10 +143,7 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	if track == "" {
 		track = repository.Track
 	}
-	distro := request.Distro
-	if repository.Format == "deb" && distro == "" {
-		distro = repository.Suite
-	}
+	distro := defaultPlacementDistro(repository, request.Distro)
 	locked := state.ToLockedBlob(blob)
 	locked.Origin = &state.ArtifactOrigin{Kind: "https", URL: originURL.String()}
 	added, err := state.AddBlob(&lock, repository.Format, track, distro, locked, packageName, blob.Facts.Version)
