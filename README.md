@@ -285,6 +285,17 @@ locks, ledgers, deployment receipts, and an optional current plan:
 go run ./cmd/snailmail render --output site
 ```
 
+The AWS SDK is the largest single component of the binary. Builds that only
+target local directories or GitHub Pages can exclude it:
+
+```sh
+go build -trimpath -ldflags="-s -w" -tags nos3 ./cmd/snailmail
+```
+
+That drops the stripped binary from about 20.6 MB to 12.8 MB. S3 hosts and S3
+blob stores then report that the build has no S3 support; every other format,
+host, and command is unaffected. The default build keeps S3.
+
 `Dockerfile` builds the runtime image; `.github/workflows/snailmail.yml` is a
 pinned template with read-only PR testing and a protected default-branch apply
 job. Configure `AWS_ROLE_ARN`/`AWS_REGION` repository variables for OIDC-backed
