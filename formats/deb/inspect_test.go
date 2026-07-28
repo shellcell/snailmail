@@ -88,3 +88,22 @@ func FuzzInspect(f *testing.F) {
 		_, _ = Inspect(name, bytes.NewReader(raw), int64(len(raw)))
 	})
 }
+
+// Every package dpkg builds leads its archives with a "./" entry, and this
+// inspector refused it as traversal. Nothing caught it because the fixtures
+// were the only packages the format ever saw and none of them had one; the
+// fixtures now write it, so the rest of the suite covers this too. Verified
+// against a real archive package: hello_2.10-3build1 has the same entry.
+func TestInspectAcceptsTheArchiveRootEntry(t *testing.T) {
+	content, filename, err := testutil.Deb("snail-demo", "1.2.3-1", "amd64", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := Inspect(filename, bytes.NewReader(content), int64(len(content)))
+	if err != nil {
+		t.Fatalf("a package with a \"./\" entry was refused: %v", err)
+	}
+	if facts.Name != "snail-demo" || facts.Version != "1.2.3-1" {
+		t.Fatalf("got %s@%s", facts.Name, facts.Version)
+	}
+}

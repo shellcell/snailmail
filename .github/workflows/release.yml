@@ -1,0 +1,176 @@
+# Builds a tagged snailmail release and publishes it as a GitHub Release.
+#
+# This workflow does not publish a package repository. Distribution is the job
+# of the shellcell/packages workspace, which adopts these assets by digest and
+# serves them from shellcell.dev. Keeping the two apart is what lets snailmail
+# be one tool among several rather than a special case.
+#
+# The assets are named for snailmail's own raw convention
+# (<name>_<version>_<os>_<arch>.<ext>), so the adopting workspace needs no
+# identity flags: the filename already says what the artifact is.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, freebsd/amd64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # The version is read from the tag, and checkout fetches no tags by
+          # default. Without this every build stamps as untagged and refuses to
+          # call itself a release.
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: Build and package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # No --always: on a commit with no tag reachable it emits a bare hash,
+          # and a digit-led hash is shaped exactly like a release version.
+          stamp=$(git describe --tags --dirty)
+          case "$stamp" in
+            *-dirty|*-[0-9]*-g[0-9a-f]*)
+              echo "::error::refusing to release from $stamp, which is not an exact clean tag"
+              exit 1 ;;
+          esac
+          version=${stamp#v}
+          goos=${TARGET%/*}
+          goarch=${TARGET#*/}
+          mkdir -p build dist
+          # -trimpath keeps the same tag reproducible across runners.
+          GOOS="$goos" GOARCH="$goarch" go build -trimpath \
+            -ldflags "-s -w -X github.com/shellcell/snailmail/internal/version.stamped=${stamp}" \
+            -o build/snailmail ./cmd/snailmail
+          tar -czf "dist/snailmail_${version}_${goos}_${goarch}.tar.gz" -C build snailmail
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries-${{ strategy.job-index }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  debs:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: Build package
+        env:
+          ARCH: ${{ matrix.arch }}
+          MAINTAINER: ${{ vars.SNAILMAIL_DEB_MAINTAINER || 'shellcell <noreply@shellcell.dev>' }}
+        run: |
+          set -euo pipefail
+          stamp=$(git describe --tags --dirty)
+          case "$stamp" in
+            *-dirty|*-[0-9]*-g[0-9a-f]*)
+              echo "::error::refusing to release from $stamp, which is not an exact clean tag"
+              exit 1 ;;
+          esac
+          version=${stamp#v}
+          # The Debian revision starts at 1 for every upstream version; a rebuild
+          # of the same version would raise it, which a tag alone cannot express.
+          debversion="${version}-1"
+          root="pkg/snailmail_${debversion}_${ARCH}"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" dist
+          GOOS=linux GOARCH="$ARCH" go build -trimpath \
+            -ldflags "-s -w -X github.com/shellcell/snailmail/internal/version.stamped=${stamp}" \
+            -o "$root/usr/bin/snailmail" ./cmd/snailmail
+          # Maintainer and Description are not optional: snailmail's own deb
+          # inspector rejects a package missing either, so a package built
+          # without them could never be published by the tool that built it.
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: snailmail
+          Version: ${debversion}
+          Section: utils
+          Priority: optional
+          Architecture: ${ARCH}
+          Maintainer: ${MAINTAINER}
+          Description: Relaxed package delivery
+           snailmail builds and publishes deterministic static package
+           repositories from a Git-backed workspace.
+          EOF
+          dpkg-deb --root-owner-group --build "$root" "dist/snailmail_${debversion}_${ARCH}.deb"
+          dpkg-deb --info "dist/snailmail_${debversion}_${ARCH}.deb"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: debs-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  publish:
+    needs: [binaries, debs]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: '*'
+          merge-multiple: true
+          path: dist
+      - name: Verify the assets name the release they claim
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=${TAG#v}
+          ls -1 dist
+          test -f "dist/snailmail_${version}_linux_amd64.tar.gz"
+          test -f "dist/snailmail_${version}-1_amd64.deb"
+          mkdir -p runner && tar -xzf "dist/snailmail_${version}_linux_amd64.tar.gz" -C runner
+          # A binary that cannot name its own version must not be published under
+          # one. This is the last point where that is still cheap to catch.
+          reported=$(./runner/snailmail version --json | tr -d ' \n')
+          case "$reported" in
+            *"\"version\":\"${version}\""*) echo "binary reports ${version}" ;;
+            *) echo "::error::binary reports ${reported}, expected version ${version}"; exit 1 ;;
+          esac
+          # The adopting workspace pins every artifact by digest, so the digests
+          # ship with the release rather than being recomputed from whatever the
+          # download happened to return.
+          ( cd dist && sha256sum ./*.tar.gz ./*.deb > SHA256SUMS )
+          cat dist/SHA256SUMS
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            --verify-tag

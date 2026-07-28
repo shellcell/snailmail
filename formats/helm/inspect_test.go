@@ -69,3 +69,21 @@ func FuzzInspect(f *testing.F) {
 		_, _ = Inspect(name, bytes.NewReader(raw), int64(len(raw)))
 	})
 }
+
+// A chart archive that leads with "./" was refused as traversal. `helm package`
+// writes no such entry, so no fixture had one and nothing caught it; the same
+// omission hid the identical defect in the Debian inspector, where every real
+// package carries it.
+func TestInspectAcceptsAnArchiveRootEntry(t *testing.T) {
+	content, filename, err := testutil.HelmChartWithArchiveRoot("snail-demo", "1.2.3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := Inspect(filename, bytes.NewReader(content), int64(len(content)))
+	if err != nil {
+		t.Fatalf("a chart with a \"./\" entry was refused: %v", err)
+	}
+	if facts.Name != "snail-demo" || facts.Version != "1.2.3" {
+		t.Fatalf("got %s@%s", facts.Name, facts.Version)
+	}
+}

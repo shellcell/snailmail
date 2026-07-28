@@ -44,6 +44,24 @@ jobs:
       # The S3 adapters are build-tagged out for smaller binaries; that
       # configuration has to keep compiling and passing.
       - run: go vet -tags nos3 ./... && go test -tags nos3 -count=1 ./...
+      # A stamped build must report the tag as its version, and an ordinary one
+      # must refuse to claim a release. Both directions matter: the second is
+      # what stops a development build being published as a release.
+      - name: Verify version stamping
+        run: |
+          go build -ldflags \
+            "-X github.com/shellcell/snailmail/internal/version.stamped=v9.9.9" \
+            -o ./snailmail-stamped ./cmd/snailmail
+          got=$(./snailmail-stamped version --json | tr -d ' \n')
+          case "$got" in
+            *'"version":"9.9.9"'*) echo "stamped: ok" ;;
+            *) echo "stamped build reported $got"; exit 1 ;;
+          esac
+          go build -o ./snailmail-plain ./cmd/snailmail
+          if ./snailmail-plain version --json | grep -q '"version": *"[^"]'; then
+            echo "an unstamped build claimed a release version"; exit 1
+          fi
+          echo "unstamped: ok"
 
   # Builds the image and runs the suite inside it, which also exercises the
   # signed-Debian stage against a real apt.
@@ -61,10 +79,27 @@ jobs:
         target: [linux/amd64, linux/arm64, darwin/amd64, darwin/arm64, freebsd/amd64]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The release version is read from the Git tag, and checkout fetches
+          # no tags by default. Without this every build stamps as untagged.
+          fetch-depth: 0
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-      - run: GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}" go build ./...
+      - run: go vet ./... && GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}" go build ./...
+        env:
+          TARGET: ${{ matrix.target }}
+      # Build the binary the way a release builds it, so a broken -ldflags path
+      # fails here rather than by shipping a binary that cannot name itself.
+      # No --always: it emits a bare commit hash when no tag is reachable, and a
+      # digit-led hash is shaped exactly like a release version.
+      - name: Build stamped binary
+        run: |
+          stamp=$(git describe --tags --dirty 2>/dev/null || true)
+          echo "stamp: ${stamp:-<none>}"
+          GOOS="${TARGET%/*}" GOARCH="${TARGET#*/}" go build \
+            -ldflags "-X github.com/shellcell/snailmail/internal/version.stamped=${stamp}" \
+            -o "snailmail_${TARGET%/*}_${TARGET#*/}" ./cmd/snailmail
         env:
           TARGET: ${{ matrix.target }}
 

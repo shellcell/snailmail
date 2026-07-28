@@ -16,6 +16,18 @@ func HelmChart(name, version string) ([]byte, string, error) {
 }
 
 func HelmChartWithMetadata(name, version, chartYAML string) ([]byte, string, error) {
+	return helmChart(name, version, chartYAML, false)
+}
+
+// HelmChartWithArchiveRoot builds a chart whose archive leads with a "./"
+// entry. `helm package` does not write one, but a chart rolled by hand with tar
+// does, and it is not a reason to refuse the chart.
+func HelmChartWithArchiveRoot(name, version string) ([]byte, string, error) {
+	return helmChart(name, version, "apiVersion: v2\nname: "+name+"\nversion: "+version+
+		"\nappVersion: 2.4.6\ndescription: deterministic test chart\ntype: application\n", true)
+}
+
+func helmChart(name, version, chartYAML string, rootEntry bool) ([]byte, string, error) {
 	chart, err := tarGzip(map[string]string{
 		name + "/Chart.yaml":  chartYAML,
 		name + "/values.yaml": "message: relaxed delivery\n",
@@ -26,7 +38,7 @@ metadata:
 data:
   message: {{ .Values.message | quote }}
 `,
-	})
+	}, rootEntry)
 	if err != nil {
 		return nil, "", err
 	}

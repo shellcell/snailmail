@@ -85,9 +85,16 @@ func InspectWithExpandedLimit(filename string, reader io.ReaderAt, size, maximum
 		if len(header.Name) > maxArchivePath {
 			return domain.PackageFacts{}, fmt.Errorf("inspect %q: archive path is too long", filename)
 		}
+		// "." is the archive root, not a path within it. `helm package` writes no
+		// such entry, but tar does, and a chart rolled by hand is still a chart.
 		clean := path.Clean(strings.TrimPrefix(header.Name, "./"))
-		if clean == "." || path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
+		if path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 			return domain.PackageFacts{}, fmt.Errorf("inspect %q: unsafe archive path %q", filename, header.Name)
+		}
+		if clean == "." {
+			// The root entry names no chart directory, so it neither sets nor
+			// contradicts the single root a chart must have.
+			continue
 		}
 		entryRoot := strings.SplitN(clean, "/", 2)[0]
 		if root == "" {

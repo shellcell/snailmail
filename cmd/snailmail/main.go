@@ -19,6 +19,7 @@ import (
 	httpsource "github.com/shellcell/snailmail/adapters/source/http"
 	"github.com/shellcell/snailmail/engine"
 	"github.com/shellcell/snailmail/gate"
+	"github.com/shellcell/snailmail/internal/version"
 	"github.com/shellcell/snailmail/internal/wire"
 	"github.com/shellcell/snailmail/signer"
 	"github.com/shellcell/snailmail/source"
@@ -41,6 +42,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return nil
 	}
 	switch args[0] {
+	case "version", "--version", "-version":
+		return runVersion(args[1:], stdout, stderr)
 	case "init":
 		return runInit(args[1:], stdout, stderr)
 	case "setup":
@@ -1052,6 +1055,26 @@ func runVerifyRaw(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
+// runVersion reports what this binary is. The version is stamped from the Git
+// tag at link time, so an ordinary `go build` reports a revision rather than
+// claiming a release it is not.
+func runVersion(args []string, stdout, stderr io.Writer) error {
+	flags := newCommandFlags("version", stderr).withJSON()
+	if err := flags.parse(args); err != nil {
+		return err
+	}
+	build := version.Current()
+	if done, err := flags.emit(stdout, build); done || err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "\u2709\ufe0f   %s\n", build.String())
+	if !build.IsRelease() {
+		fmt.Fprintln(stdout, "    not a release build; nothing here may be published as one")
+	}
+	return nil
+}
+
 func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("serve", stderr)
 	repository := flags.String("repo", "", "generated repository directory")
@@ -1138,6 +1161,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail verify helm --repo DIR [--runner podman]")
 	fmt.Fprintln(output, "  snailmail verify raw --repo DIR")
 	fmt.Fprintln(output, "  snailmail serve --repo DIR [--listen 127.0.0.1:8080]")
+	fmt.Fprintln(output, "  snailmail version [--json]")
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Every command that reports a result accepts --json.")
 }

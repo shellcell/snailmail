@@ -200,8 +200,13 @@ func validateDataArchive(name string, raw io.Reader, maximumExpanded int64) (int
 		if len(header.Name) > maxControlPathSize {
 			return 0, errors.New("data archive path is too long")
 		}
+		// "." is the archive root, not a path within it. Every package dpkg
+		// builds leads with a "./" entry, so rejecting it as traversal turned
+		// away real Debian packages while accepting the synthetic ones this
+		// format was tested against. It still has to be a supported entry type,
+		// so it falls through rather than being skipped.
 		clean := path.Clean(strings.TrimPrefix(header.Name, "./"))
-		if clean == "." || path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
+		if path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
 			return 0, fmt.Errorf("data archive contains unsafe path %q", header.Name)
 		}
 		switch header.Typeflag {
