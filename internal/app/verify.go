@@ -567,25 +567,28 @@ func verifyDebCase(ctx context.Context, runner, image, snapshot string, workspac
 	caseCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	memoryBytes := workspaceBytes + 512<<20
-	arguments := []string{
-		"run", "--rm", "--pull=missing", "--network=none",
-		"--platform", platform,
-		"--read-only", "--memory=" + strconv.FormatInt(memoryBytes, 10), "--cpus=2", "--pids-limit=256",
+	reference, platformFlag := platformImage(caseCtx, runner, image, platform)
+	arguments := []string{"run", "--rm", "--pull=missing", "--network=none"}
+	if platformFlag {
+		arguments = append(arguments, "--platform", platform)
+	}
+	arguments = append(arguments,
+		"--read-only", "--memory="+strconv.FormatInt(memoryBytes, 10), "--cpus=2", "--pids-limit=256",
 		"--ulimit", "fsize=536870912:536870912", "--ulimit", "nofile=1024:1024",
 		"--security-opt", "no-new-privileges",
-		"--volume", snapshot + ":/target/repo:ro,Z",
+		"--volume", snapshot+":/target/repo:ro,Z",
 		"--env", "DEBIAN_FRONTEND=noninteractive",
-		"--env", "SNAILMAIL_SUITE=" + manifest.Install.Suite,
-		"--env", "SNAILMAIL_COMPONENT=" + manifest.Install.Component,
-		"--env", "SNAILMAIL_ARCHITECTURE=" + verification.Architecture,
-		"--env", "SNAILMAIL_PACKAGE=" + verification.Package,
-		"--env", "SNAILMAIL_VERSION=" + verification.Version,
-		"--env", "SNAILMAIL_SIGNING_KEY=" + manifest.Install.SigningKeyPath,
+		"--env", "SNAILMAIL_SUITE="+manifest.Install.Suite,
+		"--env", "SNAILMAIL_COMPONENT="+manifest.Install.Component,
+		"--env", "SNAILMAIL_ARCHITECTURE="+verification.Architecture,
+		"--env", "SNAILMAIL_PACKAGE="+verification.Package,
+		"--env", "SNAILMAIL_VERSION="+verification.Version,
+		"--env", "SNAILMAIL_SIGNING_KEY="+manifest.Install.SigningKeyPath,
 		"--tmpfs", "/tmp:rw,size=64m,mode=1777",
 		// exec is explicit because runtimes mount tmpfs noexec by default and the
 		// chroot below runs apt-get and dpkg-query out of this mount.
-		"--tmpfs", "/target:rw,exec,size=" + strconv.FormatInt(workspaceBytes, 10) + ",mode=0755",
-		image,
+		"--tmpfs", "/target:rw,exec,size="+strconv.FormatInt(workspaceBytes, 10)+",mode=0755",
+		reference,
 		"sh", "-euc", `
 for directory in bin etc lib lib64 sbin usr var; do
     test -e "/$directory" && cp -a "/$directory" /target/
@@ -606,8 +609,7 @@ if test -n "$SNAILMAIL_PACKAGE"; then
     status=$(chroot /target dpkg-query -W -f='${Status} ${Version}' "$SNAILMAIL_PACKAGE")
     test "$status" = "install ok installed $SNAILMAIL_VERSION"
 fi
-`,
-	}
+`)
 	command := exec.CommandContext(caseCtx, runner, arguments...)
 	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()

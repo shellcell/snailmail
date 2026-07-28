@@ -229,9 +229,9 @@ func verifyDebEndpointCase(ctx context.Context, runner, image, endpoint string, 
 	caseCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	memoryBytes := workspaceBytes + 512<<20
+	reference, platformFlag := platformImage(caseCtx, runner, image, platform)
 	arguments := []string{
 		"run", "--rm", "--pull=missing",
-		"--platform", platform,
 		"--read-only", "--memory=" + strconv.FormatInt(memoryBytes, 10), "--cpus=2", "--pids-limit=256",
 		"--ulimit", "fsize=536870912:536870912", "--ulimit", "nofile=1024:1024",
 		"--security-opt", "no-new-privileges",
@@ -257,7 +257,10 @@ func verifyDebEndpointCase(ctx context.Context, runner, image, endpoint string, 
 	if trust.caBundle != "" {
 		arguments = append(arguments, "--volume", trust.caBundle+":/snailmail-ca.crt:ro")
 	}
-	arguments = append(arguments, image, "sh", "-euc", debEndpointScript)
+	if platformFlag {
+		arguments = append(arguments, "--platform", platform)
+	}
+	arguments = append(arguments, reference, "sh", "-euc", debEndpointScript)
 
 	command := exec.CommandContext(caseCtx, runner, arguments...)
 	command.Env = runnerEnvironment()

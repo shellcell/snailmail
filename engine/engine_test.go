@@ -274,9 +274,6 @@ func TestBuildDebIsByteDeterministic(t *testing.T) {
 
 func TestVerifyDebInstallsWithApt(t *testing.T) {
 	runner := availableContainerRunner(t)
-	// Built for the host architecture: asking a runtime to resolve a
-	// manifest-list digest under a foreign --platform is refused, so a
-	// cross-architecture repository cannot be verified locally today.
 	architecture := hostDebianArchitecture(t)
 	input := t.TempDir()
 	if _, err := testutil.WriteDeb(input, "snail-demo", "1.2.3-1", architecture, nil); err != nil {
