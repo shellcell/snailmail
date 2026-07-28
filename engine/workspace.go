@@ -27,6 +27,7 @@ import (
 	"github.com/shellcell/snailmail/internal/state"
 	statusrenderer "github.com/shellcell/snailmail/internal/status"
 	"github.com/shellcell/snailmail/signer"
+	"github.com/shellcell/snailmail/source"
 )
 
 const phase1EngineVersion = "phase3-v1"
@@ -100,7 +101,10 @@ type AddArtifactsResult struct {
 }
 
 type PlanWorkspaceRequest struct {
-	Root             string
+	Root string
+	// Sources fetches an artifact back from the origin its lock records, for a
+	// workspace whose blobs are not in the clone and not in a blob store.
+	Sources          source.Fetcher
 	Output           string
 	GeneratedAt      time.Time
 	createdAt        time.Time
@@ -157,6 +161,7 @@ type RenderStatusResult struct {
 
 type ApplyWorkspaceRequest struct {
 	Root                   string
+	Sources                source.Fetcher
 	Plan                   string
 	now                    time.Time
 	clock                  func() time.Time
@@ -523,7 +528,7 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
-		desired, err := buildLockedRepository(ctx, root, name, repository, lock, generatedAt, createdAt, "", blobStore, manifest.Keys, nil, request.Signers)
+		desired, err := buildLockedRepository(ctx, root, name, repository, lock, generatedAt, createdAt, "", blobStore, manifest.Keys, nil, request.Signers, request.Sources)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
@@ -1268,7 +1273,7 @@ func verifyEndpointClient(ctx context.Context, repository state.Repository, stag
 	}
 }
 
-func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt, signatureTime time.Time, output string, blobStore blob.Store, keys map[string]state.SigningKey, plannedSigning []state.PlanSigning, signers signer.Resolver) (BuildResult, error) {
+func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt, signatureTime time.Time, output string, blobStore blob.Store, keys map[string]state.SigningKey, plannedSigning []state.PlanSigning, signers signer.Resolver, fetcher source.Fetcher) (BuildResult, error) {
 	staging, err := stagingRoot(root)
 	if err != nil {
 		return BuildResult{}, err
@@ -1290,8 +1295,8 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	lockedSources := make(map[string]string)
 	for _, packageVersion := range active {
 		for _, locked := range packageVersion.Blobs {
-			blob, source, err := state.EnsureBlob(ctx, root, repository.Format, locked, blobStore,
-				formats.IdentityFor(selected, packageVersion.Package, packageVersion.Version))
+			blob, source, err := ensureBlob(ctx, root, repository.Format, locked, blobStore,
+				formats.IdentityFor(selected, packageVersion.Package, packageVersion.Version), fetcher)
 			if err != nil {
 				return BuildResult{}, err
 			}
@@ -2253,7 +2258,7 @@ func (preparation *applyPreparation) prepareRepository(planned state.PlanReposit
 		return applyRepository{}, err
 	}
 	stageOutput := filepath.Join(stage, "repository")
-	staged, buildErr := buildLockedRepository(preparation.ctx, preparation.root, planned.Name, repository, lock, preparation.generatedAt, preparation.signatureTime, stageOutput, preparation.blobStore, preparation.manifest.Keys, planned.Signing, nil)
+	staged, buildErr := buildLockedRepository(preparation.ctx, preparation.root, planned.Name, repository, lock, preparation.generatedAt, preparation.signatureTime, stageOutput, preparation.blobStore, preparation.manifest.Keys, planned.Signing, nil, preparation.request.Sources)
 	if buildErr == nil && (staged.TreeSHA256 != planned.DesiredTreeSHA256 || staged.ManifestSHA256 != planned.DesiredManifestSHA256) {
 		buildErr = errors.New("stale plan: rebuilt tree digest changed")
 	}

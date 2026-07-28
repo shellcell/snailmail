@@ -247,17 +247,24 @@ func ValidateLockedBlobOpenContext(ctx context.Context, file *os.File, info os.F
 	return validateLockedBlobOpenContext(ctx, file, info, name, format, locked, supplied)
 }
 
-func EnsureBlob(ctx context.Context, root, format string, locked LockedBlob, store blob.Store, supplied formats.Identity) (domain.Blob, string, error) {
+func validateLockedDigest(format string, locked LockedBlob) error {
 	decoded, err := hex.DecodeString(locked.SHA256)
 	if err != nil || len(decoded) != sha256.Size || locked.SHA256 != strings.ToLower(locked.SHA256) {
-		return domain.Blob{}, "", errors.New("locked blob has invalid SHA-256")
+		return errors.New("locked blob has invalid SHA-256")
 	}
 	maximum, err := formatMaximum(format)
 	if err != nil {
-		return domain.Blob{}, "", err
+		return err
 	}
 	if locked.Size < 0 || locked.Size > maximum {
-		return domain.Blob{}, "", fmt.Errorf("blob sha256:%s exceeds format size limit", locked.SHA256)
+		return fmt.Errorf("blob sha256:%s exceeds format size limit", locked.SHA256)
+	}
+	return nil
+}
+
+func EnsureBlob(ctx context.Context, root, format string, locked LockedBlob, store blob.Store, supplied formats.Identity) (domain.Blob, string, error) {
+	if err := validateLockedDigest(format, locked); err != nil {
+		return domain.Blob{}, "", err
 	}
 	loaded, name, localErr := LoadBlob(root, format, locked, supplied)
 	if localErr == nil {
@@ -266,12 +273,26 @@ func EnsureBlob(ctx context.Context, root, format string, locked LockedBlob, sto
 	if store == nil {
 		return domain.Blob{}, "", localErr
 	}
+	return InstallBlob(root, format, locked, supplied, func(destination io.Writer) error {
+		return store.Fetch(ctx, blob.Ref{SHA256: locked.SHA256, Size: locked.Size}, destination)
+	})
+}
+
+// InstallBlob writes bytes into the workspace CAS and accepts them only if they
+// match the locked record, so every source of a blob is admitted through one
+// verified path rather than each being trusted on its own terms.
+//
+// write receives a temporary file inside the CAS. The bytes become the blob only
+// after they hash to the locked digest; a mismatch leaves the CAS untouched.
+func InstallBlob(root, format string, locked LockedBlob, supplied formats.Identity, write func(io.Writer) error) (domain.Blob, string, error) {
+	if err := validateLockedDigest(format, locked); err != nil {
+		return domain.Blob{}, "", err
+	}
 	relativeName := filepath.Join(".snailmail", "cas", "sha256", locked.SHA256[:2], locked.SHA256)
 	resolvedRoot, err := ResolveWorkspaceRoot(root)
 	if err != nil {
 		return domain.Blob{}, "", err
 	}
-	name = filepath.Join(resolvedRoot, relativeName)
 	rootHandle, err := os.OpenRoot(resolvedRoot)
 	if err != nil {
 		return domain.Blob{}, "", err
@@ -299,7 +320,7 @@ func EnsureBlob(ctx context.Context, root, format string, locked LockedBlob, sto
 		_ = temporary.Close()
 		_ = rootHandle.Remove(temporaryName)
 	}()
-	if err := store.Fetch(ctx, blob.Ref{SHA256: locked.SHA256, Size: locked.Size}, temporary); err != nil {
+	if err := write(temporary); err != nil {
 		return domain.Blob{}, "", fmt.Errorf("fetch blob sha256:%s: %w", locked.SHA256, err)
 	}
 	if err := temporary.Sync(); err != nil {

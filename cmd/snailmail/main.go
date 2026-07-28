@@ -664,6 +664,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	result, err := engine.PlanWorkspace(ctx, engine.PlanWorkspaceRequest{
 		Root: flags.Root(), Output: *output, GeneratedAt: generatedAt, ExpiresIn: *expires,
 		Hosts: hosts, Blobs: wire.NewBlobResolver(), Signers: signers, VerificationMode: verificationMode(*structuralOnly),
+		Sources: httpsource.New(),
 	})
 	if err != nil {
 		return err
@@ -708,6 +709,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		Root: flags.Root(), Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
 		DebianImage: *debianImage, HelmImage: *helmImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
 		Hosts: hosts, Blobs: wire.NewBlobResolver(), Gates: gate.NewDefaultEvaluator(resolvedApprovalFile, wire.NewForgeResolver()),
+		Sources: httpsource.New(),
 	})
 	if err != nil {
 		if result.Applied != 0 || result.Current != 0 {
