@@ -738,9 +738,40 @@ else
 fi
 HANDLER
 chmod 0700 /tmp/http-handler
-nc -lk -s 127.0.0.1 -p 8879 -e /tmp/http-handler &
-server=$!
-trap 'kill "$server"' EXIT
+# busybox httpd is a real static file server and is present in any
+# busybox-based image. The nc handler stays as the fallback: -e and -k vary
+# between nc implementations, which is why it is not the first choice.
+server=""
+if command -v busybox >/dev/null 2>&1 && busybox httpd --help >/dev/null 2>&1; then
+    busybox httpd -f -p 127.0.0.1:8879 -h /repo &
+    server=$!
+    sleep 1
+    if ! kill -0 "$server" 2>/dev/null; then
+        server=""
+    fi
+fi
+if test -z "$server"; then
+    nc -lk -s 127.0.0.1 -p 8879 -e /tmp/http-handler &
+    server=$!
+fi
+trap 'kill "$server" 2>/dev/null' EXIT
+# Fail with the image contract rather than an opaque Helm error when whichever
+# server was chosen never comes up.
+if command -v wget >/dev/null 2>&1; then
+    ready=""
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if wget -q -O /dev/null http://127.0.0.1:8879/index.yaml 2>/dev/null; then
+            ready=yes
+            break
+        fi
+        sleep 1
+    done
+    if test -z "$ready"; then
+        echo "verification image provides no usable static HTTP server;" >&2
+        echo "it needs busybox httpd, or an nc supporting -l -k -s -p -e" >&2
+        exit 1
+    fi
+fi
 helm repo add staged http://127.0.0.1:8879
 helm repo update staged
 if test -n "$SNAILMAIL_CHART"; then
