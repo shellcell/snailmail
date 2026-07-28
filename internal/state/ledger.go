@@ -38,8 +38,13 @@ func LoadLedgerHistory(root, repository string) ([]PublicationRecord, error) {
 	return LoadLedgerHistoryContext(context.Background(), root, repository)
 }
 
+// LoadLedgerHistoryContext replays the publication history reachable from HEAD.
+// Scoping to the current history is deliberate: a record that only ever existed
+// on an abandoned branch or an old tag was never part of this line of history,
+// and folding those in reported perfectly good ledgers as having "removed an
+// immutable record".
 func LoadLedgerHistoryContext(ctx context.Context, root, repository string) ([]PublicationRecord, error) {
-	return loadLedgerHistoryContext(ctx, root, repository, "--all")
+	return loadLedgerHistoryContext(ctx, root, repository, "HEAD")
 }
 
 func LoadLedgerHistoryAtRevisionContext(ctx context.Context, root, repository, revision string) ([]PublicationRecord, error) {
@@ -75,20 +80,40 @@ func loadLedgerHistoryContext(ctx context.Context, root, repository, revision st
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		// A workspace can record artifacts before its first commit, and naming a
+		// revision fails outright on an unborn HEAD where a whole-repository walk
+		// would simply have been empty.
+		if _, verifyErr := gitOutputContext(ctx, root, "rev-parse", "--verify", "--quiet", revision+"^{commit}"); verifyErr != nil {
+			return records, nil
+		}
 		return nil, fmt.Errorf("read publication history: %w", err)
 	}
-	for _, revision := range strings.Fields(output) {
+	commits := strings.Fields(output)
+	revspecs := make([]string, 0, len(commits))
+	for _, commit := range commits {
+		revspecs = append(revspecs, commit+":"+treePath)
+	}
+	// One cat-file batch instead of a `git show` process per historical commit,
+	// which grew without bound as a workspace accumulated publications.
+	objects, err := catFileBatch(ctx, root, revspecs)
+	if err != nil {
+		return nil, fmt.Errorf("read publication history: %w", err)
+	}
+	replayed := make(map[string]bool, len(objects))
+	for index, object := range objects {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		content, err := execGitShowContext(ctx, root, revision, treePath)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			return nil, fmt.Errorf("read publication ledger at %s: %w", revision, err)
+		if object.id == "" {
+			return nil, fmt.Errorf("read publication ledger at %s", commits[index])
 		}
-		historical, err := parseLedger(bytes.NewReader(content))
+		// Successive commits often carry identical ledger bytes; parsing each
+		// distinct blob once keeps the replay linear in content, not commits.
+		if replayed[object.id] {
+			continue
+		}
+		replayed[object.id] = true
+		historical, err := parseLedger(bytes.NewReader(object.content))
 		if err != nil {
 			return nil, err
 		}

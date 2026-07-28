@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -642,6 +644,87 @@ func revisionBlobIDs(ctx context.Context, root, revision string, treePaths []str
 		}
 	}
 	return identifiers, nil
+}
+
+// maxBatchObjectSize bounds a single object read through catFileBatch. Ledger
+// blobs are the only use, and they are line-oriented records.
+const maxBatchObjectSize = 64 << 20
+
+type batchObject struct {
+	id      string
+	content []byte
+}
+
+// catFileBatch reads every requested revspec through one cat-file process
+// rather than one `git show` per object. Objects the repository does not
+// contain come back with an empty id.
+func catFileBatch(ctx context.Context, root string, revspecs []string) ([]batchObject, error) {
+	if len(revspecs) == 0 {
+		return nil, nil
+	}
+	var query bytes.Buffer
+	for _, revspec := range revspecs {
+		query.WriteString(revspec)
+		query.WriteString("\n")
+	}
+	command := gitCommandContext(ctx, root, "cat-file", "--batch")
+	command.Stdin = &query
+	output, err := command.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := command.Start(); err != nil {
+		return nil, err
+	}
+	objects, readErr := readCatFileBatch(bufio.NewReaderSize(output, 64<<10), len(revspecs))
+	if readErr != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, readErr
+	}
+	if err := command.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("read Git objects: %w", err)
+	}
+	return objects, nil
+}
+
+func readCatFileBatch(reader *bufio.Reader, expected int) ([]batchObject, error) {
+	objects := make([]batchObject, 0, expected)
+	for len(objects) < expected {
+		header, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("read Git object header: %w", err)
+		}
+		fields := strings.Fields(strings.TrimSuffix(header, "\n"))
+		// "<request> missing" for anything the repository does not contain.
+		if len(fields) == 2 && fields[1] == "missing" {
+			objects = append(objects, batchObject{})
+			continue
+		}
+		if len(fields) != 3 || fields[1] != "blob" {
+			return nil, errors.New("unexpected Git object header")
+		}
+		size, err := strconv.ParseInt(fields[2], 10, 64)
+		if err != nil || size < 0 || size > maxBatchObjectSize {
+			return nil, errors.New("Git object size is invalid or exceeds the read limit")
+		}
+		content := make([]byte, size)
+		if _, err := io.ReadFull(reader, content); err != nil {
+			return nil, fmt.Errorf("read Git object: %w", err)
+		}
+		// cat-file --batch terminates each object with a newline.
+		if _, err := reader.Discard(1); err != nil {
+			return nil, fmt.Errorf("read Git object terminator: %w", err)
+		}
+		objects = append(objects, batchObject{id: fields[0], content: content})
+	}
+	return objects, nil
 }
 
 // worktreeBlobIDs hashes each worktree file as Git would when committing it,
