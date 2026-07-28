@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 func AcquireWorkspaceLock(root string) (func(), error) {
@@ -488,11 +489,12 @@ func AcquireGitRevisionLock(root, expectedRevision string) (func(), error) {
 			releases[index]()
 		}
 	}
-	for _, name := range []string{indexPath + ".lock", headPath + ".lock", refPath + ".lock"} {
+	names := []string{indexPath + ".lock", headPath + ".lock", refPath + ".lock"}
+	for _, name := range names {
 		release, err := acquireGitLock(name)
 		if err != nil {
 			releaseAll()
-			return nil, errors.New("Git changed or is busy before publication")
+			return nil, fmt.Errorf("Git changed or is busy before publication: %w", describeGitLockConflict(name, names, err))
 		}
 		releases = append(releases, release)
 	}
@@ -1022,9 +1024,21 @@ func resolveGitPath(root, name string) (string, error) {
 	return filepath.Clean(resolved), nil
 }
 
+// gitLockOwnerPrefix marks a lock file this process created, so a lock left
+// behind by a crash can be told apart from one Git is genuinely holding.
+const gitLockOwnerPrefix = "snailmail publication lock"
+
 func acquireGitLock(name string) (func(), error) {
 	file, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
+		return nil, err
+	}
+	// Git only reads a lock file it created itself, so recording who holds this
+	// one is free and turns an opaque "File exists" into something actionable.
+	owner := fmt.Sprintf("%s\npid=%d\nsince=%s\n", gitLockOwnerPrefix, os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+	if _, err := file.WriteString(owner); err != nil {
+		_ = file.Close()
+		_ = os.Remove(name)
 		return nil, err
 	}
 	if err := file.Close(); err != nil {
@@ -1032,6 +1046,47 @@ func acquireGitLock(name string) (func(), error) {
 		return nil, err
 	}
 	return func() { _ = os.Remove(name) }, nil
+}
+
+// describeGitLockConflict explains which lock blocked publication and, when it
+// was left behind by an interrupted snailmail run, says so and names every file
+// that has to be removed to recover.
+func describeGitLockConflict(blocked string, names []string, cause error) error {
+	if !errors.Is(cause, os.ErrExist) {
+		return fmt.Errorf("%s: %w", blocked, cause)
+	}
+	content, readErr := os.ReadFile(blocked)
+	if readErr != nil || !strings.HasPrefix(string(content), gitLockOwnerPrefix) {
+		return fmt.Errorf("%s is held by another Git process", blocked)
+	}
+	details := strings.ReplaceAll(strings.TrimSpace(string(content)), "\n", " ")
+	if owner, found := gitLockOwnerProcess(content); found && processExists(owner) {
+		return fmt.Errorf("%s is held by a running snailmail process (%s)", blocked, details)
+	}
+	return fmt.Errorf("%s was left behind by a snailmail run that did not finish (%s); "+
+		"if no snailmail process is publishing this repository, remove %s to recover",
+		blocked, details, strings.Join(names, ", "))
+}
+
+func gitLockOwnerProcess(content []byte) (int, bool) {
+	for _, line := range strings.Split(string(content), "\n") {
+		if value, found := strings.CutPrefix(line, "pid="); found {
+			pid, err := strconv.Atoi(strings.TrimSpace(value))
+			return pid, err == nil && pid > 0
+		}
+	}
+	return 0, false
+}
+
+// processExists reports whether a process id is live. A recycled id can make
+// this a false positive, which is why the caller only uses it to soften the
+// wording rather than to remove anything.
+func processExists(pid int) bool {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return process.Signal(syscall.Signal(0)) == nil
 }
 
 func copyGitIndex(indexPath string) (string, error) {
