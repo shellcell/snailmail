@@ -24,6 +24,7 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"github.com/shellcell/snailmail/blob"
 	"github.com/shellcell/snailmail/formats"
+	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/source"
 )
 
@@ -186,7 +187,7 @@ func Setup(root string, options SetupOptions) error {
 }
 
 func writeInstallDocument(root, name string, repository Repository) error {
-	if (repository.Host.Type != "s3" && repository.Host.Type != "github-pages") || repository.Format != "pypi" {
+	if !host.Supports(repository.Host.Type, repository.Format).InstallDocument {
 		return nil
 	}
 	content := installDocumentContent(name, repository)
@@ -198,7 +199,7 @@ func writeInstallDocument(root, name string, repository Repository) error {
 }
 
 func ValidateInstallDocument(root, name string, repository Repository) error {
-	if (repository.Host.Type != "s3" && repository.Host.Type != "github-pages") || repository.Format != "pypi" {
+	if !host.Supports(repository.Host.Type, repository.Format).InstallDocument {
 		return nil
 	}
 	filename, err := WorkspacePath(root, filepath.ToSlash(filepath.Join("docs", "install-"+name+".md")))
@@ -378,8 +379,8 @@ func validateRepositoryHost(name string, repository Repository) error {
 			return fmt.Errorf("repository %q local host has S3-only configuration", name)
 		}
 	case "s3":
-		if repository.Format != "pypi" {
-			return fmt.Errorf("repository %q: the first S3 host slice supports PyPI only", name)
+		if err := requireHostServesFormat(name, repository); err != nil {
+			return err
 		}
 		if repository.Visibility == "private" && (repository.Host.ReadAuth != "basic" || repository.Host.CredentialBroker != "default") {
 			return fmt.Errorf("repository %q: private S3 hosting requires Basic read auth and a credential broker", name)
@@ -411,8 +412,11 @@ func validateRepositoryHost(name string, repository Repository) error {
 			}
 		}
 	case "github-pages":
-		if repository.Format != "pypi" || repository.Visibility != "public" {
-			return fmt.Errorf("repository %q: GitHub Pages currently supports public PyPI only", name)
+		if err := requireHostServesFormat(name, repository); err != nil {
+			return err
+		}
+		if repository.Visibility != "public" {
+			return fmt.Errorf("repository %q: GitHub Pages currently supports public repositories only", name)
 		}
 		if repository.Host.Path != "" || repository.Host.Bucket != "" || repository.Host.Prefix != "" || repository.Host.Region != "" || repository.Host.Endpoint != "" || repository.Host.UsePathStyle || repository.Host.ReadAuth != "" || repository.Host.CredentialBroker != "" {
 			return fmt.Errorf("repository %q GitHub Pages host has incompatible configuration", name)
@@ -440,6 +444,20 @@ func validateRepositoryHost(name string, repository Repository) error {
 		return fmt.Errorf("repository %q has unsupported host type %q", name, repository.Host.Type)
 	}
 	return nil
+}
+
+// requireHostServesFormat rejects a format the configured host cannot serve,
+// naming what it does serve so the operator does not have to read the matrix.
+func requireHostServesFormat(name string, repository Repository) error {
+	if host.Supports(repository.Host.Type, repository.Format).Supported() {
+		return nil
+	}
+	supported := host.SupportedFormats(repository.Host.Type)
+	if len(supported) == 0 {
+		return fmt.Errorf("repository %q: host %q serves no repository formats", name, repository.Host.Type)
+	}
+	return fmt.Errorf("repository %q: host %q does not serve format %q; it serves %s",
+		name, repository.Host.Type, repository.Format, strings.Join(supported, ", "))
 }
 
 func validateHTTPURL(value string) error {

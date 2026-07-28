@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - run: docker build --target test --tag snailmail-ci-test:${GITHUB_SHA} .
+      - run: docker build --target test --tag "snailmail-ci-test:${GITHUB_SHA}" .
 
   # The binary is distributed for platforms no test job runs on.
   cross-compile:
@@ -61,12 +61,15 @@ jobs:
           TARGET: ${{ matrix.target }}
 
   # A reachable advisory in a signing dependency is the failure this catches;
-  # one shipped in circl and was found by hand rather than by CI.
+  # one shipped in circl and was found by hand rather than by CI. It runs in the
+  # digest-pinned build image because `go run tool@version` builds the tool with
+  # the runner's ambient toolchain, which can be older than go.mod requires and
+  # then cannot load these packages at all.
   vulncheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - run: docker build --target vulncheck .
 
   lint-template:
     runs-on: ubuntu-latest

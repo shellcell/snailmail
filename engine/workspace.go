@@ -821,8 +821,9 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			}
 			continue
 		}
-		if item.repository.Format != "pypi" {
-			return ApplyWorkspaceResult{}, fmt.Errorf("host preview verification is not implemented for format %q", item.repository.Format)
+		if !host.Supports(item.hostRepository.Type, item.repository.Format).RemoteClientVerification {
+			return ApplyWorkspaceResult{}, fmt.Errorf("host preview verification is not implemented for format %q on host %q",
+				item.repository.Format, item.hostRepository.Type)
 		}
 		access := item.hostStage.Access
 		if access.Endpoint == "" {
@@ -1214,8 +1215,9 @@ func verifyCanonicalClient(ctx context.Context, root string, repository state.Re
 		_, err = verifyStaged(ctx, repository.Format, output, request)
 		return err
 	}
-	if repository.Format != "pypi" {
-		return fmt.Errorf("canonical client verification is not implemented for format %q", repository.Format)
+	if !host.Supports(repository.Host.Type, repository.Format).RemoteClientVerification {
+		return fmt.Errorf("canonical client verification is not implemented for format %q on host %q",
+			repository.Format, repository.Host.Type)
 	}
 	_, _, err := app.VerifyPyPIClientEndpointAccess(ctx, staged, access, request.Python)
 	return err
@@ -1586,7 +1588,7 @@ func repositoryHostIdentity(repository state.Repository) (string, error) {
 }
 
 func repositoryInstallDocDigest(root, name string, repository state.Repository) (string, error) {
-	if (repository.Host.Type != "s3" && repository.Host.Type != "github-pages") || repository.Format != "pypi" {
+	if !host.Supports(repository.Host.Type, repository.Format).InstallDocument {
 		return "", nil
 	}
 	if err := state.ValidateInstallDocument(root, name, repository); err != nil {

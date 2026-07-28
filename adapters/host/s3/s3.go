@@ -986,8 +986,10 @@ func (adapter *Adapter) acquireCommitLock(ctx context.Context, repository host.R
 }
 
 func validateRepository(repository host.Repository) error {
-	if repository.Type != "s3" || repository.Format != "pypi" {
-		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("the first S3 slice supports PyPI only")}
+	// Configuration validation rejects an unsupported pair earlier; this is the
+	// adapter refusing to act on one that reached it anyway.
+	if repository.Type != "s3" || !host.Supports(repository.Type, repository.Format).Publish {
+		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: fmt.Errorf("S3 does not serve format %q", repository.Format)}
 	}
 	if repository.Visibility != "public" && repository.Visibility != "private" {
 		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("S3 visibility must be public or private")}

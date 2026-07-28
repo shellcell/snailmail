@@ -320,8 +320,13 @@ func commitResult(repository host.Repository, revision host.PublishedRevision, i
 }
 
 func validateRepository(repository host.Repository) error {
-	if repository.Type != "github-pages" || repository.Format != "pypi" || repository.Visibility != "public" {
-		return invalid("configure GitHub Pages host", "GitHub Pages currently supports public PyPI only")
+	// Configuration validation rejects an unsupported pair earlier; this is the
+	// adapter refusing to act on one that reached it anyway.
+	if repository.Type != "github-pages" || !host.Supports(repository.Type, repository.Format).Publish {
+		return invalid("configure GitHub Pages host", "GitHub Pages does not serve format "+repository.Format)
+	}
+	if repository.Visibility != "public" {
+		return invalid("configure GitHub Pages host", "GitHub Pages currently supports public repositories only")
 	}
 	if !validRepositoryName(repository.RemoteRepository) || !validRepositoryName(repository.PreviewRepository) || strings.EqualFold(repository.RemoteRepository, repository.PreviewRepository) ||
 		!validBranch(repository.Branch) || !validBranch(repository.PreviewBranch) || repository.Path != "" || repository.Bucket != "" || repository.Prefix != "" || repository.Region != "" || repository.Endpoint != "" || repository.UsePathStyle || repository.ReadAuth != "" || repository.CredentialBroker != "" {

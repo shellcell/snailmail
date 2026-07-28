@@ -54,7 +54,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - run: docker build --target test --tag snailmail-ci-test:${GITHUB_SHA} .
+      - run: docker build --target test --tag "snailmail-ci-test:${GITHUB_SHA}" .
 
   plan:
     if: >-
@@ -75,7 +75,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
-      - run: docker build --tag snailmail-ci:${GITHUB_SHA} .
+      - run: docker build --tag "snailmail-ci:${GITHUB_SHA}" .
       - name: Prepare repository signing key
         if: vars.SNAILMAIL_SIGNING_KEY_REF != ''
         env:
@@ -109,7 +109,7 @@ jobs:
           -e AWS_SESSION_TOKEN
           -e AWS_REGION
           -e SNAILMAIL_KEY_PASSPHRASE_FILE=/run/snailmail-passphrase
-          snailmail-ci:${GITHUB_SHA}
+          "snailmail-ci:${GITHUB_SHA}"
           plan --out snailmail.snailmail-plan.json
         env:
           GH_TOKEN: ${{ secrets.SNAILMAIL_GITHUB_TOKEN || github.token }}
@@ -142,7 +142,7 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
-      - run: docker build --tag snailmail-ci:${GITHUB_SHA} .
+      - run: docker build --tag "snailmail-ci:${GITHUB_SHA}" .
       - name: Create signed approval evidence
         if: vars.SNAILMAIL_APPROVAL_REPOSITORIES != ''
         env:
@@ -153,7 +153,7 @@ jobs:
           printf '%s' "$APPROVAL_KEY" > "$RUNNER_TEMP/snailmail-approval-key.json"
           chmod 600 "$RUNNER_TEMP/snailmail-approval-key.json"
           for repository in ${APPROVAL_REPOSITORIES//,/ }; do
-            docker run --rm -v "$PWD:/workspace" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w /workspace snailmail-ci:${GITHUB_SHA} approve --plan snailmail.snailmail-plan.json --repository "$repository" --key "$RUNNER_TEMP/snailmail-approval-key.json" --yes
+            docker run --rm -v "$PWD:/workspace" -v "$RUNNER_TEMP:$RUNNER_TEMP" -w /workspace "snailmail-ci:${GITHUB_SHA}" approve --plan snailmail.snailmail-plan.json --repository "$repository" --key "$RUNNER_TEMP/snailmail-approval-key.json" --yes
           done
       - name: Apply reviewed plan
         env:
@@ -167,11 +167,11 @@ jobs:
             -w /workspace \
             -e GH_TOKEN -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN -e AWS_REGION \
             -e TMPDIR="$RUNNER_TEMP/snailmail-tmp" \
-            snailmail-ci:${GITHUB_SHA} apply --plan snailmail.snailmail-plan.json --runner docker
+            "snailmail-ci:${GITHUB_SHA}" apply --plan snailmail.snailmail-plan.json --runner docker
       - name: Push publication and deployment records
-        run: git push origin HEAD:${GITHUB_REF_NAME}
+        run: git push origin "HEAD:${GITHUB_REF_NAME}"
       - name: Render public status
-        run: docker run --rm -v "$PWD:/workspace" -w /workspace snailmail-ci:${GITHUB_SHA} render --output site
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace "snailmail-ci:${GITHUB_SHA}" render --output site
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: snailmail-status-${{ github.sha }}
