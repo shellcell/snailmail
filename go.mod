@@ -6,7 +6,7 @@ require (
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/klauspost/compress v1.19.1
 	github.com/ulikunitz/xz v0.5.16
-	golang.org/x/net v0.43.0
+	golang.org/x/net v0.57.0
 	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -16,7 +16,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.43.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.31
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.0
-	github.com/aws/smithy-go v1.27.3
+	github.com/aws/smithy-go v1.27.5
 	github.com/pelletier/go-toml/v2 v2.4.3
 )
 
@@ -35,6 +35,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.33.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.0 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.45.0 // indirect
-	github.com/cloudflare/circl v1.6.2 // indirect
-	golang.org/x/crypto v0.41.0 // indirect
+	github.com/cloudflare/circl v1.6.4 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
 )
