@@ -168,7 +168,7 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 		Repository: request.Repository, Package: packageName, Version: blob.Facts.Version,
 		Filename: filename, SHA256: blob.SHA256, OriginURL: originURL.String(), Changed: changed, DryRun: request.DryRun,
 	}
-	if request.DryRun || !changed {
+	if request.DryRun {
 		return result, nil
 	}
 	if err := ctx.Err(); err != nil {
@@ -192,6 +192,9 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	}
 	if err := ctx.Err(); err != nil {
 		return AdoptArtifactResult{}, err
+	}
+	if !changed {
+		return result, nil
 	}
 	if err := state.WriteLock(root, repository, lock); err != nil {
 		return AdoptArtifactResult{}, err

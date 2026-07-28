@@ -90,9 +90,16 @@ func TestAdoptArtifactPinsOriginAndSupportsDryRun(t *testing.T) {
 	if len(plan.Payload.Repositories) != 1 || len(plan.Payload.Repositories[0].Acquisitions) != 1 {
 		t.Fatalf("plan payload omitted acquisition: %#v", plan.Payload.Repositories)
 	}
+	casName := filepath.Join(root, ".snailmail", "cas", "sha256", locked.SHA256[:2], locked.SHA256)
+	if err := os.Remove(casName); err != nil {
+		t.Fatal(err)
+	}
 	repeated, err := AdoptArtifact(context.Background(), request)
 	if err != nil || repeated.Changed {
 		t.Fatalf("repeated adopt=%#v err=%v", repeated, err)
+	}
+	if _, _, err := state.LoadBlob(root, "pypi", locked); err != nil {
+		t.Fatalf("repeated adopt did not restore CAS: %v", err)
 	}
 	checked, err := CheckWorkspace(context.Background(), CheckWorkspaceRequest{Root: root, Origins: true, Sources: fetcher})
 	if err != nil || checked.OriginsChecked != 1 || len(checked.Findings) != 0 {
