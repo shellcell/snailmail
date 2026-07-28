@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -1192,11 +1193,40 @@ func ValidateArtifactOrigin(origin ArtifactOrigin) error {
 	return nil
 }
 
+// resolvedRoots caches the symlink resolution of a workspace root. A root
+// cannot change while an operation holds the workspace lock, and resolving it
+// is otherwise repeated for every path, including once per blob in a build.
+var resolvedRoots struct {
+	sync.Mutex
+	byRoot map[string]string
+}
+
+// ResolveWorkspaceRoot returns the workspace root with symlinks resolved.
+func ResolveWorkspaceRoot(root string) (string, error) {
+	resolvedRoots.Lock()
+	cached, found := resolvedRoots.byRoot[root]
+	resolvedRoots.Unlock()
+	if found {
+		return cached, nil
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	resolvedRoots.Lock()
+	if resolvedRoots.byRoot == nil {
+		resolvedRoots.byRoot = make(map[string]string)
+	}
+	resolvedRoots.byRoot[root] = resolved
+	resolvedRoots.Unlock()
+	return resolved, nil
+}
+
 func WorkspacePath(root, relative string) (string, error) {
 	if err := validateRelativePath(relative); err != nil {
 		return "", err
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
+	resolvedRoot, err := ResolveWorkspaceRoot(root)
 	if err != nil {
 		return "", err
 	}

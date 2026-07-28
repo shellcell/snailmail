@@ -195,12 +195,17 @@ func LoadBlobContext(ctx context.Context, root, format string, locked LockedBlob
 	if len(locked.SHA256) != sha256.Size*2 {
 		return domain.Blob{}, "", errors.New("locked blob has invalid SHA-256 length")
 	}
+	// The relative path is built from an already-validated hex digest, so there
+	// is no caller-supplied component to sanitise, and the os.Root handle below
+	// refuses to traverse a symlink out of the workspace. Running the general
+	// path check as well would repeat that containment once per blob.
 	relativeName := filepath.Join(".snailmail", "cas", "sha256", locked.SHA256[:2], locked.SHA256)
-	name, err := WorkspacePath(root, filepath.ToSlash(relativeName))
+	resolvedRoot, err := ResolveWorkspaceRoot(root)
 	if err != nil {
-		return domain.Blob{}, "", err
+		return domain.Blob{}, "", fmt.Errorf("%w: resolve workspace root: %v", blob.ErrUnavailable, err)
 	}
-	rootHandle, err := os.OpenRoot(root)
+	name := filepath.Join(resolvedRoot, relativeName)
+	rootHandle, err := os.OpenRoot(resolvedRoot)
 	if err != nil {
 		return domain.Blob{}, "", fmt.Errorf("%w: open workspace root: %v", blob.ErrUnavailable, err)
 	}
@@ -262,14 +267,11 @@ func EnsureBlob(ctx context.Context, root, format string, locked LockedBlob, sto
 		return domain.Blob{}, "", localErr
 	}
 	relativeName := filepath.Join(".snailmail", "cas", "sha256", locked.SHA256[:2], locked.SHA256)
-	name, err = WorkspacePath(root, filepath.ToSlash(relativeName))
+	resolvedRoot, err := ResolveWorkspaceRoot(root)
 	if err != nil {
 		return domain.Blob{}, "", err
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return domain.Blob{}, "", err
-	}
+	name = filepath.Join(resolvedRoot, relativeName)
 	rootHandle, err := os.OpenRoot(resolvedRoot)
 	if err != nil {
 		return domain.Blob{}, "", err
