@@ -869,7 +869,11 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			prepared = append(prepared, item)
 			continue
 		}
-		stage, err := os.MkdirTemp("", ".snailmail-apply-*")
+		staging, err := stagingRoot(root)
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
+		stage, err := os.MkdirTemp(staging, ".snailmail-apply-*")
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
@@ -1452,7 +1456,11 @@ func verifyCanonicalClient(ctx context.Context, root string, repository state.Re
 }
 
 func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt, signatureTime time.Time, output string, blobStore blob.Store, keys map[string]state.SigningKey, plannedSigning []state.PlanSigning, signers signer.Resolver) (BuildResult, error) {
-	input, err := os.MkdirTemp("", ".snailmail-locked-input-*")
+	staging, err := stagingRoot(root)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	input, err := os.MkdirTemp(staging, ".snailmail-locked-input-*")
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -1480,7 +1488,7 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		}
 	}
 	if output == "" {
-		temporary, err := os.MkdirTemp("", ".snailmail-plan-build-*")
+		temporary, err := os.MkdirTemp(staging, ".snailmail-plan-build-*")
 		if err != nil {
 			return BuildResult{}, err
 		}
@@ -1695,6 +1703,30 @@ func linkOrCopy(source, target string) error {
 		return closeOutputErr
 	}
 	return closeInputErr
+}
+
+// StageDirectoryEnvironment overrides where build and stage trees are created.
+const StageDirectoryEnvironment = "SNAILMAIL_STAGE_DIR"
+
+// stagingRoot returns the directory that holds temporary build and stage trees.
+//
+// These default to the workspace rather than TMPDIR for two reasons. TMPDIR is
+// commonly a tmpfs, so a multi-gigabyte repository tree would be held in RAM,
+// and it is a different filesystem from the local CAS, so linking artifacts
+// into a build input falls back to copying every byte. Staging beside the CAS
+// keeps the links and the bytes on disk.
+func stagingRoot(root string) (string, error) {
+	directory := filepath.Join(root, ".snailmail", "stage")
+	if override := strings.TrimSpace(os.Getenv(StageDirectoryEnvironment)); override != "" {
+		if !filepath.IsAbs(override) {
+			return "", fmt.Errorf("%s must be an absolute path", StageDirectoryEnvironment)
+		}
+		directory = override
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", fmt.Errorf("create staging directory: %w", err)
+	}
+	return directory, nil
 }
 
 func workspaceRoot(root string) (string, error) {

@@ -575,7 +575,7 @@ fi
 `,
 	}
 	command := exec.CommandContext(caseCtx, runner, arguments...)
-	command.Env = os.Environ()
+	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Debian client verification for %s=%s/%s: %w\n%s", verification.Package, verification.Version, verification.Architecture, err, strings.TrimSpace(string(output)))
@@ -752,7 +752,7 @@ fi
 `,
 	}
 	command := exec.CommandContext(caseCtx, runner, arguments...)
-	command.Env = os.Environ()
+	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Helm client verification for %s@%s: %w\n%s", verification.Project, verification.Version, err, strings.TrimSpace(string(output)))
