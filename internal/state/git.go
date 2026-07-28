@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -124,19 +125,19 @@ func requireCleanGitContext(ctx context.Context, root string, allowedUntracked m
 }
 
 func validateGitStatusAllowingUntracked(status string, allowedUntracked, authoritative map[string]bool) error {
-	for _, line := range strings.Split(status, "\n") {
-		if line == "" {
+	entries, err := parseGitStatus(status)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.code == "??" && len(entry.paths) == 1 && allowedUntracked[entry.paths[0]] {
 			continue
 		}
-		if len(line) < 4 {
-			return errors.New("cannot parse Git status")
-		}
-		name := filepath.ToSlash(strings.TrimSpace(line[3:]))
-		if strings.HasPrefix(line, "?? ") && allowedUntracked[name] {
-			continue
-		}
-		if err := validateGitStatus(line, nil, authoritative); err != nil {
-			return err
+		for _, name := range entry.paths {
+			if entry.code == "??" && !authoritative[name] && !isAuthoritativePath(name) {
+				continue
+			}
+			return fmt.Errorf("workspace has uncommitted authoritative or tracked changes at %q", name)
 		}
 	}
 	return nil
@@ -545,30 +546,41 @@ func requireAuthoritativeFilesCommitted(root, revision string, authoritative, al
 	return requireAuthoritativeFilesCommittedContext(context.Background(), root, revision, authoritative, allowedChanges)
 }
 
+// requireAuthoritativeFilesCommittedContext proves that every authoritative
+// file is present in revision and identical to the worktree.
+//
+// Both sides are resolved in one batch each. The worktree side is hashed by Git
+// from the file itself rather than through the index, so neither
+// assume-unchanged nor skip-worktree can hide a change, and hashing by path
+// applies the same .gitattributes and core.autocrlf clean filters that produced
+// the committed blob — comparing raw worktree bytes would report every file as
+// changed in any repository that converts line endings.
 func requireAuthoritativeFilesCommittedContext(ctx context.Context, root, revision string, authoritative, allowedChanges map[string]bool) error {
 	names := make([]string, 0, len(authoritative))
 	for name := range authoritative {
-		names = append(names, name)
+		if !allowedChanges[name] {
+			names = append(names, name)
+		}
 	}
 	sort.Strings(names)
+	if len(names) == 0 {
+		return nil
+	}
+	prefix, err := gitPrefix(ctx, root)
+	if err != nil {
+		return err
+	}
+	treePaths := make([]string, 0, len(names))
 	for _, name := range names {
-		if err := ctx.Err(); err != nil {
-			return err
+		// hash-object reads its path list as newline-separated text, so a name
+		// carrying a newline could inject an entry. Authoritative names come from
+		// validated manifest fields and fixed globs, but a file on disk can still
+		// be named adversarially.
+		if strings.ContainsAny(name, "\n\r") {
+			return fmt.Errorf("authoritative state %q has an unusable name", name)
 		}
-		if allowedChanges[name] {
-			continue
-		}
-		treePath, err := workspaceGitPath(root, name)
-		if err != nil {
-			return err
-		}
-		expected, err := gitOutputContext(ctx, root, "rev-parse", revision+":"+treePath)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return fmt.Errorf("authoritative state %q is not committed to Git", name)
-		}
+		// A symlink with the same bytes is not a committed regular file, and a
+		// content comparison alone would not tell them apart.
 		workspacePath, err := WorkspacePath(root, name)
 		if err != nil {
 			return err
@@ -577,40 +589,139 @@ func requireAuthoritativeFilesCommittedContext(ctx context.Context, root, revisi
 		if err != nil || !info.Mode().IsRegular() {
 			return fmt.Errorf("authoritative state %q is not a regular committed file", name)
 		}
-		content, err := os.ReadFile(workspacePath)
-		if err != nil {
-			return err
+		treePaths = append(treePaths, filepath.ToSlash(filepath.Join(filepath.FromSlash(prefix), filepath.FromSlash(name))))
+	}
+	committed, err := revisionBlobIDs(ctx, root, revision, treePaths)
+	if err != nil {
+		return err
+	}
+	for index, name := range names {
+		if committed[index] == "" {
+			return fmt.Errorf("authoritative state %q is not committed to Git", name)
 		}
-		actual, err := gitHashObjectContext(ctx, root, content)
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return err
-		}
-		if actual != expected {
+	}
+	worktree, err := worktreeBlobIDs(ctx, root, treePaths)
+	if err != nil {
+		return err
+	}
+	for index, name := range names {
+		if worktree[index] != committed[index] {
 			return fmt.Errorf("authoritative state %q differs from Git", name)
 		}
 	}
 	return nil
 }
 
+// revisionBlobIDs resolves every tree path in revision through one cat-file
+// batch, reporting an empty ID for a path revision does not contain.
+func revisionBlobIDs(ctx context.Context, root, revision string, treePaths []string) ([]string, error) {
+	var query bytes.Buffer
+	for _, treePath := range treePaths {
+		query.WriteString(revision + ":" + treePath + "\n")
+	}
+	command := gitCommandContext(ctx, root, "cat-file", "--batch-check")
+	command.Stdin = &query
+	output, err := command.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("resolve committed authoritative state: %w", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(output), "\n"), "\n")
+	if len(lines) != len(treePaths) {
+		return nil, errors.New("cannot resolve committed authoritative state")
+	}
+	identifiers := make([]string, len(treePaths))
+	for index, line := range lines {
+		// A resolvable object answers "<sha> <type> <size>"; anything else, such
+		// as "<request> missing", means revision does not contain that path.
+		fields := strings.Fields(line)
+		if len(fields) == 3 && fields[1] == "blob" {
+			identifiers[index] = fields[0]
+		}
+	}
+	return identifiers, nil
+}
+
+// worktreeBlobIDs hashes each worktree file as Git would when committing it,
+// in one batch. Reading the files rather than the index is what keeps
+// assume-unchanged and skip-worktree from hiding a modification. Unlike most
+// commands, hash-object resolves --stdin-paths entries against the repository
+// root rather than the working directory, so these must be tree paths.
+func worktreeBlobIDs(ctx context.Context, root string, treePaths []string) ([]string, error) {
+	var query bytes.Buffer
+	for _, treePath := range treePaths {
+		query.WriteString(treePath)
+		query.WriteString("\n")
+	}
+	command := gitCommandContext(ctx, root, "hash-object", "--stdin-paths")
+	command.Stdin = &query
+	output, err := command.Output()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("hash authoritative worktree state: %w", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(output), "\n"), "\n")
+	if len(lines) != len(treePaths) {
+		return nil, errors.New("cannot hash authoritative worktree state")
+	}
+	for index := range lines {
+		lines[index] = strings.TrimSpace(lines[index])
+	}
+	return lines, nil
+}
+
+type gitStatusEntry struct {
+	code  string
+	paths []string
+}
+
+// parseGitStatus reads NUL-delimited porcelain v1 records. The NUL format is
+// what makes paths trustworthy: it never quotes or escapes, so core.quotePath
+// cannot change the bytes, and a rename carries its original path as a separate
+// NUL-terminated field instead of an ambiguous "old -> new" string.
+func parseGitStatus(status string) ([]gitStatusEntry, error) {
+	records := strings.Split(status, "\x00")
+	var entries []gitStatusEntry
+	for index := 0; index < len(records); index++ {
+		record := records[index]
+		if record == "" {
+			continue
+		}
+		if len(record) < 4 {
+			return nil, errors.New("cannot parse Git status")
+		}
+		entry := gitStatusEntry{code: record[:2], paths: []string{filepath.ToSlash(record[3:])}}
+		if entry.code[0] == 'R' || entry.code[0] == 'C' || entry.code[1] == 'R' || entry.code[1] == 'C' {
+			index++
+			if index >= len(records) {
+				return nil, errors.New("cannot parse Git status")
+			}
+			entry.paths = append(entry.paths, filepath.ToSlash(records[index]))
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
 func validateGitStatus(status string, allowedChanges, authoritative map[string]bool) error {
-	for _, line := range strings.Split(status, "\n") {
-		if line == "" {
-			continue
+	entries, err := parseGitStatus(status)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		for _, name := range entry.paths {
+			if allowedChanges[name] {
+				continue
+			}
+			if entry.code == "??" && !authoritative[name] && !isAuthoritativePath(name) {
+				continue
+			}
+			return fmt.Errorf("workspace has uncommitted authoritative or tracked changes at %q", name)
 		}
-		if len(line) < 4 {
-			return errors.New("cannot parse Git status")
-		}
-		name := filepath.ToSlash(strings.TrimSpace(line[3:]))
-		if allowedChanges[name] {
-			continue
-		}
-		if strings.HasPrefix(line, "?? ") && !authoritative[name] && !isAuthoritativePath(name) {
-			continue
-		}
-		return fmt.Errorf("workspace has uncommitted authoritative or tracked changes at %q", name)
 	}
 	return nil
 }
@@ -699,8 +810,38 @@ func publicationWorkspacePaths(repositories []string) map[string]bool {
 	return paths
 }
 
+// gitPrefix returns the workspace's path prefix inside its Git repository.
+// The prefix cannot change while a workspace operation holds its lock, and it
+// is consulted once per authoritative path, so it is resolved once per root
+// rather than through a subprocess per lookup.
+var gitPrefixes struct {
+	sync.Mutex
+	byRoot map[string]string
+}
+
+func gitPrefix(ctx context.Context, root string) (string, error) {
+	gitPrefixes.Lock()
+	cached, found := gitPrefixes.byRoot[root]
+	gitPrefixes.Unlock()
+	if found {
+		return cached, nil
+	}
+	prefix, err := gitOutputContext(ctx, root, "rev-parse", "--show-prefix")
+	if err != nil {
+		return "", err
+	}
+	prefix = filepath.ToSlash(prefix)
+	gitPrefixes.Lock()
+	if gitPrefixes.byRoot == nil {
+		gitPrefixes.byRoot = make(map[string]string)
+	}
+	gitPrefixes.byRoot[root] = prefix
+	gitPrefixes.Unlock()
+	return prefix, nil
+}
+
 func workspaceGitPath(root, relative string) (string, error) {
-	prefix, err := gitOutput(root, "rev-parse", "--show-prefix")
+	prefix, err := gitPrefix(context.Background(), root)
 	if err != nil {
 		return "", err
 	}
@@ -708,11 +849,10 @@ func workspaceGitPath(root, relative string) (string, error) {
 }
 
 func workspaceRelativeGitPath(root, name string) (string, bool, error) {
-	prefix, err := gitOutput(root, "rev-parse", "--show-prefix")
+	prefix, err := gitPrefix(context.Background(), root)
 	if err != nil {
 		return "", false, err
 	}
-	prefix = filepath.ToSlash(prefix)
 	name = filepath.ToSlash(name)
 	if prefix == "" {
 		return name, true, nil
@@ -885,9 +1025,24 @@ func gitCommand(root string, arguments ...string) *exec.Cmd {
 	return gitCommandContext(context.Background(), root, arguments...)
 }
 
+// gitConfigOverrides neutralise user configuration that would otherwise change
+// output this package parses. They are applied as -c overrides rather than by
+// disabling global and system configuration wholesale, so that settings the
+// repository genuinely needs — safe.directory in particular, which Git accepts
+// only from those files — keep working.
+var gitConfigOverrides = []string{
+	// Prepends signature verification output to `log --format=%B`.
+	"-c", "log.showSignature=false",
+	// Can answer from a stale daemon view of the worktree.
+	"-c", "core.fsmonitor=",
+	// Quoting would change the path bytes read back from status output.
+	"-c", "core.quotePath=false",
+}
+
 func gitCommandContext(ctx context.Context, root string, arguments ...string) *exec.Cmd {
-	command := exec.CommandContext(ctx, "git", append([]string{"-C", root}, arguments...)...)
-	command.Env = replaceEnvironment(os.Environ(), "GIT_OPTIONAL_LOCKS", "0")
+	full := append([]string{"-C", root}, gitConfigOverrides...)
+	command := exec.CommandContext(ctx, "git", append(full, arguments...)...)
+	command.Env = replaceEnvironment(os.Environ(), "GIT_OPTIONAL_LOCKS", "0", "GIT_TERMINAL_PROMPT", "0")
 	return command
 }
 
@@ -912,11 +1067,11 @@ func gitStatusOutput(root string) (string, error) {
 }
 
 func gitStatusOutputContext(ctx context.Context, root string) (string, error) {
-	output, err := gitCommandContext(ctx, root, "status", "--porcelain", "--untracked-files=all").Output()
+	output, err := gitCommandContext(ctx, root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames").Output()
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimRight(string(output), "\r\n"), nil
+	return string(output), nil
 }
 
 func gitOutputEnv(root string, environment []string, arguments ...string) (string, error) {
@@ -952,8 +1107,15 @@ func replaceEnvironment(environment []string, values ...string) []string {
 		}
 		result = append(result, entry)
 	}
-	for key, value := range replacements {
-		result = append(result, key+"="+value)
+	// Map iteration order is random; sort so the child environment is a
+	// deterministic function of its inputs.
+	keys := make([]string, 0, len(replacements))
+	for key := range replacements {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		result = append(result, key+"="+replacements[key])
 	}
 	return result
 }
