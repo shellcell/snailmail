@@ -27,10 +27,10 @@ type NewKeyRequest struct {
 }
 
 type NewKeyResult struct {
-	Name        string
-	Fingerprint string
-	ExpiresAt   string
-	Reference   string
+	Name        string `json:"name"`
+	Fingerprint string `json:"fingerprint"`
+	ExpiresAt   string `json:"expires_at"`
+	Reference   string `json:"reference"`
 }
 
 type PublishKeyRequest struct {
@@ -46,8 +46,8 @@ type KeyAuditFinding struct {
 }
 
 type KeyAuditResult struct {
-	Findings  []KeyAuditFinding
-	Rotations []KeyRotationStatus
+	Findings  []KeyAuditFinding   `json:"findings"`
+	Rotations []KeyRotationStatus `json:"rotations"`
 }
 
 type KeyRotationStatus struct {

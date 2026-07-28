@@ -90,13 +90,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 }
 
 func runInit(args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("init", stderr).withWorkspace()
+	flags := newCommandFlags("init", stderr).withWorkspace().withJSON()
 	name := flags.String("name", "", "workspace name")
 	forgeRepository := flags.String("forge-repo", "", "GitHub state repository (owner/name) for PR gates")
 	if err := flags.parse(args); err != nil {
 		return err
 	}
 	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: flags.Root(), Name: *name, ForgeRepository: *forgeRepository}); err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, initResult{Workspace: *name}); done || err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -109,7 +112,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 		return errors.New("usage: snailmail setup <pypi|deb|helm> --name NAME --host <local|s3|github-pages> [host options]")
 	}
 	format := args[0]
-	flags := newCommandFlags("setup "+format, stderr).withWorkspace()
+	flags := newCommandFlags("setup "+format, stderr).withWorkspace().withJSON()
 	name := flags.String("name", "", "repository name")
 	output := flags.String("output", "", "workspace-relative published directory")
 	hostType := flags.String("host", "local", "host type: local, s3, or github-pages")
@@ -152,12 +155,15 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	}); err != nil {
 		return err
 	}
-	printBrand(stdout)
-	fmt.Fprintf(stdout, "📦  configured %s repository %s\n", format, *name)
 	target := *output
 	if *hostType == "s3" || *hostType == "github-pages" {
 		target = *canonicalEndpoint
 	}
+	if done, err := flags.emit(stdout, setupResult{Repository: *name, Format: format, Target: target}); done || err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  configured %s repository %s\n", format, *name)
 	fmt.Fprintf(stdout, "✉️   desired state will publish to %s\n", target)
 	return nil
 }
@@ -172,7 +178,7 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return errors.New("usage: snailmail keys new NAME [--algo openpgp-rsa4096] [--expires-in 17520h]")
 		}
 		name := args[1]
-		flags := newCommandFlags("keys new", stderr).withWorkspace()
+		flags := newCommandFlags("keys new", stderr).withWorkspace().withJSON()
 		algorithm := flags.String("algo", "openpgp-rsa4096", "signing algorithm")
 		expiresIn := flags.Duration("expires-in", 2*365*24*time.Hour, "key validity duration")
 		if err := flags.parse(args[2:]); err != nil {
@@ -186,6 +192,9 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		if err != nil {
 			return err
 		}
+		if done, err := flags.emit(stdout, result); done || err != nil {
+			return err
+		}
 		printBrand(stdout)
 		fmt.Fprintf(stdout, "📦  generated signing key %s\n", result.Name)
 		fmt.Fprintf(stdout, "✉️   fingerprint %s; expires %s\n", result.Fingerprint, result.ExpiresAt)
@@ -196,7 +205,7 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return errors.New("usage: snailmail keys publish NAME")
 		}
 		name := args[1]
-		flags := newCommandFlags("keys publish", stderr).withWorkspace()
+		flags := newCommandFlags("keys publish", stderr).withWorkspace().withJSON()
 		if err := flags.parse(args[2:]); err != nil {
 			return err
 		}
@@ -208,6 +217,9 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		if err != nil {
 			return err
 		}
+		if done, err := flags.emit(stdout, publishKeyResult{Name: result.Name, Fingerprint: result.Fingerprint}); done || err != nil {
+			return err
+		}
 		printBrand(stdout)
 		fmt.Fprintf(stdout, "📦  published public forms for %s\n", result.Name)
 		fmt.Fprintf(stdout, "✉️   fingerprint %s\n", result.Fingerprint)
@@ -217,7 +229,7 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 			return errors.New("usage: snailmail keys rotate REPOSITORY --successor KEY [--minimum-refresh 720h] | --advance --yes")
 		}
 		repository := args[1]
-		flags := newCommandFlags("keys rotate", stderr).withWorkspace()
+		flags := newCommandFlags("keys rotate", stderr).withWorkspace().withJSON()
 		successor := flags.String("successor", "", "successor signing key name")
 		advance := flags.Bool("advance", false, "advance the deployed rotation to its next phase")
 		minimumRefresh := flags.Duration("minimum-refresh", 30*24*time.Hour, "minimum client keyring refresh window")
@@ -247,6 +259,9 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		if err != nil {
 			return err
 		}
+		if done, err := flags.emit(stdout, result); done || err != nil {
+			return err
+		}
 		printBrand(stdout)
 		fmt.Fprintf(stdout, "📦  signing rotation for %s is %s\n", result.Repository, result.Phase)
 		fmt.Fprintf(stdout, "✉️   active %s; trusted %s\n", result.ActiveKey, strings.Join(result.TrustedKeys, ", "))
@@ -258,13 +273,26 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 		}
 		return nil
 	case "audit":
-		flags := newCommandFlags("keys audit", stderr).withWorkspace()
+		flags := newCommandFlags("keys audit", stderr).withWorkspace().withJSON()
 		if err := flags.parse(args[1:]); err != nil {
 			return err
 		}
 		result, err := engine.AuditKeys(engine.PublishKeyRequest{Root: flags.Root()}, time.Time{})
 		if err != nil {
 			return err
+		}
+		if done, emitErr := flags.emit(stdout, result); done || emitErr != nil {
+			if emitErr != nil {
+				return emitErr
+			}
+			// The audit's exit status is part of its contract, so JSON output
+			// still fails when the audit found errors.
+			for _, finding := range result.Findings {
+				if finding.Severity == "error" {
+					return errors.New("signing key audit found errors")
+				}
+			}
+			return nil
 		}
 		printBrand(stdout)
 		if len(result.Findings) == 0 {
@@ -294,7 +322,7 @@ func runKeys(ctx context.Context, args []string, stdout, stderr io.Writer) error
 }
 
 func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("add", stderr).withWorkspace()
+	flags := newCommandFlags("add", stderr).withWorkspace().withJSON()
 	track := flags.String("track", "stable", "placement track")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -307,6 +335,9 @@ func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 		Blobs: wire.NewBlobResolver(),
 	})
 	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -322,7 +353,7 @@ func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 }
 
 func runPromote(args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("promote", stderr).withWorkspace()
+	flags := newCommandFlags("promote", stderr).withWorkspace().withJSON()
 	track := flags.String("track", "stable", "destination placement track")
 	distro := flags.String("distro", "", "Debian placement distro (defaults to repository suite)")
 	if err := flags.Parse(args); err != nil {
@@ -337,6 +368,9 @@ func runPromote(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
 	printBrand(stdout)
 	if result.Changed == 0 {
 		fmt.Fprintf(stdout, "📦  placement %s@%s is already present in %s/%s\n", result.Package, result.Version, result.Repository, result.Track)
@@ -347,7 +381,7 @@ func runPromote(args []string, stdout, stderr io.Writer) error {
 }
 
 func runYank(args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("yank", stderr).withWorkspace()
+	flags := newCommandFlags("yank", stderr).withWorkspace().withJSON()
 	track := flags.String("track", "", "placement track to remove")
 	distro := flags.String("distro", "", "Debian placement distro (defaults to repository suite)")
 	all := flags.Bool("all", false, "remove every placement for the package version")
@@ -361,6 +395,9 @@ func runYank(args []string, stdout, stderr io.Writer) error {
 		Root: flags.Root(), Repository: flags.Arg(0), Package: flags.Arg(1), Version: flags.Arg(2), Track: *track, Distro: *distro, All: *all,
 	})
 	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -379,7 +416,7 @@ func runPrune(args []string, stdout, stderr io.Writer) error {
 		return errors.New("usage: snailmail prune REPOSITORY --keep N")
 	}
 	repository := args[0]
-	flags := newCommandFlags("prune", stderr).withWorkspace()
+	flags := newCommandFlags("prune", stderr).withWorkspace().withJSON()
 	keep := flags.Int("keep", 0, "versions to retain per package, track, and distro")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
@@ -389,6 +426,9 @@ func runPrune(args []string, stdout, stderr io.Writer) error {
 	}
 	result, err := engine.Prune(engine.PruneRequest{Root: flags.Root(), Repository: repository, Keep: *keep})
 	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -402,7 +442,7 @@ func runPrune(args []string, stdout, stderr io.Writer) error {
 }
 
 func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("check", stderr).withWorkspace()
+	flags := newCommandFlags("check", stderr).withWorkspace().withJSON()
 	origins := flags.Bool("origins", false, "re-fetch recorded adopted origins")
 	maxOrigins := flags.Int("max-origins", 2, "maximum recorded origins to re-fetch (1-4)")
 	originOffset := flags.Int("origin-offset", 0, "skip this many sorted recorded origins")
@@ -410,11 +450,22 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 	if flags.NArg() != 0 {
-		return errors.New("usage: snailmail check [--workspace DIR] [--origins --max-origins N --origin-offset N]")
+		return errors.New("usage: snailmail check [--workspace DIR] [--json] [--origins --max-origins N --origin-offset N]")
 	}
 	result, err := engine.CheckWorkspace(ctx, engine.CheckWorkspaceRequest{Root: flags.Root(), Blobs: wire.NewBlobResolver(), Origins: *origins, Sources: httpsource.New(), MaxOrigins: *maxOrigins, OriginOffset: *originOffset})
 	if err != nil {
 		return err
+	}
+	if done, emitErr := flags.emit(stdout, result); done || emitErr != nil {
+		if emitErr != nil {
+			return emitErr
+		}
+		// The exit status is part of check's contract, so JSON output still
+		// fails when an artifact is unavailable or changed.
+		if len(result.Findings) != 0 {
+			return fmt.Errorf("check found %d unavailable or changed %s", len(result.Findings), plural(len(result.Findings), "artifact", "artifacts"))
+		}
+		return nil
 	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  checked %d %s, %d package versions, and %d locked %s\n",
@@ -560,7 +611,7 @@ func runBlobStore(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		return errors.New("usage: snailmail blob-store <local|s3> [options]")
 	}
 	storeType := args[0]
-	flags := newCommandFlags("blob-store "+storeType, stderr).withWorkspace()
+	flags := newCommandFlags("blob-store "+storeType, stderr).withWorkspace().withJSON()
 	bucket := flags.String("bucket", "", "S3 blob bucket")
 	prefix := flags.String("prefix", "", "S3 blob prefix")
 	region := flags.String("region", "", "AWS region")
@@ -575,6 +626,9 @@ func runBlobStore(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}); err != nil {
 		return err
 	}
+	if done, err := flags.emit(stdout, blobStoreResult{Type: storeType}); done || err != nil {
+		return err
+	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  configured %s blob storage\n", storeType)
 	fmt.Fprintln(stdout, "✉️   existing locked artifacts are durable")
@@ -582,7 +636,7 @@ func runBlobStore(ctx context.Context, args []string, stdout, stderr io.Writer) 
 }
 
 func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("plan", stderr).withWorkspace()
+	flags := newCommandFlags("plan", stderr).withWorkspace().withJSON()
 	output := flags.String("out", "snailmail.snailmail-plan.json", "plan output file")
 	generatedAtValue := flags.String("generated-at", "", "explicit RFC3339 repository generation time")
 	expires := flags.Duration("expires", 2*time.Hour, "plan lifetime")
@@ -607,6 +661,9 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err != nil {
 		return err
 	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  planned %d repository %s\n", result.Changes, plural(result.Changes, "change", "changes"))
 	fmt.Fprintf(stdout, "✉️   %s\n", result.Output)
@@ -619,7 +676,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 }
 
 func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("apply", stderr).withWorkspace()
+	flags := newCommandFlags("apply", stderr).withWorkspace().withJSON()
 	plan := flags.String("plan", "snailmail.snailmail-plan.json", "reviewed plan file")
 	structuralOnly := flags.Bool("structural-only", false, "skip ecosystem client verification")
 	python := flags.String("python", "python3", "Python executable for PyPI verification")
@@ -656,6 +713,9 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		}
 		return err
 	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  applied %d repository %s", result.Applied, plural(result.Applied, "change", "changes"))
 	if result.Current != 0 {
@@ -667,7 +727,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 }
 
 func runApprove(args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("approve", stderr).withWorkspace()
+	flags := newCommandFlags("approve", stderr).withWorkspace().withJSON()
 	plan := flags.String("plan", "snailmail.snailmail-plan.json", "reviewed plan file")
 	output := flags.String("out", "", "approval evidence output")
 	repository := flags.String("repository", "", "repository to approve")
@@ -687,6 +747,9 @@ func runApprove(args []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  approved repository %s\n", *repository)
 	fmt.Fprintf(stdout, "✉️   %s\n", result.Output)
@@ -696,16 +759,25 @@ func runApprove(args []string, stdout, stderr io.Writer) error {
 }
 
 func runApprovalKey(args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("approval-key", stderr)
+	// The subcommand word is consumed before parsing, because Go's flag package
+	// stops at the first non-flag argument: parsing the whole tail left --out
+	// unseen and rejected the documented invocation.
+	if len(args) == 0 || args[0] != "generate" {
+		return errors.New("usage: snailmail approval-key generate --out FILE")
+	}
+	flags := newCommandFlags("approval-key generate", stderr).withJSON()
 	output := flags.String("out", "", "private key output file")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.parse(args[1:]); err != nil {
 		return err
 	}
-	if flags.NArg() != 1 || flags.Arg(0) != "generate" || *output == "" {
+	if *output == "" {
 		return errors.New("usage: snailmail approval-key generate --out FILE")
 	}
 	publicKey, err := gate.GenerateApprovalKey(*output)
 	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, approvalKeyResult{Output: *output, PublicKey: publicKey}); done || err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -716,7 +788,7 @@ func runApprovalKey(args []string, stdout, stderr io.Writer) error {
 }
 
 func runRender(args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("render", stderr).withWorkspace()
+	flags := newCommandFlags("render", stderr).withWorkspace().withJSON()
 	output := flags.String("output", "site", "status site output directory")
 	plan := flags.String("plan", "snailmail.snailmail-plan.json", "optional plan used for pending gates")
 	if err := flags.parse(args); err != nil {
@@ -724,6 +796,9 @@ func runRender(args []string, stdout, stderr io.Writer) error {
 	}
 	result, err := engine.RenderStatus(engine.RenderStatusRequest{Root: flags.Root(), Output: *output, Plan: *plan})
 	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -749,7 +824,7 @@ func runBuild(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 }
 
 func runBuildPyPI(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("build pypi", stderr)
+	flags := newCommandFlags("build pypi", stderr).withJSON()
 	input := flags.String("input", "", "directory containing wheels and source distributions")
 	output := flags.String("output", "", "directory to write the static repository")
 	generatedAtValue := flags.String("generated-at", defaultGeneratedAt, "explicit RFC3339 generation time")
@@ -768,6 +843,9 @@ func runBuildPyPI(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  packed %d %s across %d %s\n", result.DistributionCount, plural(result.DistributionCount, "distribution", "distributions"), result.ProjectCount, plural(result.ProjectCount, "project", "projects"))
 	fmt.Fprintf(stdout, "✉️   wrote %s to %s\n", result.Format, result.Output)
@@ -776,7 +854,7 @@ func runBuildPyPI(ctx context.Context, args []string, stdout, stderr io.Writer) 
 }
 
 func runBuildDeb(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("build deb", stderr)
+	flags := newCommandFlags("build deb", stderr).withJSON()
 	input := flags.String("input", "", "directory containing Debian packages")
 	output := flags.String("output", "", "directory to write the static repository")
 	suite := flags.String("suite", "stable", "Debian suite/codename")
@@ -801,6 +879,9 @@ func runBuildDeb(ctx context.Context, args []string, stdout, stderr io.Writer) e
 	if err != nil {
 		return err
 	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  indexed %d %s across %d %s\n", result.DistributionCount, plural(result.DistributionCount, "package file", "package files"), result.PackageCount, plural(result.PackageCount, "package", "packages"))
 	fmt.Fprintf(stdout, "✉️   wrote %s to %s\n", result.Format, result.Output)
@@ -809,7 +890,7 @@ func runBuildDeb(ctx context.Context, args []string, stdout, stderr io.Writer) e
 }
 
 func runBuildHelm(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("build helm", stderr)
+	flags := newCommandFlags("build helm", stderr).withJSON()
 	input := flags.String("input", "", "directory containing packaged Helm charts")
 	output := flags.String("output", "", "directory to write the static repository")
 	generatedAtValue := flags.String("generated-at", defaultGeneratedAt, "explicit RFC3339 generation time")
@@ -822,6 +903,9 @@ func runBuildHelm(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	result, err := engine.BuildHelm(ctx, engine.BuildHelmRequest{Input: *input, Output: *output, GeneratedAt: generatedAt})
 	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -848,7 +932,7 @@ func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) err
 }
 
 func runVerifyPyPI(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("verify pypi", stderr)
+	flags := newCommandFlags("verify pypi", stderr).withJSON()
 	repository := flags.String("repo", "", "generated repository directory")
 	python := flags.String("python", "python3", "Python executable whose pip client verifies installs")
 	structuralOnly := flags.Bool("structural-only", false, "verify files and indexes without invoking pip")
@@ -863,6 +947,9 @@ func runVerifyPyPI(ctx context.Context, args []string, stdout, stderr io.Writer)
 	if err != nil {
 		return err
 	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  verified %d repository %s\n", result.FileCount, plural(result.FileCount, "file", "files"))
 	if *structuralOnly {
@@ -875,7 +962,7 @@ func runVerifyPyPI(ctx context.Context, args []string, stdout, stderr io.Writer)
 }
 
 func runVerifyDeb(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("verify deb", stderr)
+	flags := newCommandFlags("verify deb", stderr).withJSON()
 	repository := flags.String("repo", "", "generated repository directory")
 	runner := flags.String("runner", "podman", "OCI runner executable")
 	image := flags.String("image", engine.DefaultDebianVerificationImage, "digest-pinned Debian client image")
@@ -894,6 +981,9 @@ func runVerifyDeb(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	if err != nil {
 		return err
 	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  verified %d repository %s\n", result.FileCount, plural(result.FileCount, "file", "files"))
 	if *structuralOnly {
@@ -906,7 +996,7 @@ func runVerifyDeb(ctx context.Context, args []string, stdout, stderr io.Writer) 
 }
 
 func runVerifyHelm(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("verify helm", stderr)
+	flags := newCommandFlags("verify helm", stderr).withJSON()
 	repository := flags.String("repo", "", "generated repository directory")
 	runner := flags.String("runner", "podman", "OCI runner executable")
 	image := flags.String("image", engine.DefaultHelmVerificationImage, "digest-pinned Helm client image")
@@ -916,6 +1006,9 @@ func runVerifyHelm(ctx context.Context, args []string, stdout, stderr io.Writer)
 	}
 	result, err := engine.VerifyHelm(ctx, engine.VerifyHelmRequest{Repository: *repository, Runner: *runner, Image: *image, StructuralOnly: *structuralOnly})
 	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
 		return err
 	}
 	printBrand(stdout)
@@ -992,7 +1085,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail prune REPOSITORY --keep N")
-	fmt.Fprintln(output, "  snailmail check [--workspace DIR] [--origins --max-origins N --origin-offset N]")
+	fmt.Fprintln(output, "  snailmail check [--workspace DIR] [--json] [--origins --max-origins N --origin-offset N]")
 	fmt.Fprintln(output, "  snailmail status [--workspace DIR] [--json]")
 	fmt.Fprintln(output, "  snailmail doctor [--format auto|pypi|deb|helm] [--json] URL")
 	fmt.Fprintln(output, "  snailmail adopt --sha256 HEX --public-origin [--filename NAME --track TRACK --distro DISTRO --dry-run --json --workspace DIR] REPOSITORY URL")
@@ -1014,6 +1107,8 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail verify deb --repo DIR [--runner podman]")
 	fmt.Fprintln(output, "  snailmail verify helm --repo DIR [--runner podman]")
 	fmt.Fprintln(output, "  snailmail serve --repo DIR [--listen 127.0.0.1:8080]")
+	fmt.Fprintln(output)
+	fmt.Fprintln(output, "Every command that reports a result accepts --json.")
 }
 
 func splitList(value string) []string {
@@ -1054,4 +1149,33 @@ func plural(count int, singular, pluralForm string) string {
 		return singular
 	}
 	return pluralForm
+}
+
+// These commands complete an action rather than compute a result, so the typed
+// value both renderings read is declared here. ARCHITECTURE §5.3 requires the
+// two renderings to share one value; what matters is that they cannot drift,
+// not where the value is declared.
+
+type initResult struct {
+	Workspace string `json:"workspace"`
+}
+
+type setupResult struct {
+	Repository string `json:"repository"`
+	Format     string `json:"format"`
+	Target     string `json:"target"`
+}
+
+type blobStoreResult struct {
+	Type string `json:"type"`
+}
+
+type approvalKeyResult struct {
+	Output    string `json:"output"`
+	PublicKey string `json:"public_key"`
+}
+
+type publishKeyResult struct {
+	Name        string `json:"name"`
+	Fingerprint string `json:"fingerprint"`
 }

@@ -18,13 +18,13 @@ type PlacementMutationRequest struct {
 }
 
 type PlacementMutationResult struct {
-	Repository string
-	Package    string
-	Version    string
-	Track      string
-	Distro     string
-	Changed    int
-	All        bool
+	Repository string `json:"repository"`
+	Package    string `json:"package"`
+	Version    string `json:"version"`
+	Track      string `json:"track"`
+	Distro     string `json:"distro"`
+	Changed    int    `json:"changed"`
+	All        bool   `json:"all"`
 }
 
 func Promote(request PlacementMutationRequest) (PlacementMutationResult, error) {

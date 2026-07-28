@@ -17,9 +17,9 @@ import (
 )
 
 type CheckFinding struct {
-	State   string
-	Subject string
-	Message string
+	State   string `json:"state"`
+	Subject string `json:"subject"`
+	Message string `json:"message"`
 }
 
 type CheckWorkspaceRequest struct {
@@ -32,12 +32,12 @@ type CheckWorkspaceRequest struct {
 }
 
 type CheckWorkspaceResult struct {
-	Repositories    int
-	PackageVersions int
-	Artifacts       int
-	OriginsChecked  int
-	OriginsSkipped  int
-	Findings        []CheckFinding
+	Repositories    int            `json:"repositories"`
+	PackageVersions int            `json:"package_versions"`
+	Artifacts       int            `json:"artifacts"`
+	OriginsChecked  int            `json:"origins_checked"`
+	OriginsSkipped  int            `json:"origins_skipped"`
+	Findings        []CheckFinding `json:"findings"`
 }
 
 type authorityFetchError struct{ err error }

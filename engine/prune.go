@@ -14,9 +14,9 @@ type PruneRequest struct {
 }
 
 type PruneResult struct {
-	Repository string
-	Keep       int
-	Removed    int
+	Repository string `json:"repository"`
+	Keep       int    `json:"keep"`
+	Removed    int    `json:"removed"`
 }
 
 func Prune(request PruneRequest) (PruneResult, error) {

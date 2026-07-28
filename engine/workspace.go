@@ -89,10 +89,10 @@ type ConfigureBlobStoreRequest struct {
 }
 
 type AddArtifactsResult struct {
-	Repository string
-	Added      int
-	Skipped    int
-	Packages   []string
+	Repository string   `json:"repository"`
+	Added      int      `json:"added"`
+	Skipped    int      `json:"skipped"`
+	Packages   []string `json:"packages"`
 }
 
 type PlanWorkspaceRequest struct {
@@ -108,19 +108,19 @@ type PlanWorkspaceRequest struct {
 }
 
 type PlanWorkspaceResult struct {
-	PlanID       string
-	Output       string
-	Changes      int
-	Acquisitions []PlannedAcquisition
+	PlanID       string               `json:"plan_id"`
+	Output       string               `json:"output"`
+	Changes      int                  `json:"changes"`
+	Acquisitions []PlannedAcquisition `json:"acquisitions"`
 }
 
 type PlannedAcquisition struct {
-	Repository string
-	Package    string
-	Version    string
-	Filename   string
-	SHA256     string
-	OriginURL  string
+	Repository string `json:"repository"`
+	Package    string `json:"package"`
+	Version    string `json:"version"`
+	Filename   string `json:"filename"`
+	SHA256     string `json:"sha256"`
+	OriginURL  string `json:"origin_url"`
 }
 
 type ApprovePlanRequest struct {
@@ -134,9 +134,9 @@ type ApprovePlanRequest struct {
 }
 
 type ApprovePlanResult struct {
-	PlanID   string
-	Output   string
-	Approver string
+	PlanID   string `json:"plan_id"`
+	Output   string `json:"output"`
+	Approver string `json:"approver"`
 }
 
 type RenderStatusRequest struct {
@@ -147,8 +147,8 @@ type RenderStatusRequest struct {
 }
 
 type RenderStatusResult struct {
-	Output       string
-	Repositories int
+	Output       string `json:"output"`
+	Repositories int    `json:"repositories"`
 }
 
 type ApplyWorkspaceRequest struct {
@@ -169,9 +169,9 @@ type ApplyWorkspaceRequest struct {
 }
 
 type ApplyWorkspaceResult struct {
-	PlanID  string
-	Applied int
-	Current int
+	PlanID  string `json:"plan_id"`
+	Applied int    `json:"applied"`
+	Current int    `json:"current"`
 }
 
 func InitWorkspace(request InitWorkspaceRequest) error {

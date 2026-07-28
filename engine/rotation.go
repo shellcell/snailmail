@@ -24,14 +24,14 @@ type RotateKeyRequest struct {
 }
 
 type RotateKeyResult struct {
-	Repository      string
+	Repository      string `json:"repository"`
 	PreviousKey     string
-	SuccessorKey    string
-	Phase           string
-	ActiveKey       string
-	TrustedKeys     []string
-	EarliestAdvance string
-	RequiresDeploy  bool
+	SuccessorKey    string   `json:"successor_key"`
+	Phase           string   `json:"phase"`
+	ActiveKey       string   `json:"active_key"`
+	TrustedKeys     []string `json:"trusted_keys"`
+	EarliestAdvance string   `json:"earliest_advance"`
+	RequiresDeploy  bool     `json:"requires_deploy"`
 }
 
 func RotateKey(ctx context.Context, request RotateKeyRequest) (RotateKeyResult, error) {

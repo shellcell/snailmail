@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 type commandFlags struct {
 	set       *flag.FlagSet
 	workspace *string
+	json      *bool
 }
 
 func newCommandFlags(name string, stderr io.Writer) *commandFlags {
@@ -46,6 +48,26 @@ func (flags *commandFlags) Int64(name string, value int64, usage string) *int64 
 
 func (flags *commandFlags) Duration(name string, value time.Duration, usage string) *time.Duration {
 	return flags.set.Duration(name, value, usage)
+}
+
+// withJSON declares the shared machine-readable output flag. PLAN.md §13:
+// "--json on everything, so CI is the CLI in a container."
+func (flags *commandFlags) withJSON() *commandFlags {
+	flags.json = flags.set.Bool("json", false, "emit machine-readable JSON")
+	return flags
+}
+
+// emit writes the command's result as JSON when it was asked for, and reports
+// whether it did so the caller renders either machine-readable or human output
+// and never both. Both renderings read the same typed value, so they cannot
+// drift apart.
+func (flags *commandFlags) emit(stdout io.Writer, result any) (bool, error) {
+	if flags.json == nil || !*flags.json {
+		return false, nil
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return true, encoder.Encode(result)
 }
 
 // Root is the resolved workspace root, or "." for commands without the flag.

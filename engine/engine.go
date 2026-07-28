@@ -28,14 +28,14 @@ type BuildPyPIRequest struct {
 }
 
 type BuildResult struct {
-	Format            string
-	Output            string
-	TreeSHA256        string
-	ManifestSHA256    string
-	ProjectCount      int
-	PackageCount      int
-	DistributionCount int
-	Signing           []state.PlanSigning
+	Format            string              `json:"format"`
+	Output            string              `json:"output"`
+	TreeSHA256        string              `json:"tree_sha256"`
+	ManifestSHA256    string              `json:"manifest_sha256"`
+	ProjectCount      int                 `json:"project_count"`
+	PackageCount      int                 `json:"package_count"`
+	DistributionCount int                 `json:"distribution_count"`
+	Signing           []state.PlanSigning `json:"-"`
 }
 
 type BuildDebRequest struct {
@@ -75,19 +75,19 @@ type VerifyHelmRequest struct {
 }
 
 type VerifyResult struct {
-	Format         string
-	TreeSHA256     string
-	FileCount      int
-	InstalledCases int
+	Format         string `json:"format"`
+	TreeSHA256     string `json:"tree_sha256"`
+	FileCount      int    `json:"file_count"`
+	InstalledCases int    `json:"installed_cases"`
 	// Manifest is the verified file list, returned so a caller that has just
 	// verified a tree does not have to re-verify it to enumerate its contents.
-	Manifest buildgraph.RepositoryManifest
+	Manifest buildgraph.RepositoryManifest `json:"-"`
 }
 
 type RepositoryInfo struct {
-	Format     string
-	TreeSHA256 string
-	FileCount  int
+	Format     string `json:"format"`
+	TreeSHA256 string `json:"tree_sha256"`
+	FileCount  int    `json:"file_count"`
 }
 
 // BuildPyPI builds and atomically materializes a deterministic PEP 503 tree.
