@@ -32,6 +32,7 @@ import (
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
+	"github.com/shellcell/snailmail/internal/factscache"
 	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
@@ -873,18 +874,23 @@ func verifyPyPIStructure(root string, manifest buildgraph.RepositoryManifest) ([
 		if len(parts) != 3 || parts[0] != "packages" || parts[1] != file.SHA256 || !pypi.IsDistributionFilename(parts[2]) {
 			return nil, fmt.Errorf("unexpected PyPI repository path %q", file.Path)
 		}
-		name := filepath.Join(root, filepath.FromSlash(file.Path))
-		packageFile, err := os.Open(name)
-		if err != nil {
-			return nil, fmt.Errorf("open PyPI package %q: %w", file.Path, err)
-		}
-		facts, inspectErr := pypi.Inspect(parts[2], packageFile, file.Size)
-		closeErr := packageFile.Close()
-		if inspectErr != nil {
-			return nil, inspectErr
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close PyPI package %q: %w", file.Path, closeErr)
+		facts, cached := factscache.Lookup(pypi.FormatID, file.SHA256)
+		if !cached {
+			name := filepath.Join(root, filepath.FromSlash(file.Path))
+			packageFile, err := os.Open(name)
+			if err != nil {
+				return nil, fmt.Errorf("open PyPI package %q: %w", file.Path, err)
+			}
+			var inspectErr error
+			facts, inspectErr = pypi.Inspect(parts[2], packageFile, file.Size)
+			closeErr := packageFile.Close()
+			if inspectErr != nil {
+				return nil, inspectErr
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("close PyPI package %q: %w", file.Path, closeErr)
+			}
+			factscache.Store(pypi.FormatID, file.SHA256, facts)
 		}
 		blobs = append(blobs, domain.Blob{Filename: parts[2], Size: file.Size, SHA256: file.SHA256, Facts: facts})
 	}
@@ -917,17 +923,22 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 			return nil, fmt.Errorf("unexpected Debian repository path %q", file.Path)
 		}
 		name := filepath.Join(root, filepath.FromSlash(file.Path))
-		packageFile, err := os.Open(name)
-		if err != nil {
-			return nil, fmt.Errorf("open Debian package %q: %w", file.Path, err)
-		}
-		facts, inspectErr := deb.Inspect(path.Base(file.Path), packageFile, file.Size)
-		closeErr := packageFile.Close()
-		if inspectErr != nil {
-			return nil, inspectErr
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close Debian package %q: %w", file.Path, closeErr)
+		facts, cached := factscache.Lookup(deb.FormatID, file.SHA256)
+		if !cached {
+			packageFile, err := os.Open(name)
+			if err != nil {
+				return nil, fmt.Errorf("open Debian package %q: %w", file.Path, err)
+			}
+			var inspectErr error
+			facts, inspectErr = deb.Inspect(path.Base(file.Path), packageFile, file.Size)
+			closeErr := packageFile.Close()
+			if inspectErr != nil {
+				return nil, inspectErr
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("close Debian package %q: %w", file.Path, closeErr)
+			}
+			factscache.Store(deb.FormatID, file.SHA256, facts)
 		}
 		md5Value, sha1Value, err := legacyChecksums(name)
 		if err != nil {
@@ -1019,18 +1030,23 @@ func verifyHelmStructure(root string, manifest buildgraph.RepositoryManifest) ([
 		if len(parts) != 3 || parts[0] != "charts" || parts[1] != file.SHA256 || !helm.IsChartFilename(parts[2]) {
 			return nil, fmt.Errorf("unexpected Helm repository path %q", file.Path)
 		}
-		name := filepath.Join(root, filepath.FromSlash(file.Path))
-		chartFile, err := os.Open(name)
-		if err != nil {
-			return nil, fmt.Errorf("open Helm chart %q: %w", file.Path, err)
-		}
-		facts, inspectErr := helm.Inspect(parts[2], chartFile, file.Size)
-		closeErr := chartFile.Close()
-		if inspectErr != nil {
-			return nil, inspectErr
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close Helm chart %q: %w", file.Path, closeErr)
+		facts, cached := factscache.Lookup(helm.FormatID, file.SHA256)
+		if !cached {
+			name := filepath.Join(root, filepath.FromSlash(file.Path))
+			chartFile, err := os.Open(name)
+			if err != nil {
+				return nil, fmt.Errorf("open Helm chart %q: %w", file.Path, err)
+			}
+			var inspectErr error
+			facts, inspectErr = helm.Inspect(parts[2], chartFile, file.Size)
+			closeErr := chartFile.Close()
+			if inspectErr != nil {
+				return nil, inspectErr
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("close Helm chart %q: %w", file.Path, closeErr)
+			}
+			factscache.Store(helm.FormatID, file.SHA256, facts)
 		}
 		blobs = append(blobs, domain.Blob{Filename: parts[2], Size: file.Size, SHA256: file.SHA256, Facts: facts})
 	}

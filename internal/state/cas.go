@@ -20,6 +20,7 @@ import (
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
 	"github.com/shellcell/snailmail/internal/domain"
+	"github.com/shellcell/snailmail/internal/factscache"
 )
 
 func PutArtifact(root, format, sourceName string) (domain.Blob, error) {
@@ -377,25 +378,36 @@ func validateLockedBlobOpenContext(ctx context.Context, file *os.File, pathInfo 
 	if err != nil {
 		return domain.Blob{}, fmt.Errorf("%w: read blob sha256:%s: %w", blob.ErrUnavailable, locked.SHA256, err)
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return domain.Blob{}, fmt.Errorf("%w: seek blob sha256:%s: %w", blob.ErrUnavailable, locked.SHA256, err)
-	}
-	facts, err := inspect(format, locked.Filename, contextReaderAt{ctx: ctx, reader: file}, size)
-	if err != nil {
-		if ctx.Err() != nil {
-			return domain.Blob{}, ctx.Err()
-		}
-		return domain.Blob{}, fmt.Errorf("%w: inspect blob sha256:%s: %v", blob.ErrCorrupt, locked.SHA256, err)
-	}
 	validated := domain.Blob{
 		Filename: locked.Filename,
 		Size:     size,
 		MD5:      hex.EncodeToString(md5Hash.Sum(nil)),
 		SHA1:     hex.EncodeToString(sha1Hash.Sum(nil)),
 		SHA256:   hex.EncodeToString(sha256Hash.Sum(nil)),
-		Facts:    facts,
 	}
-	if size != info.Size() || validated.Size != locked.Size || validated.SHA256 != locked.SHA256 || (locked.MD5 != "" && validated.MD5 != locked.MD5) || (locked.SHA1 != "" && validated.SHA1 != locked.SHA1) || facts.Architecture != locked.Architecture {
+	// Establish that these bytes are exactly the locked content before consulting
+	// any memo, so a cached parse is only ever reused for content this call has
+	// itself just verified.
+	if size != info.Size() || validated.Size != locked.Size || validated.SHA256 != locked.SHA256 ||
+		(locked.MD5 != "" && validated.MD5 != locked.MD5) || (locked.SHA1 != "" && validated.SHA1 != locked.SHA1) {
+		return domain.Blob{}, fmt.Errorf("%w: blob sha256:%s disagrees with its lock", blob.ErrCorrupt, locked.SHA256)
+	}
+	facts, cached := factscache.Lookup(format, validated.SHA256)
+	if !cached {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return domain.Blob{}, fmt.Errorf("%w: seek blob sha256:%s: %w", blob.ErrUnavailable, locked.SHA256, err)
+		}
+		facts, err = inspect(format, locked.Filename, contextReaderAt{ctx: ctx, reader: file}, size)
+		if err != nil {
+			if ctx.Err() != nil {
+				return domain.Blob{}, ctx.Err()
+			}
+			return domain.Blob{}, fmt.Errorf("%w: inspect blob sha256:%s: %v", blob.ErrCorrupt, locked.SHA256, err)
+		}
+		factscache.Store(format, validated.SHA256, facts)
+	}
+	validated.Facts = facts
+	if facts.Architecture != locked.Architecture {
 		return domain.Blob{}, fmt.Errorf("%w: blob sha256:%s disagrees with its lock", blob.ErrCorrupt, locked.SHA256)
 	}
 	if err := ctx.Err(); err != nil {
