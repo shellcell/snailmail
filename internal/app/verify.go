@@ -72,7 +72,7 @@ func verifyRepository(root string) (buildgraph.RepositoryManifest, []domain.Blob
 	if len(manifestBytes) > maxManifestSize {
 		return buildgraph.RepositoryManifest{}, nil, errors.New("repository manifest exceeds 8 MiB")
 	}
-	decoder := json.NewDecoder(strings.NewReader(string(manifestBytes)))
+	decoder := json.NewDecoder(bytes.NewReader(manifestBytes))
 	decoder.DisallowUnknownFields()
 	var manifest buildgraph.RepositoryManifest
 	if err := decoder.Decode(&manifest); err != nil {
@@ -451,6 +451,11 @@ func isLoopbackHost(value string) bool {
 }
 
 func redactCredential(value, username, password string) string {
+	// With no credential every derived form is a constant — base64(":") in
+	// particular — so redacting them would rewrite unrelated client output.
+	if username == "" || password == "" {
+		return value
+	}
 	secrets := []string{
 		username, password, url.QueryEscape(username), url.QueryEscape(password),
 		base64.StdEncoding.EncodeToString([]byte(username + ":" + password)),

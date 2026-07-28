@@ -1,7 +1,7 @@
 package wire
 
 import (
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -9,6 +9,10 @@ import (
 )
 
 const SigningPassphraseEnvironment = "SNAILMAIL_KEY_PASSPHRASE"
+
+// MinimumSigningPassphraseBytes is the documented floor for a signing key
+// passphrase, which should come from a secret manager rather than be typed.
+const MinimumSigningPassphraseBytes = 24
 
 func NewSignerStore() (*filesigner.Store, error) {
 	dataHome := os.Getenv("XDG_DATA_HOME")
@@ -21,8 +25,8 @@ func NewSignerStore() (*filesigner.Store, error) {
 	}
 	return filesigner.New(filepath.Join(dataHome, "snailmail", "private-keys"), func() ([]byte, error) {
 		value := os.Getenv(SigningPassphraseEnvironment)
-		if len(value) < 16 {
-			return nil, errors.New("signing key passphrase environment must contain at least 16 bytes")
+		if len(value) < MinimumSigningPassphraseBytes {
+			return nil, fmt.Errorf("%s must contain at least %d bytes", SigningPassphraseEnvironment, MinimumSigningPassphraseBytes)
 		}
 		return []byte(value), nil
 	})
