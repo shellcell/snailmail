@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package app
 
@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func TestCommitReleaseLinkPreservesConcurrentReplacement(t *testing.T) {
+func TestExchangeReleaseLinkPreservesConcurrentReplacement(t *testing.T) {
 	directory := t.TempDir()
 	output := filepath.Join(directory, "repository")
 	temporary := filepath.Join(directory, "new-link")
@@ -18,7 +18,7 @@ func TestCommitReleaseLinkPreservesConcurrentReplacement(t *testing.T) {
 	if err := os.Symlink("new-release", temporary); err != nil {
 		t.Fatal(err)
 	}
-	committed, err := commitReleaseLink(temporary, output, "old-release")
+	committed, err := exchangeReleaseLink(temporary, output, "old-release")
 	if err == nil || !committed {
 		t.Fatal("expected concurrent replacement to fail")
 	}
@@ -31,7 +31,7 @@ func TestCommitReleaseLinkPreservesConcurrentReplacement(t *testing.T) {
 	}
 }
 
-func TestCommitReleaseLinkExchangesExpectedSymlink(t *testing.T) {
+func TestExchangeReleaseLinkExchangesExpectedSymlink(t *testing.T) {
 	directory := t.TempDir()
 	output := filepath.Join(directory, "repository")
 	temporary := filepath.Join(directory, "new-link")
@@ -41,7 +41,7 @@ func TestCommitReleaseLinkExchangesExpectedSymlink(t *testing.T) {
 	if err := os.Symlink("new-release", temporary); err != nil {
 		t.Fatal(err)
 	}
-	committed, err := commitReleaseLink(temporary, output, "old-release")
+	committed, err := exchangeReleaseLink(temporary, output, "old-release")
 	if err != nil {
 		t.Fatal(err)
 	}

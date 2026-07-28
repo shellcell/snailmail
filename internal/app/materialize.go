@@ -310,13 +310,10 @@ func publishRelease(output, staging, expectedLink, expectedTree string) (bool, e
 		if err := os.Symlink(newLink, filepath.Join(control, "current")); err != nil {
 			return false, fmt.Errorf("create current release link: %w", err)
 		}
-		temporaryName, err := reserveSymlink(parent, "."+filepath.Base(output)+".snailmail-link-*", filepath.Join(filepath.Base(control), "current"))
-		if err != nil {
-			return false, err
-		}
-		committed, err := commitReleaseLink(temporaryName, output, "")
-		if err != nil {
-			return committed, fmt.Errorf("commit initial release link: %w", err)
+		// os.Symlink is itself the atomic create-if-absent commit: it fails with
+		// EEXIST rather than replacing an entry another writer published.
+		if err := os.Symlink(filepath.Join(filepath.Base(control), "current"), output); err != nil {
+			return false, fmt.Errorf("commit initial release link: %w", err)
 		}
 		if err := syncDirectory(control); err != nil {
 			return true, err
@@ -338,7 +335,7 @@ func publishRelease(output, staging, expectedLink, expectedTree string) (bool, e
 	if err != nil {
 		return false, err
 	}
-	committed, err := commitReleaseLink(temporaryName, filepath.Join(control, "current"), expectedLink)
+	committed, err := exchangeReleaseLink(temporaryName, filepath.Join(control, "current"), expectedLink)
 	if err != nil {
 		return committed, fmt.Errorf("commit current release: %w", err)
 	}
