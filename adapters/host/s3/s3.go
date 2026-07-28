@@ -141,17 +141,21 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 			return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 restore state", Err: errors.New("bound retained root is corrupt")}
 		}
 	}
-	for _, file := range descriptor.Files {
+	if err := forEachObject(ctx, len(descriptor.Files), func(ctx context.Context, index int) error {
+		file := descriptor.Files[index]
 		info, err := adapter.client.Head(ctx, releaseKey(repository, revision.TreeSHA256, file.Path))
 		if errors.Is(err, ErrNotFound) {
-			return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 release", Err: fmt.Errorf("release object %q is missing or corrupt", file.Path)}
+			return &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 release", Err: fmt.Errorf("release object %q is missing or corrupt", file.Path)}
 		}
 		if err != nil {
-			return host.PublishedRevision{}, infrastructure("inspect S3 release object", err)
+			return infrastructure("inspect S3 release object", err)
 		}
 		if info.Size != file.Size || info.SHA256 != file.SHA256 || info.Metadata["sha256"] != file.SHA256 {
-			return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 release", Err: fmt.Errorf("release object %q is missing or corrupt", file.Path)}
+			return &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 release", Err: fmt.Errorf("release object %q is missing or corrupt", file.Path)}
 		}
+		return nil
+	}); err != nil {
+		return host.PublishedRevision{}, err
 	}
 	releaseRoot, _, err := adapter.client.Get(ctx, releaseKey(repository, revision.TreeSHA256, pypiRootPath), maximumMetadataSize)
 	if err != nil {
@@ -264,35 +268,42 @@ func (adapter *Adapter) Stage(ctx context.Context, repository host.Repository, r
 			resultErr = fmt.Errorf("%w; clean partial S3 stage: %v", resultErr, cleanupErr)
 		}
 	}()
+	// Every key is recorded before any upload starts so the deferred cleanup
+	// removes partial stages regardless of which uploads were in flight.
 	for _, file := range descriptor.Files {
+		uploaded = append(uploaded, stageKey(repository, identifier, file.Path))
+	}
+	if err := forEachObject(ctx, len(descriptor.Files), func(ctx context.Context, index int) error {
+		file := descriptor.Files[index]
 		name := filepath.Join(request.Directory, filepath.FromSlash(file.Path))
 		actualSize, actualDigest, err := hashFile(name)
 		if err != nil {
-			return host.StagedPublication{}, err
+			return err
 		}
 		if actualSize != file.Size || actualDigest != file.SHA256 {
-			return host.StagedPublication{}, &host.Error{Kind: host.ErrorStale, Operation: "stage S3 repository", Err: fmt.Errorf("file %q changed after verification", file.Path)}
+			return &host.Error{Kind: host.ErrorStale, Operation: "stage S3 repository", Err: fmt.Errorf("file %q changed after verification", file.Path)}
 		}
 		input, err := os.Open(name)
 		if err != nil {
-			return host.StagedPublication{}, err
+			return err
 		}
-		key := stageKey(repository, identifier, file.Path)
-		uploaded = append(uploaded, key)
 		stored, putErr := adapter.client.Put(ctx, PutRequest{
-			Key: key, Body: input, Size: file.Size, SHA256: file.SHA256,
+			Key: stageKey(repository, identifier, file.Path), Body: input, Size: file.Size, SHA256: file.SHA256,
 			ContentType: contentType(file.Path), Metadata: map[string]string{"sha256": file.SHA256},
 		})
 		closeErr := input.Close()
 		if putErr != nil {
-			return host.StagedPublication{}, infrastructure("upload S3 stage object", putErr)
+			return infrastructure("upload S3 stage object", putErr)
 		}
 		if closeErr != nil {
-			return host.StagedPublication{}, closeErr
+			return closeErr
 		}
 		if stored.Size != file.Size || stored.SHA256 != file.SHA256 || stored.Metadata["sha256"] != file.SHA256 {
-			return host.StagedPublication{}, &host.Error{Kind: host.ErrorInfrastructure, Operation: "verify S3 stage object", Err: fmt.Errorf("object %q metadata does not match", file.Path)}
+			return &host.Error{Kind: host.ErrorInfrastructure, Operation: "verify S3 stage object", Err: fmt.Errorf("object %q metadata does not match", file.Path)}
 		}
+		return nil
+	}); err != nil {
+		return host.StagedPublication{}, err
 	}
 	manifest, err := app.VerifyRepository(request.Directory)
 	if err != nil || manifest.Format != pypi.FormatID || manifest.TreeSHA256 != request.TreeSHA256 {
@@ -699,25 +710,29 @@ func descriptorFromRequest(request host.StageRequest) (publicationDescriptor, st
 
 func (adapter *Adapter) materializeRelease(ctx context.Context, repository host.Repository, stageID string, publication publicationDescriptor) (string, error) {
 	descriptor := releaseDescriptorFromPublication(publication)
-	for _, file := range descriptor.Files {
+	if err := forEachObject(ctx, len(descriptor.Files), func(ctx context.Context, index int) error {
+		file := descriptor.Files[index]
 		destination := releaseKey(repository, descriptor.TreeSHA256, file.Path)
 		stored, err := adapter.client.CopyCreate(ctx, stageKey(repository, stageID, file.Path), destination, file.Size, file.SHA256)
 		if errors.Is(err, ErrPrecondition) {
 			stored, err = adapter.client.Head(ctx, destination)
 			if err != nil {
-				return "", infrastructure("reconcile S3 release object", err)
+				return infrastructure("reconcile S3 release object", err)
 			}
 			if stored.Size != file.Size || stored.SHA256 != file.SHA256 || stored.Metadata["sha256"] != file.SHA256 {
-				return "", &host.Error{Kind: host.ErrorIndeterminate, Operation: "materialize S3 release", Err: fmt.Errorf("immutable release object %q conflicts", file.Path)}
+				return &host.Error{Kind: host.ErrorIndeterminate, Operation: "materialize S3 release", Err: fmt.Errorf("immutable release object %q conflicts", file.Path)}
 			}
-			continue
+			return nil
 		}
 		if err != nil {
-			return "", infrastructure("materialize S3 release object", err)
+			return infrastructure("materialize S3 release object", err)
 		}
 		if stored.Size != file.Size || stored.SHA256 != file.SHA256 || stored.Metadata["sha256"] != file.SHA256 {
-			return "", &host.Error{Kind: host.ErrorInfrastructure, Operation: "verify S3 release object", Err: fmt.Errorf("object %q metadata does not match", file.Path)}
+			return &host.Error{Kind: host.ErrorInfrastructure, Operation: "verify S3 release object", Err: fmt.Errorf("object %q metadata does not match", file.Path)}
 		}
+		return nil
+	}); err != nil {
+		return "", err
 	}
 	content, err := json.Marshal(descriptor)
 	if err != nil {
