@@ -118,14 +118,17 @@ func Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact
 
 	var releaseFiles []releaseFile
 	for _, architecture := range architectures {
-		var packages strings.Builder
+		// Render straight into the buffer whose bytes become the file. Building a
+		// string per stanza, copying it into an index builder and then copying
+		// the whole index again to bytes held a large Packages index three times.
+		var packages bytes.Buffer
 		for _, entry := range indexed {
 			if entry.blob.Facts.Architecture != "all" && entry.blob.Facts.Architecture != architecture {
 				continue
 			}
-			packages.WriteString(renderPackage(entry))
+			writePackage(&packages, entry)
 		}
-		packagesBytes := []byte(packages.String())
+		packagesBytes := packages.Bytes()
 		base := path.Join("dists", options.Suite, options.Component, "binary-"+architecture)
 		packagesPath := path.Join(base, "Packages")
 		files = append(files, domain.File{Path: packagesPath, Content: packagesBytes})
@@ -210,7 +213,7 @@ func packagePoolPath(component string, blob domain.Blob) string {
 	return path.Join("pool", component, prefix, blob.Facts.Name, blob.Filename)
 }
 
-func renderPackage(entry indexedBlob) string {
+func writePackage(output *bytes.Buffer, entry indexedBlob) {
 	fields := make(map[string]string, len(entry.blob.Facts.Fields)+5)
 	for name, value := range entry.blob.Facts.Fields {
 		if name != "Status" && name != "Filename" && name != "Size" && name != "MD5sum" && name != "SHA1" && name != "SHA256" {
@@ -234,12 +237,10 @@ func renderPackage(entry indexedBlob) string {
 		}
 		return names[i] < names[j]
 	})
-	var stanza strings.Builder
 	for _, name := range names {
-		writeField(&stanza, name, fields[name])
+		writeField(output, name, fields[name])
 	}
-	stanza.WriteByte('\n')
-	return stanza.String()
+	output.WriteByte('\n')
 }
 
 func fieldRank(name string) int {
@@ -252,7 +253,7 @@ func fieldRank(name string) int {
 	return len(order)
 }
 
-func writeField(output *strings.Builder, name, value string) {
+func writeField(output *bytes.Buffer, name, value string) {
 	lines := strings.Split(value, "\n")
 	output.WriteString(name)
 	output.WriteString(": ")

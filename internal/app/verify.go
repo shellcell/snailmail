@@ -374,38 +374,41 @@ func verifyHostedPyPIBytes(ctx context.Context, access host.ClientAccess, userna
 			return errors.New("repository verification does not follow redirects")
 		},
 	}
-	verifyURL := func(address string, expectedSize int64, expectedSHA256 string) ([]byte, error) {
+	// Routes cover every file in the tree, including distributions up to
+	// pypi.MaxArtifactSize. Only the digest and length matter here, so the body
+	// is hashed as it streams rather than buffered whole.
+	verifyURL := func(address string, expectedSize int64, expectedSHA256 string) error {
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if private {
 			request.SetBasicAuth(username, password)
 		}
 		response, err := client.Do(request)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		content, readErr := io.ReadAll(io.LimitReader(response.Body, expectedSize+1))
+		hash := sha256.New()
+		size, readErr := io.Copy(hash, io.LimitReader(response.Body, expectedSize+1))
 		closeErr := response.Body.Close()
 		if readErr != nil {
-			return nil, readErr
+			return readErr
 		}
 		if closeErr != nil {
-			return nil, closeErr
+			return closeErr
 		}
-		digest := sha256.Sum256(content)
-		if response.StatusCode != http.StatusOK || int64(len(content)) != expectedSize || hex.EncodeToString(digest[:]) != expectedSHA256 {
-			return nil, errors.New("host-served repository bytes do not match the reviewed tree")
+		if response.StatusCode != http.StatusOK || size != expectedSize || hex.EncodeToString(hash.Sum(nil)) != expectedSHA256 {
+			return errors.New("host-served repository bytes do not match the reviewed tree")
 		}
-		return content, nil
+		return nil
 	}
 	for _, route := range access.Routes {
 		parsed, err := url.Parse(route.URL)
 		if err != nil || parsed.Scheme != endpoint.Scheme || parsed.Host != endpoint.Host || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || route.Size < 0 {
 			return errors.New("host supplied an invalid client verification route")
 		}
-		if _, err := verifyURL(route.URL, route.Size, route.SHA256); err != nil {
+		if err := verifyURL(route.URL, route.Size, route.SHA256); err != nil {
 			return fmt.Errorf("verify host-served route %q: %w", parsed.EscapedPath(), err)
 		}
 	}
