@@ -3,6 +3,7 @@ package deb
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"errors"
 	"fmt"
@@ -238,7 +239,7 @@ func compressedTarReader(name string, raw io.Reader, maxMemory uint64) (io.Reade
 		compressed, err := (xz.ReaderConfig{DictCap: int(maxMemory)}).NewReader(raw)
 		return compressed, nil, err
 	case strings.HasSuffix(name, ".zst"):
-		compressed, err := zstd.NewReader(raw, zstd.WithDecoderMaxMemory(maxMemory))
+		compressed, err := zstd.NewReader(raw, zstd.WithDecoderMaxMemory(maxMemory), zstd.WithDecoderConcurrency(1))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -303,7 +304,7 @@ func readControlArchive(name string, raw io.Reader) (map[string]string, error) {
 		}
 		stream = compressed
 	case strings.HasSuffix(name, ".zst"):
-		compressed, err := zstd.NewReader(raw, zstd.WithDecoderMaxMemory(maxControlArchive))
+		compressed, err := zstd.NewReader(raw, zstd.WithDecoderMaxMemory(maxControlArchive), zstd.WithDecoderConcurrency(1))
 		if err != nil {
 			return nil, fmt.Errorf("open zstd control archive: %w", err)
 		}
@@ -358,7 +359,7 @@ func parseControl(content []byte) (map[string]string, error) {
 	}
 	fields := make(map[string]string)
 	seenFields := make(map[string]bool)
-	scanner := bufio.NewScanner(strings.NewReader(string(content)))
+	scanner := bufio.NewScanner(bytes.NewReader(content))
 	scanner.Buffer(make([]byte, 4096), maxControlSize)
 	current := ""
 	for scanner.Scan() {

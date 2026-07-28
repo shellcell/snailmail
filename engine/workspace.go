@@ -617,6 +617,41 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 	return PlanWorkspaceResult{PlanID: plan.PlanID, Output: output, Changes: changes, Acquisitions: plannedAcquisitions}, nil
 }
 
+// applyRepository is one repository's state as apply carries it from plan
+// revalidation through staging to publication.
+type applyRepository struct {
+	planned        state.PlanRepository
+	repository     state.Repository
+	lock           state.RepositoryLock
+	host           host.Host
+	hostRepository host.Repository
+	observed       host.PublishedRevision
+	hostStage      host.StagedPublication
+	stageRoot      string
+	stage          string
+	stagedManifest buildgraph.RepositoryManifest
+	current        bool
+	deployment     state.DeploymentRecord
+	signingState   deploymentSigningState
+}
+
+// restoreFailedPublication compensates a failed verification by asking the host
+// to put back the revision this change displaced. Restoring is itself a
+// publication effect, so it is gated exactly like the change that failed.
+func restoreFailedPublication(ctx context.Context, item applyRepository, reference host.RestoreRef, expected host.ExpectedRevision, authorize func(applyRepository) error) error {
+	if err := authorize(item); err != nil {
+		return fmt.Errorf("restore gate failed: %w", err)
+	}
+	// The restore must still run when the caller's context is already done,
+	// otherwise an interrupt would leave the failed tree published.
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	if _, err := item.host.Restore(restoreCtx, item.hostRepository, reference, expected); err != nil {
+		return fmt.Errorf("restore failed: %w", err)
+	}
+	return nil
+}
+
 func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWorkspaceResult, error) {
 	root, err := workspaceRoot(request.Root)
 	if err != nil {
@@ -695,205 +730,29 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	if err != nil {
 		return ApplyWorkspaceResult{}, err
 	}
-	type applyRepository struct {
-		planned        state.PlanRepository
-		repository     state.Repository
-		lock           state.RepositoryLock
-		host           host.Host
-		hostRepository host.Repository
-		observed       host.PublishedRevision
-		hostStage      host.StagedPublication
-		stageRoot      string
-		stage          string
-		current        bool
-		deployment     state.DeploymentRecord
-		signingState   deploymentSigningState
-	}
 	var prepared []applyRepository
 	hosts := request.Hosts
 	if hosts == nil {
 		hosts = localHostResolver{}
 	}
 	seenRepositories := make(map[string]bool)
+	preparation := &applyPreparation{
+		ctx: ctx, root: root, request: request, plan: plan, manifest: manifest, hosts: hosts,
+		blobStore: blobStore, now: now, expiresAt: expiresAt, generatedAt: generatedAt,
+		signatureTime: signatureTime, ledgerCommitted: ledgerCommitted,
+	}
 	for _, planned := range plan.Payload.Repositories {
 		if seenRepositories[planned.Name] {
 			return ApplyWorkspaceResult{}, fmt.Errorf("plan contains duplicate repository %q", planned.Name)
 		}
 		seenRepositories[planned.Name] = true
-		repository, exists := manifest.Repositories[planned.Name]
-		if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) || len(planned.Signing) > 1 || (len(planned.Signing) == 0) != (len(repository.SigningKeys) == 0) {
-			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q configuration changed", planned.Name)
-		}
-		activeSigningKey, _, _, _, signingStateErr := repositorySigningState(repository)
-		if signingStateErr != nil {
-			return ApplyWorkspaceResult{}, signingStateErr
-		}
-		for index, signing := range planned.Signing {
-			if index != 0 || signing.KeyName != activeSigningKey {
-				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q signing key changed", planned.Name)
-			}
-			key, exists := manifest.Keys[signing.KeyName]
-			if !exists {
-				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q signing key is missing", planned.Name)
-			}
-			keyExpiresAt, err := time.Parse(time.RFC3339, key.ExpiresAt)
-			if err != nil || expiresAt.After(keyExpiresAt) {
-				return ApplyWorkspaceResult{}, fmt.Errorf("repository %q plan expires after its signing key", planned.Name)
-			}
-			if err := validateSigningRecipeMetadata(signing, repository.Suite); err != nil {
-				return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q: %w", planned.Name, err)
-			}
-		}
-		hostIdentity, err := repositoryHostIdentity(repository)
-		if err != nil || hostIdentity != planned.HostIdentitySHA256 || repository.Host != planned.Host || repository.Visibility != planned.Visibility {
-			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q host changed", planned.Name)
-		}
-		hostRepository := toHostRepository(root, manifest.Workspace.ID, hostIdentity, planned.Name, repository)
-		if hostRepository.CanonicalEndpoint != planned.CanonicalEndpoint {
-			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q canonical endpoint changed", planned.Name)
-		}
-		installDocDigest, err := repositoryInstallDocDigest(root, planned.Name, repository)
-		if err != nil || installDocDigest != planned.InstallDocSHA256 {
-			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q install document changed", planned.Name)
-		}
-		selectedHost, err := hosts.Resolve(ctx, hostRepository)
+		item, err := preparation.prepareRepository(planned)
 		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		capabilities, err := selectedHost.Capabilities(ctx, hostRepository)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		if capabilities.FaithfulPreview != planned.FaithfulPreview || capabilities.ConditionalCommit != planned.ConditionalCommit || capabilities.ConditionalRestore != planned.ConditionalRestore ||
-			capabilities.PrivateRead != planned.PrivateRead || capabilities.CredentialBrokerIdentity != planned.CredentialBrokerIdentity {
-			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q host capabilities changed", planned.Name)
-		}
-		lockPath, err := state.WorkspacePath(root, repository.Lock)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		lockDigest, err := state.HashFile(lockPath)
-		if err != nil || lockDigest != planned.LockSHA256 {
-			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q lock changed", planned.Name)
-		}
-		lock, err := state.LoadLock(root, repository)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		if err := state.ValidateLock(lock, planned.Name, repository.Format); err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		ledger, err := state.LoadLedgerHistory(root, planned.Name)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		if err := state.ValidatePublicationHistory(planned.Name, ledger); err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		missingBindings := missingPublicationBindings(lock, repository, ledger)
-		expectedBindings := []state.PlanPublicationBinding(nil)
-		if planned.PublicationRecords {
-			expectedBindings = publicationBindingsForVersions(visiblePackageVersions(lock, repository))
-		}
-		expectedAcquisitions := planAcquisitionsForVersions(visiblePackageVersions(lock, repository))
-		if !reflect.DeepEqual(planned.Acquisitions, expectedAcquisitions) {
-			return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q has inconsistent adopted acquisitions", planned.Name)
-		}
-		if planned.PublicationRecords != (len(planned.PublicationBindings) != 0) ||
-			!reflect.DeepEqual(planned.PublicationBindings, expectedBindings) ||
-			(!ledgerCommitted && planned.PublicationRecords != (len(missingBindings) != 0)) ||
-			(ledgerCommitted && !planned.PublicationRecords && len(missingBindings) != 0) {
-			return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q has inconsistent publication-record effects", planned.Name)
-		}
-		deployment, err := state.LoadDeployment(root, planned.Name)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		desiredSigningState, err := repositoryDeploymentSigningState(repository, manifest.Keys)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		observed, err := selectedHost.Observe(ctx, hostRepository)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		plannedObserved := publishedFromPlanObservation(planned)
-		trustNotBefore := time.Time{}
-		if repository.SigningRotation != nil || deployment.SigningRotationPhase != "" {
-			trustNotBefore, err = state.AuthoritativeDeploymentTrustSince(root, planned.Name, deployment)
-			if err != nil {
-				return ApplyWorkspaceResult{}, err
-			}
-		}
-		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, plannedObserved, now, trustNotBefore); err != nil {
-			return ApplyWorkspaceResult{}, fmt.Errorf("repository %q: %w", planned.Name, err)
-		}
-		matchesObserved := revisionMatchesPlanObservation(observed, planned)
-		managedRemote := repository.Host.Type == "s3" || repository.Host.Type == "github-pages"
-		matchesApplied := planned.Action != "noop" && observed.TreeSHA256 == planned.DesiredTreeSHA256 &&
-			(!managedRemote || (observed.PlanID == plan.PlanID && observed.ChangeID == planned.ChangeID && observed.ManifestSHA256 == planned.DesiredManifestSHA256))
-		deploymentApplied := deployment.PlanID == plan.PlanID && deployment.ChangeID == planned.ChangeID && deployment.TreeSHA256 == planned.DesiredTreeSHA256 && deployment.ManifestSHA256 == planned.DesiredManifestSHA256 && deployment.NativeRevision == observed.NativeRevision && deploymentSigningMatches(deployment, desiredSigningState)
-		deploymentCurrent := deploymentMatchesDesired(deployment, observed, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, desiredSigningState)
-		if !reflect.DeepEqual(deployment, planned.ObservedDeployment) && !deploymentApplied {
-			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q deployment receipt changed", planned.Name)
-		}
-		if !matchesObserved && !matchesApplied {
-			if observed.TreeSHA256 == planned.ObservedTreeSHA256 {
-				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q native revision changed", planned.Name)
-			}
-			if observed.TreeSHA256 == planned.DesiredTreeSHA256 {
-				return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q desired tree was published by another change", planned.Name)
-			}
-			return ApplyWorkspaceResult{}, fmt.Errorf("stale plan: repository %q target changed", planned.Name)
-		}
-		expectedAction := "noop"
-		if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 || (managedRemote && planned.ObservedManifestSHA256 != planned.DesiredManifestSHA256) || !publicationBindingsComplete(lock, repository, ledger) || !deploymentMatchesDesired(planned.ObservedDeployment, plannedObserved, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, desiredSigningState) {
-			expectedAction = "update"
-			if planned.ObservedRevision == "" {
-				expectedAction = "create"
-			}
-		}
-		if planned.Action != expectedAction || planned.ChangeID != planned.Name+":"+planned.DesiredTreeSHA256[:12] {
-			return ApplyWorkspaceResult{}, fmt.Errorf("plan repository %q has inconsistent action metadata", planned.Name)
-		}
-		receiptRecovery := matchesApplied && reflect.DeepEqual(deployment, planned.ObservedDeployment)
-		current := observed.TreeSHA256 == planned.DesiredTreeSHA256 && (!managedRemote || observed.ManifestSHA256 == planned.DesiredManifestSHA256) && (deploymentApplied || (planned.Action == "noop" && deploymentCurrent) || receiptRecovery)
-		item := applyRepository{
-			planned: planned, repository: repository, lock: lock, host: selectedHost,
-			hostRepository: hostRepository, observed: observed, current: current, deployment: deployment, signingState: desiredSigningState,
-		}
-		if item.current && (request.StructuralOnly || planned.Action == "noop") && !(planned.Action != "noop" && len(planned.Signing) != 0) {
-			prepared = append(prepared, item)
-			continue
-		}
-		stage, err := os.MkdirTemp("", ".snailmail-apply-*")
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		stageOutput := filepath.Join(stage, "repository")
-		staged, buildErr := buildLockedRepository(ctx, root, planned.Name, repository, lock, generatedAt, signatureTime, stageOutput, blobStore, manifest.Keys, planned.Signing, nil)
-		if buildErr == nil && (staged.TreeSHA256 != planned.DesiredTreeSHA256 || staged.ManifestSHA256 != planned.DesiredManifestSHA256) {
-			buildErr = errors.New("stale plan: rebuilt tree digest changed")
-		}
-		if buildErr == nil && !signingContentsEqual(staged.Signing, planned.Signing) {
-			buildErr = errors.New("stale plan: signing recipe changed")
-		}
-		if buildErr == nil {
-			structuralRequest := request
-			structuralRequest.StructuralOnly = true
-			buildErr = verifyStaged(ctx, repository.Format, stageOutput, structuralRequest)
-		}
-		if buildErr != nil {
-			_ = os.RemoveAll(stage)
 			for _, previous := range prepared {
 				_ = os.RemoveAll(previous.stageRoot)
 			}
-			return ApplyWorkspaceResult{}, buildErr
+			return ApplyWorkspaceResult{}, err
 		}
-		item.stageRoot, item.stage = stage, stageOutput
 		prepared = append(prepared, item)
 	}
 	defer func() {
@@ -943,7 +802,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if item.current {
 			continue
 		}
-		files, err := stagedHostFiles(item.stage)
+		files, err := stagedHostFiles(item.stage, item.stagedManifest)
 		if err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
@@ -962,7 +821,7 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			continue
 		}
 		if item.hostRepository.Type == "local" {
-			if err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
+			if _, err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
 				return ApplyWorkspaceResult{}, err
 			}
 			continue
@@ -1077,100 +936,22 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	}
 	result := ApplyWorkspaceResult{PlanID: plan.PlanID}
 	deployments := make([]state.DeploymentRecord, 0, len(prepared))
-	for _, item := range prepared {
-		if item.current {
-			result.Current++
-			if !request.StructuralOnly && item.planned.Action != "noop" {
-				access, accessErr := item.host.ReadAccess(ctx, item.hostRepository, item.observed)
-				if accessErr != nil {
-					return result, accessErr
-				}
-				if err := verifyCanonicalClient(ctx, root, item.repository, item.stage, access, request); err != nil {
-					if item.observed.RestoreID != "" {
-						if gateErr := authorize(item); gateErr != nil {
-							return result, gateErr
-						}
-						restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-						_, restoreErr := item.host.Restore(restoreCtx, item.hostRepository, host.RestoreRef{
-							ID: item.observed.RestoreID, PlanID: item.observed.PlanID,
-							ChangeID: item.observed.ChangeID, FailedTree: item.observed.TreeSHA256,
-							DescriptorSHA256: item.observed.RestoreSHA256, RootSHA256: item.observed.RestoreRootSHA256,
-						}, expectedRevisionFromPublished(item.observed))
-						cancelRestore()
-						if restoreErr != nil {
-							return result, fmt.Errorf("canonical retry probe failed: %v; restore failed: %w", err, restoreErr)
-						}
-						result.Current--
-					}
-					return result, err
-				}
-			}
-			if item.planned.Action != "noop" {
-				deployments = append(deployments, deploymentRecordFor(item.planned, item.deployment, item.observed, item.signingState, item.observed.NativeRevision, plan.PlanID, plan.Payload.CreatedAt, request.currentTime()))
-			}
-			continue
-		}
-		if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
-			return result, err
-		}
-		if err := authorize(item); err != nil {
-			return result, err
-		}
-		committed, err := item.host.Commit(ctx, item.hostRepository, item.hostStage, expectedRevisionFromPlan(item.planned))
-		if err != nil {
-			return result, err
-		}
-		if committed.Access.Credential != nil {
-			defer committed.Access.Credential.Destroy()
-		}
-		result.Applied++
-		canonical, observeErr := item.host.Observe(ctx, item.hostRepository)
-		if observeErr != nil || canonical.TreeSHA256 != item.planned.DesiredTreeSHA256 || canonical.NativeRevision != committed.Revision.NativeRevision ||
-			(item.hostRepository.Type == "s3" && canonical != committed.Revision) {
-			probeErr := observeErr
-			if probeErr == nil {
-				probeErr = errors.New("canonical host observation does not match committed tree")
-			}
-			if committed.RestoreRef != nil {
-				if gateErr := authorize(item); gateErr != nil {
-					return result, fmt.Errorf("canonical probe failed: %v; restore gate failed: %w", probeErr, gateErr)
-				}
-				restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-				_, restoreErr := item.host.Restore(restoreCtx, item.hostRepository, *committed.RestoreRef, expectedRevisionFromPublished(committed.Revision))
-				cancelRestore()
-				if restoreErr != nil {
-					return result, fmt.Errorf("canonical probe failed: %v; restore failed: %w", probeErr, restoreErr)
-				}
-				result.Applied--
-			}
-			return result, fmt.Errorf("canonical probe failed: %w", probeErr)
-		}
-		if !request.StructuralOnly {
-			access := committed.Access
-			if access.Endpoint == "" {
-				access.Endpoint = committed.CanonicalEndpoint
-			}
-			if probeErr := verifyCanonicalClient(ctx, root, item.repository, item.stage, access, request); probeErr != nil {
-				if committed.RestoreRef != nil {
-					if gateErr := authorize(item); gateErr != nil {
-						return result, fmt.Errorf("canonical client probe failed: %v; restore gate failed: %w", probeErr, gateErr)
-					}
-					restoreCtx, cancelRestore := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
-					_, restoreErr := item.host.Restore(restoreCtx, item.hostRepository, *committed.RestoreRef, expectedRevisionFromPublished(committed.Revision))
-					cancelRestore()
-					if restoreErr != nil {
-						return result, fmt.Errorf("canonical client probe failed: %v; restore failed: %w", probeErr, restoreErr)
-					}
-					result.Applied--
-				}
-				return result, fmt.Errorf("canonical client probe failed: %w", probeErr)
-			}
-		}
-		if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
-			return result, err
-		}
-		deployments = append(deployments, deploymentRecordFor(item.planned, item.deployment, item.observed, item.signingState, committed.Revision.NativeRevision, plan.PlanID, plan.Payload.CreatedAt, request.currentTime()))
+	execution := &applyExecution{
+		ctx: ctx, root: root, request: request, plan: plan,
+		applyGitRevision: applyGitRevision, authorize: authorize, result: result,
 	}
+	for _, item := range prepared {
+		var err error
+		if item.current {
+			err = execution.verifyCurrent(item)
+		} else {
+			err = execution.publish(item)
+		}
+		if err != nil {
+			return execution.result, err
+		}
+	}
+	result, deployments = execution.result, execution.deployments
 	if unlockGit != nil {
 		unlockGit()
 		unlockGit = nil
@@ -1435,7 +1216,8 @@ func verifyCanonicalClient(ctx context.Context, root string, repository state.Re
 		if err != nil {
 			return err
 		}
-		return verifyStaged(ctx, repository.Format, output, request)
+		_, err = verifyStaged(ctx, repository.Format, output, request)
+		return err
 	}
 	if repository.Format != "pypi" {
 		return fmt.Errorf("canonical client verification is not implemented for format %q", repository.Format)
@@ -1445,7 +1227,11 @@ func verifyCanonicalClient(ctx context.Context, root string, repository state.Re
 }
 
 func buildLockedRepository(ctx context.Context, root, name string, repository state.Repository, lock state.RepositoryLock, generatedAt, signatureTime time.Time, output string, blobStore blob.Store, keys map[string]state.SigningKey, plannedSigning []state.PlanSigning, signers signer.Resolver) (BuildResult, error) {
-	input, err := os.MkdirTemp("", ".snailmail-locked-input-*")
+	staging, err := stagingRoot(root)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	input, err := os.MkdirTemp(staging, ".snailmail-locked-input-*")
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -1473,7 +1259,7 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		}
 	}
 	if output == "" {
-		temporary, err := os.MkdirTemp("", ".snailmail-plan-build-*")
+		temporary, err := os.MkdirTemp(staging, ".snailmail-plan-build-*")
 		if err != nil {
 			return BuildResult{}, err
 		}
@@ -1552,25 +1338,6 @@ func materializeLockedArtifact(ctx context.Context, output string, generatedAt t
 		return BuildResult{}, err
 	}
 	return BuildResult{Format: manifest.Format, Output: output, TreeSHA256: manifest.TreeSHA256, ManifestSHA256: manifestSHA256}, nil
-}
-
-func activePackageVersions(lock state.RepositoryLock) []state.PackageVersion {
-	active := make(map[string]bool)
-	for _, placement := range lock.Placement {
-		active[placement.Package+"\x00"+placement.Version] = true
-	}
-	var result []state.PackageVersion
-	for _, packageVersion := range lock.PackageVersion {
-		if active[packageVersion.Package+"\x00"+packageVersion.Version] {
-			result = append(result, packageVersion)
-		}
-	}
-	return result
-}
-
-func activeLock(lock state.RepositoryLock) state.RepositoryLock {
-	lock.PackageVersion = activePackageVersions(lock)
-	return lock
 }
 
 func visiblePackageVersions(lock state.RepositoryLock, repository state.Repository) []state.PackageVersion {
@@ -1668,19 +1435,19 @@ func planAcquisitionsForVersions(versions []state.PackageVersion) []state.PlanAc
 	return acquisitions
 }
 
-func verifyStaged(ctx context.Context, format, repository string, request ApplyWorkspaceRequest) error {
+func verifyStaged(ctx context.Context, format, repository string, request ApplyWorkspaceRequest) (buildgraph.RepositoryManifest, error) {
 	switch format {
 	case "pypi":
-		_, err := VerifyPyPI(ctx, VerifyPyPIRequest{Repository: repository, Python: request.Python, StructuralOnly: request.StructuralOnly})
-		return err
+		result, err := VerifyPyPI(ctx, VerifyPyPIRequest{Repository: repository, Python: request.Python, StructuralOnly: request.StructuralOnly})
+		return result.Manifest, err
 	case "deb":
-		_, err := VerifyDeb(ctx, VerifyDebRequest{Repository: repository, Runner: request.Runner, Image: request.DebianImage, MaxWorkspaceBytes: request.MaxWorkspaceBytes, StructuralOnly: request.StructuralOnly})
-		return err
+		result, err := VerifyDeb(ctx, VerifyDebRequest{Repository: repository, Runner: request.Runner, Image: request.DebianImage, MaxWorkspaceBytes: request.MaxWorkspaceBytes, StructuralOnly: request.StructuralOnly})
+		return result.Manifest, err
 	case "helm":
-		_, err := VerifyHelm(ctx, VerifyHelmRequest{Repository: repository, Runner: request.Runner, Image: request.HelmImage, StructuralOnly: request.StructuralOnly})
-		return err
+		result, err := VerifyHelm(ctx, VerifyHelmRequest{Repository: repository, Runner: request.Runner, Image: request.HelmImage, StructuralOnly: request.StructuralOnly})
+		return result.Manifest, err
 	default:
-		return fmt.Errorf("unsupported repository format %q", format)
+		return buildgraph.RepositoryManifest{}, fmt.Errorf("unsupported repository format %q", format)
 	}
 }
 
@@ -1707,6 +1474,30 @@ func linkOrCopy(source, target string) error {
 		return closeOutputErr
 	}
 	return closeInputErr
+}
+
+// StageDirectoryEnvironment overrides where build and stage trees are created.
+const StageDirectoryEnvironment = "SNAILMAIL_STAGE_DIR"
+
+// stagingRoot returns the directory that holds temporary build and stage trees.
+//
+// These default to the workspace rather than TMPDIR for two reasons. TMPDIR is
+// commonly a tmpfs, so a multi-gigabyte repository tree would be held in RAM,
+// and it is a different filesystem from the local CAS, so linking artifacts
+// into a build input falls back to copying every byte. Staging beside the CAS
+// keeps the links and the bytes on disk.
+func stagingRoot(root string) (string, error) {
+	directory := filepath.Join(root, ".snailmail", "stage")
+	if override := strings.TrimSpace(os.Getenv(StageDirectoryEnvironment)); override != "" {
+		if !filepath.IsAbs(override) {
+			return "", fmt.Errorf("%s must be an absolute path", StageDirectoryEnvironment)
+		}
+		directory = override
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", fmt.Errorf("create staging directory: %w", err)
+	}
+	return directory, nil
 }
 
 func workspaceRoot(root string) (string, error) {
@@ -1791,11 +1582,10 @@ func repositoryInstallDocDigest(root, name string, repository state.Repository) 
 	return state.HashFile(filename)
 }
 
-func stagedHostFiles(directory string) ([]host.File, error) {
-	manifest, err := app.VerifyRepository(directory)
-	if err != nil {
-		return nil, err
-	}
+// stagedHostFiles enumerates a stage that this apply has already verified in
+// full. The host verifies the directory again when it stages it, so the file
+// list is a convenience here rather than the integrity boundary.
+func stagedHostFiles(directory string, manifest buildgraph.RepositoryManifest) ([]host.File, error) {
 	files := make([]host.File, 0, len(manifest.Files)+1)
 	for _, file := range manifest.Files {
 		files = append(files, host.File{Path: file.Path, Size: file.Size, SHA256: file.SHA256})
@@ -2086,4 +1876,321 @@ func PlanSummary(plan state.Plan) string {
 		lines = append(lines, fmt.Sprintf("%s %s %s", repository.Action, repository.Format, repository.Name))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// applyExecution carries the mutable outcome of a publication pass so that each
+// repository can be handled by its own function rather than by another few
+// hundred lines inside ApplyWorkspace.
+type applyExecution struct {
+	ctx              context.Context
+	root             string
+	request          ApplyWorkspaceRequest
+	plan             state.Plan
+	applyGitRevision string
+	authorize        func(applyRepository) error
+
+	result      ApplyWorkspaceResult
+	deployments []state.DeploymentRecord
+}
+
+// verifyCurrent handles a repository the host already serves at the desired
+// tree. Nothing is published, but a client probe still has to pass before the
+// deployment receipt can claim the tree is being served.
+func (execution *applyExecution) verifyCurrent(item applyRepository) error {
+	ctx, request := execution.ctx, execution.request
+	execution.result.Current++
+	if !request.StructuralOnly && item.planned.Action != "noop" {
+		access, accessErr := item.host.ReadAccess(ctx, item.hostRepository, item.observed)
+		if accessErr != nil {
+			return accessErr
+		}
+		if err := verifyCanonicalClient(ctx, execution.root, item.repository, item.stage, access, request); err != nil {
+			if item.observed.RestoreID != "" {
+				reference := host.RestoreRef{
+					ID: item.observed.RestoreID, PlanID: item.observed.PlanID,
+					ChangeID: item.observed.ChangeID, FailedTree: item.observed.TreeSHA256,
+					DescriptorSHA256: item.observed.RestoreSHA256, RootSHA256: item.observed.RestoreRootSHA256,
+				}
+				if restoreErr := restoreFailedPublication(ctx, item, reference, expectedRevisionFromPublished(item.observed), execution.authorize); restoreErr != nil {
+					return fmt.Errorf("canonical retry probe failed: %v; %w", err, restoreErr)
+				}
+				execution.result.Current--
+			}
+			return err
+		}
+	}
+	if item.planned.Action != "noop" {
+		execution.recordDeployment(item, item.observed.NativeRevision)
+	}
+	return nil
+}
+
+// publish switches one repository to its staged tree, proves the host serves
+// exactly that tree, and restores the displaced revision if it does not.
+func (execution *applyExecution) publish(item applyRepository) error {
+	ctx, request := execution.ctx, execution.request
+	// The publication locks are held across the whole pass, so Git cannot move
+	// the branch under it; confirming HEAD is enough and keeps the cost of a
+	// publication independent of how many repositories it covers.
+	if err := state.AssertGitHeadRevision(execution.root, execution.applyGitRevision); err != nil {
+		return err
+	}
+	if err := execution.authorize(item); err != nil {
+		return err
+	}
+	committed, err := item.host.Commit(ctx, item.hostRepository, item.hostStage, expectedRevisionFromPlan(item.planned))
+	if err != nil {
+		return err
+	}
+	// Scoped to this repository, so a multi-repository apply does not keep every
+	// short-lived credential alive until the whole apply finishes.
+	if committed.Access.Credential != nil {
+		defer committed.Access.Credential.Destroy()
+	}
+	execution.result.Applied++
+	canonical, observeErr := item.host.Observe(ctx, item.hostRepository)
+	if observeErr != nil || canonical.TreeSHA256 != item.planned.DesiredTreeSHA256 || canonical.NativeRevision != committed.Revision.NativeRevision ||
+		(item.hostRepository.Type == "s3" && canonical != committed.Revision) {
+		probeErr := observeErr
+		if probeErr == nil {
+			probeErr = errors.New("canonical host observation does not match committed tree")
+		}
+		return execution.restore(item, committed, probeErr, "canonical probe failed")
+	}
+	if !request.StructuralOnly {
+		access := committed.Access
+		if access.Endpoint == "" {
+			access.Endpoint = committed.CanonicalEndpoint
+		}
+		if probeErr := verifyCanonicalClient(ctx, execution.root, item.repository, item.stage, access, request); probeErr != nil {
+			return execution.restore(item, committed, probeErr, "canonical client probe failed")
+		}
+	}
+	if err := state.AssertGitHeadRevision(execution.root, execution.applyGitRevision); err != nil {
+		return err
+	}
+	execution.recordDeployment(item, committed.Revision.NativeRevision)
+	return nil
+}
+
+// restore compensates a failed probe and always reports the original failure,
+// with the restore outcome attached.
+func (execution *applyExecution) restore(item applyRepository, committed host.CommitResult, probeErr error, label string) error {
+	if committed.RestoreRef == nil {
+		return fmt.Errorf("%s: %w", label, probeErr)
+	}
+	if restoreErr := restoreFailedPublication(execution.ctx, item, *committed.RestoreRef, expectedRevisionFromPublished(committed.Revision), execution.authorize); restoreErr != nil {
+		return fmt.Errorf("%s: %v; %w", label, probeErr, restoreErr)
+	}
+	execution.result.Applied--
+	return fmt.Errorf("%s: %w", label, probeErr)
+}
+
+func (execution *applyExecution) recordDeployment(item applyRepository, nativeRevision string) {
+	execution.deployments = append(execution.deployments, deploymentRecordFor(
+		item.planned, item.deployment, item.observed, item.signingState, nativeRevision,
+		execution.plan.PlanID, execution.plan.Payload.CreatedAt, execution.request.currentTime(),
+	))
+}
+
+// applyPreparation revalidates the reviewed plan against the current workspace
+// and builds each repository's stage. Nothing here has a publication effect:
+// every failure leaves the hosts untouched.
+type applyPreparation struct {
+	ctx             context.Context
+	root            string
+	request         ApplyWorkspaceRequest
+	plan            state.Plan
+	manifest        state.Manifest
+	hosts           host.Resolver
+	blobStore       blob.Store
+	now             time.Time
+	expiresAt       time.Time
+	generatedAt     time.Time
+	signatureTime   time.Time
+	ledgerCommitted bool
+}
+
+// prepareRepository checks one planned repository against the workspace it was
+// planned from and, unless the host already serves the desired tree, rebuilds
+// and verifies its stage. The caller owns cleanup of stages already built.
+func (preparation *applyPreparation) prepareRepository(planned state.PlanRepository) (applyRepository, error) {
+	repository, exists := preparation.manifest.Repositories[planned.Name]
+	if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) || len(planned.Signing) > 1 || (len(planned.Signing) == 0) != (len(repository.SigningKeys) == 0) {
+		return applyRepository{}, fmt.Errorf("stale plan: repository %q configuration changed", planned.Name)
+	}
+	activeSigningKey, _, _, _, signingStateErr := repositorySigningState(repository)
+	if signingStateErr != nil {
+		return applyRepository{}, signingStateErr
+	}
+	for index, signing := range planned.Signing {
+		if index != 0 || signing.KeyName != activeSigningKey {
+			return applyRepository{}, fmt.Errorf("stale plan: repository %q signing key changed", planned.Name)
+		}
+		key, exists := preparation.manifest.Keys[signing.KeyName]
+		if !exists {
+			return applyRepository{}, fmt.Errorf("stale plan: repository %q signing key is missing", planned.Name)
+		}
+		keyExpiresAt, err := time.Parse(time.RFC3339, key.ExpiresAt)
+		if err != nil || preparation.expiresAt.After(keyExpiresAt) {
+			return applyRepository{}, fmt.Errorf("repository %q plan expires after its signing key", planned.Name)
+		}
+		if err := validateSigningRecipeMetadata(signing, repository.Suite); err != nil {
+			return applyRepository{}, fmt.Errorf("plan repository %q: %w", planned.Name, err)
+		}
+	}
+	hostIdentity, err := repositoryHostIdentity(repository)
+	if err != nil || hostIdentity != planned.HostIdentitySHA256 || repository.Host != planned.Host || repository.Visibility != planned.Visibility {
+		return applyRepository{}, fmt.Errorf("stale plan: repository %q host changed", planned.Name)
+	}
+	hostRepository := toHostRepository(preparation.root, preparation.manifest.Workspace.ID, hostIdentity, planned.Name, repository)
+	if hostRepository.CanonicalEndpoint != planned.CanonicalEndpoint {
+		return applyRepository{}, fmt.Errorf("stale plan: repository %q canonical endpoint changed", planned.Name)
+	}
+	installDocDigest, err := repositoryInstallDocDigest(preparation.root, planned.Name, repository)
+	if err != nil || installDocDigest != planned.InstallDocSHA256 {
+		return applyRepository{}, fmt.Errorf("stale plan: repository %q install document changed", planned.Name)
+	}
+	selectedHost, err := preparation.hosts.Resolve(preparation.ctx, hostRepository)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	capabilities, err := selectedHost.Capabilities(preparation.ctx, hostRepository)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	if capabilities.FaithfulPreview != planned.FaithfulPreview || capabilities.ConditionalCommit != planned.ConditionalCommit || capabilities.ConditionalRestore != planned.ConditionalRestore ||
+		capabilities.PrivateRead != planned.PrivateRead || capabilities.CredentialBrokerIdentity != planned.CredentialBrokerIdentity {
+		return applyRepository{}, fmt.Errorf("stale plan: repository %q host capabilities changed", planned.Name)
+	}
+	lockPath, err := state.WorkspacePath(preparation.root, repository.Lock)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	lockDigest, err := state.HashFile(lockPath)
+	if err != nil || lockDigest != planned.LockSHA256 {
+		return applyRepository{}, fmt.Errorf("stale plan: repository %q lock changed", planned.Name)
+	}
+	lock, err := state.LoadLock(preparation.root, repository)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	if err := state.ValidateLock(lock, planned.Name, repository.Format); err != nil {
+		return applyRepository{}, err
+	}
+	ledger, err := state.LoadLedgerHistory(preparation.root, planned.Name)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	if err := state.ValidatePublicationHistory(planned.Name, ledger); err != nil {
+		return applyRepository{}, err
+	}
+	if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
+		return applyRepository{}, err
+	}
+	missingBindings := missingPublicationBindings(lock, repository, ledger)
+	expectedBindings := []state.PlanPublicationBinding(nil)
+	if planned.PublicationRecords {
+		expectedBindings = publicationBindingsForVersions(visiblePackageVersions(lock, repository))
+	}
+	expectedAcquisitions := planAcquisitionsForVersions(visiblePackageVersions(lock, repository))
+	if !reflect.DeepEqual(planned.Acquisitions, expectedAcquisitions) {
+		return applyRepository{}, fmt.Errorf("plan repository %q has inconsistent adopted acquisitions", planned.Name)
+	}
+	if planned.PublicationRecords != (len(planned.PublicationBindings) != 0) ||
+		!reflect.DeepEqual(planned.PublicationBindings, expectedBindings) ||
+		(!preparation.ledgerCommitted && planned.PublicationRecords != (len(missingBindings) != 0)) ||
+		(preparation.ledgerCommitted && !planned.PublicationRecords && len(missingBindings) != 0) {
+		return applyRepository{}, fmt.Errorf("plan repository %q has inconsistent publication-record effects", planned.Name)
+	}
+	deployment, err := state.LoadDeployment(preparation.root, planned.Name)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	desiredSigningState, err := repositoryDeploymentSigningState(repository, preparation.manifest.Keys)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	observed, err := selectedHost.Observe(preparation.ctx, hostRepository)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	plannedObserved := publishedFromPlanObservation(planned)
+	trustNotBefore := time.Time{}
+	if repository.SigningRotation != nil || deployment.SigningRotationPhase != "" {
+		trustNotBefore, err = state.AuthoritativeDeploymentTrustSince(preparation.root, planned.Name, deployment)
+		if err != nil {
+			return applyRepository{}, err
+		}
+	}
+	if err := validateRepositorySigningTransition(repository, preparation.manifest.Keys, deployment, plannedObserved, preparation.now, trustNotBefore); err != nil {
+		return applyRepository{}, fmt.Errorf("repository %q: %w", planned.Name, err)
+	}
+	matchesObserved := revisionMatchesPlanObservation(observed, planned)
+	managedRemote := repository.Host.Type == "s3" || repository.Host.Type == "github-pages"
+	matchesApplied := planned.Action != "noop" && observed.TreeSHA256 == planned.DesiredTreeSHA256 &&
+		(!managedRemote || (observed.PlanID == preparation.plan.PlanID && observed.ChangeID == planned.ChangeID && observed.ManifestSHA256 == planned.DesiredManifestSHA256))
+	deploymentApplied := deployment.PlanID == preparation.plan.PlanID && deployment.ChangeID == planned.ChangeID && deployment.TreeSHA256 == planned.DesiredTreeSHA256 && deployment.ManifestSHA256 == planned.DesiredManifestSHA256 && deployment.NativeRevision == observed.NativeRevision && deploymentSigningMatches(deployment, desiredSigningState)
+	deploymentCurrent := deploymentMatchesDesired(deployment, observed, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, desiredSigningState)
+	if !reflect.DeepEqual(deployment, planned.ObservedDeployment) && !deploymentApplied {
+		return applyRepository{}, fmt.Errorf("stale plan: repository %q deployment receipt changed", planned.Name)
+	}
+	if !matchesObserved && !matchesApplied {
+		if observed.TreeSHA256 == planned.ObservedTreeSHA256 {
+			return applyRepository{}, fmt.Errorf("stale plan: repository %q native revision changed", planned.Name)
+		}
+		if observed.TreeSHA256 == planned.DesiredTreeSHA256 {
+			return applyRepository{}, fmt.Errorf("stale plan: repository %q desired tree was published by another change", planned.Name)
+		}
+		return applyRepository{}, fmt.Errorf("stale plan: repository %q target changed", planned.Name)
+	}
+	expectedAction := "noop"
+	if planned.ObservedTreeSHA256 != planned.DesiredTreeSHA256 || (managedRemote && planned.ObservedManifestSHA256 != planned.DesiredManifestSHA256) || !publicationBindingsComplete(lock, repository, ledger) || !deploymentMatchesDesired(planned.ObservedDeployment, plannedObserved, planned.DesiredTreeSHA256, planned.DesiredManifestSHA256, desiredSigningState) {
+		expectedAction = "update"
+		if planned.ObservedRevision == "" {
+			expectedAction = "create"
+		}
+	}
+	if planned.Action != expectedAction || planned.ChangeID != planned.Name+":"+planned.DesiredTreeSHA256[:12] {
+		return applyRepository{}, fmt.Errorf("plan repository %q has inconsistent action metadata", planned.Name)
+	}
+	receiptRecovery := matchesApplied && reflect.DeepEqual(deployment, planned.ObservedDeployment)
+	current := observed.TreeSHA256 == planned.DesiredTreeSHA256 && (!managedRemote || observed.ManifestSHA256 == planned.DesiredManifestSHA256) && (deploymentApplied || (planned.Action == "noop" && deploymentCurrent) || receiptRecovery)
+	item := applyRepository{
+		planned: planned, repository: repository, lock: lock, host: selectedHost,
+		hostRepository: hostRepository, observed: observed, current: current, deployment: deployment, signingState: desiredSigningState,
+	}
+	// Nothing to build: the host already serves this tree and no signing effect
+	// has to be replayed, so there is no stage for this repository.
+	if item.current && (preparation.request.StructuralOnly || planned.Action == "noop") && !(planned.Action != "noop" && len(planned.Signing) != 0) {
+		return item, nil
+	}
+	staging, err := stagingRoot(preparation.root)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	stage, err := os.MkdirTemp(staging, ".snailmail-apply-*")
+	if err != nil {
+		return applyRepository{}, err
+	}
+	stageOutput := filepath.Join(stage, "repository")
+	staged, buildErr := buildLockedRepository(preparation.ctx, preparation.root, planned.Name, repository, lock, preparation.generatedAt, preparation.signatureTime, stageOutput, preparation.blobStore, preparation.manifest.Keys, planned.Signing, nil)
+	if buildErr == nil && (staged.TreeSHA256 != planned.DesiredTreeSHA256 || staged.ManifestSHA256 != planned.DesiredManifestSHA256) {
+		buildErr = errors.New("stale plan: rebuilt tree digest changed")
+	}
+	if buildErr == nil && !signingContentsEqual(staged.Signing, planned.Signing) {
+		buildErr = errors.New("stale plan: signing recipe changed")
+	}
+	var stagedManifest buildgraph.RepositoryManifest
+	if buildErr == nil {
+		structuralRequest := preparation.request
+		structuralRequest.StructuralOnly = true
+		stagedManifest, buildErr = verifyStaged(preparation.ctx, repository.Format, stageOutput, structuralRequest)
+	}
+	if buildErr != nil {
+		_ = os.RemoveAll(stage)
+		return applyRepository{}, buildErr
+	}
+	item.stageRoot, item.stage, item.stagedManifest = stage, stageOutput, stagedManifest
+	return item, nil
 }

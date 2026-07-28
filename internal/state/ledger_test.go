@@ -97,3 +97,9 @@ func TestPublicationRecordIdentityIncludesAuditFields(t *testing.T) {
 		t.Fatal("publication identity ignored its audit timestamp")
 	}
 }
+
+// recordIdentity distinguishes two records by every field a ledger line
+// carries; it exists for these assertions, not for production use.
+func recordIdentity(record PublicationRecord) string {
+	return record.Repository + "\x00" + record.PlanID + "\x00" + record.ChangeID + "\x00" + record.Package + "\x00" + record.Version + "\x00" + strings.Join(record.BlobSHA256, ",") + "\x00" + record.TreeSHA256 + "\x00" + record.RecordedAt
+}

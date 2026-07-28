@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -868,7 +869,9 @@ func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob
 	if !placementExists {
 		lock.Placement = append(lock.Placement, Placement{Package: packageName, Version: version, Track: track, Distro: distro})
 	}
-	canonicalizeLock(lock)
+	// Canonical order is a property of the written file, and WriteLock
+	// establishes it. Sorting here instead re-sorted the whole lock once per
+	// added artifact, which made `snailmail add` quadratic in an existing lock.
 	return !blobExists || !placementExists, nil
 }
 
@@ -1190,11 +1193,40 @@ func ValidateArtifactOrigin(origin ArtifactOrigin) error {
 	return nil
 }
 
+// resolvedRoots caches the symlink resolution of a workspace root. A root
+// cannot change while an operation holds the workspace lock, and resolving it
+// is otherwise repeated for every path, including once per blob in a build.
+var resolvedRoots struct {
+	sync.Mutex
+	byRoot map[string]string
+}
+
+// ResolveWorkspaceRoot returns the workspace root with symlinks resolved.
+func ResolveWorkspaceRoot(root string) (string, error) {
+	resolvedRoots.Lock()
+	cached, found := resolvedRoots.byRoot[root]
+	resolvedRoots.Unlock()
+	if found {
+		return cached, nil
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	resolvedRoots.Lock()
+	if resolvedRoots.byRoot == nil {
+		resolvedRoots.byRoot = make(map[string]string)
+	}
+	resolvedRoots.byRoot[root] = resolved
+	resolvedRoots.Unlock()
+	return resolved, nil
+}
+
 func WorkspacePath(root, relative string) (string, error) {
 	if err := validateRelativePath(relative); err != nil {
 		return "", err
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
+	resolvedRoot, err := ResolveWorkspaceRoot(root)
 	if err != nil {
 		return "", err
 	}
@@ -1243,7 +1275,7 @@ func ensureGitignore(root string) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if strings.Contains(string(content), ".snailmail/") {
+	if hasIgnoreRule(content, ".snailmail/") {
 		return nil
 	}
 	if len(content) != 0 && content[len(content)-1] != '\n' {
@@ -1251,4 +1283,17 @@ func ensureGitignore(root string) error {
 	}
 	content = append(content, []byte(block)...)
 	return atomicWrite(name, content, 0o644)
+}
+
+// hasIgnoreRule reports whether rule is present as its own directive. A
+// substring search also matched the rule inside a comment or, worse, inside a
+// "!.snailmail/" negation that re-includes exactly what must stay ignored.
+func hasIgnoreRule(content []byte, rule string) bool {
+	for _, line := range strings.Split(string(content), "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if line == rule || line == "/"+rule {
+			return true
+		}
+	}
+	return false
 }

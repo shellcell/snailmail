@@ -12,8 +12,9 @@ builds, structurally verifies, serves, and client-tests deterministic static
 PyPI, Debian, and Helm repositories. Git-backed workspaces also support local
 `init`, `setup`, `add`, `plan`, and `apply` workflows with immutable blobs,
 reviewable plans, publication ledgers, and per-repository managed release
-switching. Replacement of an existing managed release is currently implemented
-only on Linux. PyPI repositories can additionally stage and publish to
+switching. Replacement of an existing managed release needs an atomic
+directory-entry exchange, so it is implemented on Linux and macOS; creating a
+first release is portable. PyPI repositories can additionally stage and publish to
 S3-compatible object storage with immutable releases, conditional root-index
 switching, checksum observation, conditional restore, and optional scoped
 private reads. Shared S3 blob storage, public GitHub Pages with a companion
@@ -284,6 +285,22 @@ locks, ledgers, deployment receipts, and an optional current plan:
 ```sh
 go run ./cmd/snailmail render --output site
 ```
+
+`plan` and `apply` build and stage under `.snailmail/stage` in the workspace
+rather than in `TMPDIR`, so artifacts hard-link from the local CAS instead of
+being copied and large trees are never held in a `tmpfs`. Set an absolute
+`SNAILMAIL_STAGE_DIR` to stage elsewhere.
+
+The AWS SDK is the largest single component of the binary. Builds that only
+target local directories or GitHub Pages can exclude it:
+
+```sh
+go build -trimpath -ldflags="-s -w" -tags nos3 ./cmd/snailmail
+```
+
+That drops the stripped binary from about 20.6 MB to 12.8 MB. S3 hosts and S3
+blob stores then report that the build has no S3 support; every other format,
+host, and command is unaffected. The default build keeps S3.
 
 `Dockerfile` builds the runtime image; `.github/workflows/snailmail.yml` is a
 pinned template with read-only PR testing and a protected default-branch apply

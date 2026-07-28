@@ -1981,3 +1981,25 @@ func (remote *recordingHost) Restore(context.Context, host.Repository, host.Rest
 func (remote *recordingHost) Abort(context.Context, host.Repository, host.StagedPublication) error {
 	return nil
 }
+
+// Publication-record tests need the lock restricted to placed versions
+// regardless of a repository's rendered view; production code always filters
+// through a repository, so these live with their only callers.
+func activeLock(lock state.RepositoryLock) state.RepositoryLock {
+	lock.PackageVersion = activePackageVersions(lock)
+	return lock
+}
+
+func activePackageVersions(lock state.RepositoryLock) []state.PackageVersion {
+	active := make(map[string]bool)
+	for _, placement := range lock.Placement {
+		active[placement.Package+"\x00"+placement.Version] = true
+	}
+	var result []state.PackageVersion
+	for _, packageVersion := range lock.PackageVersion {
+		if active[packageVersion.Package+"\x00"+packageVersion.Version] {
+			result = append(result, packageVersion)
+		}
+	}
+	return result
+}

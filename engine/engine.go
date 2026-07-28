@@ -79,6 +79,9 @@ type VerifyResult struct {
 	TreeSHA256     string
 	FileCount      int
 	InstalledCases int
+	// Manifest is the verified file list, returned so a caller that has just
+	// verified a tree does not have to re-verify it to enumerate its contents.
+	Manifest buildgraph.RepositoryManifest
 }
 
 type RepositoryInfo struct {
@@ -273,6 +276,7 @@ func VerifyPyPI(ctx context.Context, request VerifyPyPIRequest) (VerifyResult, e
 		TreeSHA256:     manifest.TreeSHA256,
 		FileCount:      len(manifest.Files),
 		InstalledCases: installed,
+		Manifest:       manifest,
 	}, nil
 }
 
@@ -304,6 +308,7 @@ func VerifyDeb(ctx context.Context, request VerifyDebRequest) (VerifyResult, err
 		TreeSHA256:     manifest.TreeSHA256,
 		FileCount:      len(manifest.Files),
 		InstalledCases: installed,
+		Manifest:       manifest,
 	}, nil
 }
 
@@ -331,6 +336,7 @@ func VerifyHelm(ctx context.Context, request VerifyHelmRequest) (VerifyResult, e
 		TreeSHA256:     manifest.TreeSHA256,
 		FileCount:      len(manifest.Files),
 		InstalledCases: verified,
+		Manifest:       manifest,
 	}, nil
 }
 

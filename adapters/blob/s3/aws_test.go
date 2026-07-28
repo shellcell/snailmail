@@ -1,3 +1,5 @@
+//go:build !nos3
+
 package s3blob
 
 import (

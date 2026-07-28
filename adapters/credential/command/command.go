@@ -24,9 +24,11 @@ const HelperEnvironment = "SNAILMAIL_CREDENTIAL_BROKER"
 const brokerCommandTimeout = 30 * time.Second
 
 type Broker struct {
-	mutex    sync.Mutex
-	helper   *os.File
-	identity string
+	mutex     sync.Mutex
+	helper    *os.File
+	directory string
+	execPath  string
+	identity  string
 }
 
 func NewFromEnvironment() (*Broker, error) {
@@ -51,15 +53,28 @@ func NewFromEnvironment() (*Broker, error) {
 		_ = source.Close()
 		return nil, errors.New("private read credential broker must be a native executable")
 	}
-	snapshot, err := os.CreateTemp("", ".snailmail-credential-broker-*")
+	// The snapshot lives in a private directory so that retaining it by path,
+	// which darwin requires, is still unreachable by other users.
+	directory, err := os.MkdirTemp("", ".snailmail-credential-broker-*")
 	if err != nil {
 		_ = source.Close()
+		return nil, errors.New("private read credential broker executable could not be snapshotted")
+	}
+	if err := os.Chmod(directory, 0o700); err != nil {
+		_ = source.Close()
+		_ = os.RemoveAll(directory)
+		return nil, errors.New("private read credential broker directory could not be protected")
+	}
+	snapshot, err := os.CreateTemp(directory, "helper-*")
+	if err != nil {
+		_ = source.Close()
+		_ = os.RemoveAll(directory)
 		return nil, errors.New("private read credential broker executable could not be snapshotted")
 	}
 	snapshotName := snapshot.Name()
 	cleanup := func() {
 		_ = snapshot.Close()
-		_ = os.Remove(snapshotName)
+		_ = os.RemoveAll(directory)
 	}
 	hash := sha256.New()
 	_, copyErr := io.Copy(io.MultiWriter(snapshot, hash), source)
@@ -77,20 +92,21 @@ func NewFromEnvironment() (*Broker, error) {
 		return nil, errors.New("private read credential broker executable could not be prepared")
 	}
 	if err := snapshot.Close(); err != nil {
-		_ = os.Remove(snapshotName)
+		_ = os.RemoveAll(directory)
 		return nil, errors.New("private read credential broker executable could not be prepared")
 	}
 	executable, err := os.Open(snapshotName)
 	if err != nil {
-		_ = os.Remove(snapshotName)
+		_ = os.RemoveAll(directory)
 		return nil, errors.New("private read credential broker executable could not be prepared")
 	}
-	if err := os.Remove(snapshotName); err != nil {
+	execPath, err := retainSnapshot(snapshotName)
+	if err != nil {
 		_ = executable.Close()
-		_ = os.Remove(snapshotName)
+		_ = os.RemoveAll(directory)
 		return nil, errors.New("private read credential broker executable could not be protected")
 	}
-	broker := &Broker{helper: executable, identity: hex.EncodeToString(hash.Sum(nil))}
+	broker := &Broker{helper: executable, directory: directory, execPath: execPath, identity: hex.EncodeToString(hash.Sum(nil))}
 	runtime.SetFinalizer(broker, func(value *Broker) { _ = value.Close() })
 	return broker, nil
 }
@@ -108,6 +124,12 @@ func (broker *Broker) Close() error {
 	}
 	err := broker.helper.Close()
 	broker.helper = nil
+	if broker.directory != "" {
+		if removeErr := os.RemoveAll(broker.directory); err == nil {
+			err = removeErr
+		}
+		broker.directory = ""
+	}
 	return err
 }
 
@@ -130,13 +152,9 @@ func (broker *Broker) Issue(ctx context.Context, scope host.ReadScope) (host.Bas
 	if err != nil {
 		return nil, err
 	}
-	helperPath := "/proc/self/fd/3"
-	if runtime.GOOS == "darwin" {
-		helperPath = "/dev/fd/3"
-	}
 	commandCtx, cancel := context.WithTimeout(ctx, brokerCommandTimeout)
 	defer cancel()
-	command := exec.CommandContext(commandCtx, helperPath)
+	command := exec.CommandContext(commandCtx, broker.execPath)
 	command.ExtraFiles = []*os.File{broker.helper}
 	command.Stdin = bytes.NewReader(request)
 	command.Env = brokerEnvironment()
@@ -165,7 +183,7 @@ func (broker *Broker) Issue(ctx context.Context, scope host.ReadScope) (host.Bas
 	if err != nil || !expiresAt.After(time.Now().UTC()) || expiresAt.After(time.Now().UTC().Add(15*time.Minute)) || response.Username == "" || response.Password == "" {
 		return nil, errors.New("credential broker returned invalid or excessive credentials")
 	}
-	return &credential{username: response.Username, password: response.Password, expiresAt: expiresAt}, nil
+	return &credential{username: []byte(response.Username), password: []byte(response.Password), expiresAt: expiresAt}, nil
 }
 
 func brokerEnvironment() []string {
@@ -212,27 +230,32 @@ func (buffer *limitedBuffer) Write(content []byte) (int, error) {
 	return len(content), nil
 }
 
+// credential holds its secret as bytes so Destroy can actually overwrite it.
+// Go strings are immutable, so assigning "" only drops a reference and leaves
+// the secret readable in the heap until the collector happens to reuse it.
 type credential struct {
 	mutex     sync.Mutex
-	username  string
-	password  string
+	username  []byte
+	password  []byte
 	expiresAt time.Time
 }
 
 func (credential *credential) Basic(_ context.Context) (string, string, error) {
 	credential.mutex.Lock()
 	defer credential.mutex.Unlock()
-	if credential.username == "" || credential.password == "" || !time.Now().UTC().Before(credential.expiresAt) {
+	if len(credential.username) == 0 || len(credential.password) == 0 || !time.Now().UTC().Before(credential.expiresAt) {
 		return "", "", errors.New("private read credential is unavailable or expired")
 	}
-	return credential.username, credential.password, nil
+	return string(credential.username), string(credential.password), nil
 }
 
 func (credential *credential) Destroy() {
 	credential.mutex.Lock()
 	defer credential.mutex.Unlock()
-	credential.username = ""
-	credential.password = ""
+	clear(credential.username)
+	clear(credential.password)
+	credential.username = nil
+	credential.password = nil
 	credential.expiresAt = time.Time{}
 }
 

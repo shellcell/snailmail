@@ -32,6 +32,7 @@ import (
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
+	"github.com/shellcell/snailmail/internal/factscache"
 	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
@@ -72,7 +73,7 @@ func verifyRepository(root string) (buildgraph.RepositoryManifest, []domain.Blob
 	if len(manifestBytes) > maxManifestSize {
 		return buildgraph.RepositoryManifest{}, nil, errors.New("repository manifest exceeds 8 MiB")
 	}
-	decoder := json.NewDecoder(strings.NewReader(string(manifestBytes)))
+	decoder := json.NewDecoder(bytes.NewReader(manifestBytes))
 	decoder.DisallowUnknownFields()
 	var manifest buildgraph.RepositoryManifest
 	if err := decoder.Decode(&manifest); err != nil {
@@ -374,38 +375,41 @@ func verifyHostedPyPIBytes(ctx context.Context, access host.ClientAccess, userna
 			return errors.New("repository verification does not follow redirects")
 		},
 	}
-	verifyURL := func(address string, expectedSize int64, expectedSHA256 string) ([]byte, error) {
+	// Routes cover every file in the tree, including distributions up to
+	// pypi.MaxArtifactSize. Only the digest and length matter here, so the body
+	// is hashed as it streams rather than buffered whole.
+	verifyURL := func(address string, expectedSize int64, expectedSHA256 string) error {
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		if private {
 			request.SetBasicAuth(username, password)
 		}
 		response, err := client.Do(request)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		content, readErr := io.ReadAll(io.LimitReader(response.Body, expectedSize+1))
+		hash := sha256.New()
+		size, readErr := io.Copy(hash, io.LimitReader(response.Body, expectedSize+1))
 		closeErr := response.Body.Close()
 		if readErr != nil {
-			return nil, readErr
+			return readErr
 		}
 		if closeErr != nil {
-			return nil, closeErr
+			return closeErr
 		}
-		digest := sha256.Sum256(content)
-		if response.StatusCode != http.StatusOK || int64(len(content)) != expectedSize || hex.EncodeToString(digest[:]) != expectedSHA256 {
-			return nil, errors.New("host-served repository bytes do not match the reviewed tree")
+		if response.StatusCode != http.StatusOK || size != expectedSize || hex.EncodeToString(hash.Sum(nil)) != expectedSHA256 {
+			return errors.New("host-served repository bytes do not match the reviewed tree")
 		}
-		return content, nil
+		return nil
 	}
 	for _, route := range access.Routes {
 		parsed, err := url.Parse(route.URL)
 		if err != nil || parsed.Scheme != endpoint.Scheme || parsed.Host != endpoint.Host || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || route.Size < 0 {
 			return errors.New("host supplied an invalid client verification route")
 		}
-		if _, err := verifyURL(route.URL, route.Size, route.SHA256); err != nil {
+		if err := verifyURL(route.URL, route.Size, route.SHA256); err != nil {
 			return fmt.Errorf("verify host-served route %q: %w", parsed.EscapedPath(), err)
 		}
 	}
@@ -451,6 +455,11 @@ func isLoopbackHost(value string) bool {
 }
 
 func redactCredential(value, username, password string) string {
+	// With no credential every derived form is a constant — base64(":") in
+	// particular — so redacting them would rewrite unrelated client output.
+	if username == "" || password == "" {
+		return value
+	}
 	secrets := []string{
 		username, password, url.QueryEscape(username), url.QueryEscape(password),
 		base64.StdEncoding.EncodeToString([]byte(username + ":" + password)),
@@ -567,7 +576,7 @@ fi
 `,
 	}
 	command := exec.CommandContext(caseCtx, runner, arguments...)
-	command.Env = os.Environ()
+	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Debian client verification for %s=%s/%s: %w\n%s", verification.Package, verification.Version, verification.Architecture, err, strings.TrimSpace(string(output)))
@@ -729,9 +738,40 @@ else
 fi
 HANDLER
 chmod 0700 /tmp/http-handler
-nc -lk -s 127.0.0.1 -p 8879 -e /tmp/http-handler &
-server=$!
-trap 'kill "$server"' EXIT
+# busybox httpd is a real static file server and is present in any
+# busybox-based image. The nc handler stays as the fallback: -e and -k vary
+# between nc implementations, which is why it is not the first choice.
+server=""
+if command -v busybox >/dev/null 2>&1 && busybox httpd --help >/dev/null 2>&1; then
+    busybox httpd -f -p 127.0.0.1:8879 -h /repo &
+    server=$!
+    sleep 1
+    if ! kill -0 "$server" 2>/dev/null; then
+        server=""
+    fi
+fi
+if test -z "$server"; then
+    nc -lk -s 127.0.0.1 -p 8879 -e /tmp/http-handler &
+    server=$!
+fi
+trap 'kill "$server" 2>/dev/null' EXIT
+# Fail with the image contract rather than an opaque Helm error when whichever
+# server was chosen never comes up.
+if command -v wget >/dev/null 2>&1; then
+    ready=""
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if wget -q -O /dev/null http://127.0.0.1:8879/index.yaml 2>/dev/null; then
+            ready=yes
+            break
+        fi
+        sleep 1
+    done
+    if test -z "$ready"; then
+        echo "verification image provides no usable static HTTP server;" >&2
+        echo "it needs busybox httpd, or an nc supporting -l -k -s -p -e" >&2
+        exit 1
+    fi
+fi
 helm repo add staged http://127.0.0.1:8879
 helm repo update staged
 if test -n "$SNAILMAIL_CHART"; then
@@ -744,7 +784,7 @@ fi
 `,
 	}
 	command := exec.CommandContext(caseCtx, runner, arguments...)
-	command.Env = os.Environ()
+	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("Helm client verification for %s@%s: %w\n%s", verification.Project, verification.Version, err, strings.TrimSpace(string(output)))
@@ -865,18 +905,23 @@ func verifyPyPIStructure(root string, manifest buildgraph.RepositoryManifest) ([
 		if len(parts) != 3 || parts[0] != "packages" || parts[1] != file.SHA256 || !pypi.IsDistributionFilename(parts[2]) {
 			return nil, fmt.Errorf("unexpected PyPI repository path %q", file.Path)
 		}
-		name := filepath.Join(root, filepath.FromSlash(file.Path))
-		packageFile, err := os.Open(name)
-		if err != nil {
-			return nil, fmt.Errorf("open PyPI package %q: %w", file.Path, err)
-		}
-		facts, inspectErr := pypi.Inspect(parts[2], packageFile, file.Size)
-		closeErr := packageFile.Close()
-		if inspectErr != nil {
-			return nil, inspectErr
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close PyPI package %q: %w", file.Path, closeErr)
+		facts, cached := factscache.Lookup(pypi.FormatID, file.SHA256)
+		if !cached {
+			name := filepath.Join(root, filepath.FromSlash(file.Path))
+			packageFile, err := os.Open(name)
+			if err != nil {
+				return nil, fmt.Errorf("open PyPI package %q: %w", file.Path, err)
+			}
+			var inspectErr error
+			facts, inspectErr = pypi.Inspect(parts[2], packageFile, file.Size)
+			closeErr := packageFile.Close()
+			if inspectErr != nil {
+				return nil, inspectErr
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("close PyPI package %q: %w", file.Path, closeErr)
+			}
+			factscache.Store(pypi.FormatID, file.SHA256, facts)
 		}
 		blobs = append(blobs, domain.Blob{Filename: parts[2], Size: file.Size, SHA256: file.SHA256, Facts: facts})
 	}
@@ -909,17 +954,22 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 			return nil, fmt.Errorf("unexpected Debian repository path %q", file.Path)
 		}
 		name := filepath.Join(root, filepath.FromSlash(file.Path))
-		packageFile, err := os.Open(name)
-		if err != nil {
-			return nil, fmt.Errorf("open Debian package %q: %w", file.Path, err)
-		}
-		facts, inspectErr := deb.Inspect(path.Base(file.Path), packageFile, file.Size)
-		closeErr := packageFile.Close()
-		if inspectErr != nil {
-			return nil, inspectErr
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close Debian package %q: %w", file.Path, closeErr)
+		facts, cached := factscache.Lookup(deb.FormatID, file.SHA256)
+		if !cached {
+			packageFile, err := os.Open(name)
+			if err != nil {
+				return nil, fmt.Errorf("open Debian package %q: %w", file.Path, err)
+			}
+			var inspectErr error
+			facts, inspectErr = deb.Inspect(path.Base(file.Path), packageFile, file.Size)
+			closeErr := packageFile.Close()
+			if inspectErr != nil {
+				return nil, inspectErr
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("close Debian package %q: %w", file.Path, closeErr)
+			}
+			factscache.Store(deb.FormatID, file.SHA256, facts)
 		}
 		md5Value, sha1Value, err := legacyChecksums(name)
 		if err != nil {
@@ -1011,18 +1061,23 @@ func verifyHelmStructure(root string, manifest buildgraph.RepositoryManifest) ([
 		if len(parts) != 3 || parts[0] != "charts" || parts[1] != file.SHA256 || !helm.IsChartFilename(parts[2]) {
 			return nil, fmt.Errorf("unexpected Helm repository path %q", file.Path)
 		}
-		name := filepath.Join(root, filepath.FromSlash(file.Path))
-		chartFile, err := os.Open(name)
-		if err != nil {
-			return nil, fmt.Errorf("open Helm chart %q: %w", file.Path, err)
-		}
-		facts, inspectErr := helm.Inspect(parts[2], chartFile, file.Size)
-		closeErr := chartFile.Close()
-		if inspectErr != nil {
-			return nil, inspectErr
-		}
-		if closeErr != nil {
-			return nil, fmt.Errorf("close Helm chart %q: %w", file.Path, closeErr)
+		facts, cached := factscache.Lookup(helm.FormatID, file.SHA256)
+		if !cached {
+			name := filepath.Join(root, filepath.FromSlash(file.Path))
+			chartFile, err := os.Open(name)
+			if err != nil {
+				return nil, fmt.Errorf("open Helm chart %q: %w", file.Path, err)
+			}
+			var inspectErr error
+			facts, inspectErr = helm.Inspect(parts[2], chartFile, file.Size)
+			closeErr := chartFile.Close()
+			if inspectErr != nil {
+				return nil, inspectErr
+			}
+			if closeErr != nil {
+				return nil, fmt.Errorf("close Helm chart %q: %w", file.Path, closeErr)
+			}
+			factscache.Store(helm.FormatID, file.SHA256, facts)
 		}
 		blobs = append(blobs, domain.Blob{Filename: parts[2], Size: file.Size, SHA256: file.SHA256, Facts: facts})
 	}
@@ -1104,12 +1159,31 @@ func snapshotRepository(ctx context.Context, source string, manifest buildgraph.
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return "", err
 		}
-		if err := copyFile(name, target, file.Size); err != nil {
+		if err := linkOrCopyFile(name, target, file.Size); err != nil {
 			return "", err
 		}
 	}
 	keep = true
 	return snapshot, nil
+}
+
+// linkOrCopyFile prefers a hard link, so snapshotting a repository that can
+// reach the 4 GiB verification limit does not duplicate every byte. The link
+// shares the inode with an immutable release file, and the snapshot is only
+// ever read, so the two stay identical by construction. A link across
+// filesystems, or onto one that does not support them, falls back to copying.
+func linkOrCopyFile(sourceName, targetName string, expectedSize int64) error {
+	if err := os.Link(sourceName, targetName); err == nil {
+		info, statErr := os.Lstat(targetName)
+		if statErr != nil {
+			return statErr
+		}
+		if !info.Mode().IsRegular() || info.Size() != expectedSize {
+			return fmt.Errorf("repository file %q changed while snapshotting", sourceName)
+		}
+		return nil
+	}
+	return copyFile(sourceName, targetName, expectedSize)
 }
 
 func copyFile(sourceName, targetName string, expectedSize int64) error {

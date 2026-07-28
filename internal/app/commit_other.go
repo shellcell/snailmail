@@ -1,21 +1,14 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package app
 
-import (
-	"fmt"
-	"os"
-)
+import "errors"
 
-func commitReleaseLink(temporary, output, expectedLink string) (bool, error) {
-	if expectedLink != "" {
-		return false, fmt.Errorf("atomic managed-release replacement is not implemented on this platform")
-	}
-	if err := os.Link(temporary, output); err != nil {
-		return false, err
-	}
-	if err := os.Remove(temporary); err != nil {
-		return true, err
-	}
-	return true, nil
+// exchangePaths needs an atomic directory-entry exchange. Linux provides it
+// through renameat2(RENAME_EXCHANGE) and darwin through
+// renamex_np(RENAME_SWAP); platforms without either cannot replace an existing
+// managed release without risking a lost update. Creating a first managed
+// release stays portable.
+func exchangePaths(_, _ string) error {
+	return errors.New("atomic managed-release replacement is not implemented on this platform")
 }

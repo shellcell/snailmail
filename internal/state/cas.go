@@ -20,6 +20,7 @@ import (
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
 	"github.com/shellcell/snailmail/internal/domain"
+	"github.com/shellcell/snailmail/internal/factscache"
 )
 
 func PutArtifact(root, format, sourceName string) (domain.Blob, error) {
@@ -194,12 +195,17 @@ func LoadBlobContext(ctx context.Context, root, format string, locked LockedBlob
 	if len(locked.SHA256) != sha256.Size*2 {
 		return domain.Blob{}, "", errors.New("locked blob has invalid SHA-256 length")
 	}
+	// The relative path is built from an already-validated hex digest, so there
+	// is no caller-supplied component to sanitise, and the os.Root handle below
+	// refuses to traverse a symlink out of the workspace. Running the general
+	// path check as well would repeat that containment once per blob.
 	relativeName := filepath.Join(".snailmail", "cas", "sha256", locked.SHA256[:2], locked.SHA256)
-	name, err := WorkspacePath(root, filepath.ToSlash(relativeName))
+	resolvedRoot, err := ResolveWorkspaceRoot(root)
 	if err != nil {
-		return domain.Blob{}, "", err
+		return domain.Blob{}, "", fmt.Errorf("%w: resolve workspace root: %v", blob.ErrUnavailable, err)
 	}
-	rootHandle, err := os.OpenRoot(root)
+	name := filepath.Join(resolvedRoot, relativeName)
+	rootHandle, err := os.OpenRoot(resolvedRoot)
 	if err != nil {
 		return domain.Blob{}, "", fmt.Errorf("%w: open workspace root: %v", blob.ErrUnavailable, err)
 	}
@@ -222,10 +228,6 @@ func LoadBlobContext(ctx context.Context, root, format string, locked LockedBlob
 	return result, name, nil
 }
 
-func ValidateLockedBlobFile(name, format string, locked LockedBlob) (domain.Blob, error) {
-	return validateLockedBlob(name, format, locked)
-}
-
 func ValidateLockedBlobReference(format string, locked LockedBlob) error {
 	decoded, err := hex.DecodeString(locked.SHA256)
 	if err != nil || len(decoded) != sha256.Size || locked.SHA256 != strings.ToLower(locked.SHA256) {
@@ -239,10 +241,6 @@ func ValidateLockedBlobReference(format string, locked LockedBlob) error {
 		return fmt.Errorf("%w: blob sha256:%s exceeds format size limit", blob.ErrCorrupt, locked.SHA256)
 	}
 	return nil
-}
-
-func ValidateLockedBlobOpen(file *os.File, info os.FileInfo, name, format string, locked LockedBlob) (domain.Blob, error) {
-	return validateLockedBlobOpen(file, info, name, format, locked)
 }
 
 func ValidateLockedBlobOpenContext(ctx context.Context, file *os.File, info os.FileInfo, name, format string, locked LockedBlob) (domain.Blob, error) {
@@ -269,14 +267,11 @@ func EnsureBlob(ctx context.Context, root, format string, locked LockedBlob, sto
 		return domain.Blob{}, "", localErr
 	}
 	relativeName := filepath.Join(".snailmail", "cas", "sha256", locked.SHA256[:2], locked.SHA256)
-	name, err = WorkspacePath(root, filepath.ToSlash(relativeName))
+	resolvedRoot, err := ResolveWorkspaceRoot(root)
 	if err != nil {
 		return domain.Blob{}, "", err
 	}
-	resolvedRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return domain.Blob{}, "", err
-	}
+	name = filepath.Join(resolvedRoot, relativeName)
 	rootHandle, err := os.OpenRoot(resolvedRoot)
 	if err != nil {
 		return domain.Blob{}, "", err
@@ -385,25 +380,36 @@ func validateLockedBlobOpenContext(ctx context.Context, file *os.File, pathInfo 
 	if err != nil {
 		return domain.Blob{}, fmt.Errorf("%w: read blob sha256:%s: %w", blob.ErrUnavailable, locked.SHA256, err)
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return domain.Blob{}, fmt.Errorf("%w: seek blob sha256:%s: %w", blob.ErrUnavailable, locked.SHA256, err)
-	}
-	facts, err := inspect(format, locked.Filename, contextReaderAt{ctx: ctx, reader: file}, size)
-	if err != nil {
-		if ctx.Err() != nil {
-			return domain.Blob{}, ctx.Err()
-		}
-		return domain.Blob{}, fmt.Errorf("%w: inspect blob sha256:%s: %v", blob.ErrCorrupt, locked.SHA256, err)
-	}
 	validated := domain.Blob{
 		Filename: locked.Filename,
 		Size:     size,
 		MD5:      hex.EncodeToString(md5Hash.Sum(nil)),
 		SHA1:     hex.EncodeToString(sha1Hash.Sum(nil)),
 		SHA256:   hex.EncodeToString(sha256Hash.Sum(nil)),
-		Facts:    facts,
 	}
-	if size != info.Size() || validated.Size != locked.Size || validated.SHA256 != locked.SHA256 || (locked.MD5 != "" && validated.MD5 != locked.MD5) || (locked.SHA1 != "" && validated.SHA1 != locked.SHA1) || facts.Architecture != locked.Architecture {
+	// Establish that these bytes are exactly the locked content before consulting
+	// any memo, so a cached parse is only ever reused for content this call has
+	// itself just verified.
+	if size != info.Size() || validated.Size != locked.Size || validated.SHA256 != locked.SHA256 ||
+		(locked.MD5 != "" && validated.MD5 != locked.MD5) || (locked.SHA1 != "" && validated.SHA1 != locked.SHA1) {
+		return domain.Blob{}, fmt.Errorf("%w: blob sha256:%s disagrees with its lock", blob.ErrCorrupt, locked.SHA256)
+	}
+	facts, cached := factscache.Lookup(format, validated.SHA256)
+	if !cached {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return domain.Blob{}, fmt.Errorf("%w: seek blob sha256:%s: %w", blob.ErrUnavailable, locked.SHA256, err)
+		}
+		facts, err = inspect(format, locked.Filename, contextReaderAt{ctx: ctx, reader: file}, size)
+		if err != nil {
+			if ctx.Err() != nil {
+				return domain.Blob{}, ctx.Err()
+			}
+			return domain.Blob{}, fmt.Errorf("%w: inspect blob sha256:%s: %v", blob.ErrCorrupt, locked.SHA256, err)
+		}
+		factscache.Store(format, validated.SHA256, facts)
+	}
+	validated.Facts = facts
+	if facts.Architecture != locked.Architecture {
 		return domain.Blob{}, fmt.Errorf("%w: blob sha256:%s disagrees with its lock", blob.ErrCorrupt, locked.SHA256)
 	}
 	if err := ctx.Err(); err != nil {
