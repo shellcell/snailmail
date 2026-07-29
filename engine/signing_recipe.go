@@ -274,3 +274,19 @@ func signerMatchesPublic(algorithm string, private, public signer.Identity) bool
 	}
 	return private == public
 }
+
+// clientKeyPath is the file a client installs to verify this repository.
+//
+// It is not always the keyring the manifest records: apt installs the merged
+// binary keyring, a yum client the armored form of the same keys, and apk the
+// single key file it will hold in /etc/apk/keys under exactly that name.
+func clientKeyPath(repository state.Repository, key state.SigningKey) string {
+	switch repository.Format {
+	case "rpm":
+		return strings.TrimSuffix(repository.SigningKeyring, ".gpg") + ".asc"
+	case "apk":
+		return key.PublicArmorPath
+	default:
+		return repository.SigningKeyring
+	}
+}

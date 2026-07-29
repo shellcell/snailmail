@@ -1,6 +1,7 @@
 package formats
 
 import (
+	"github.com/shellcell/snailmail/signer"
 	"strings"
 	"testing"
 	"time"
@@ -253,6 +254,27 @@ func TestCommitPathsExistInTheBuiltTree(t *testing.T) {
 			if !built[commitPath] {
 				t.Errorf("format %q names commit path %q that its build does not produce", format.Name(), commitPath)
 			}
+		}
+	}
+}
+
+// A format that signs must say which kind of key its clients verify, and one
+// that does not must name none. Either half alone is a repository that can be
+// configured but never read: a signature nothing checks, or a key nothing can.
+func TestSigningFormatsNameTheirAlgorithm(t *testing.T) {
+	known := map[string]bool{
+		signer.AlgorithmOpenPGPRSA4096: true,
+		signer.AlgorithmAPKRSA4096:     true,
+	}
+	for _, format := range All() {
+		algorithm := format.SigningAlgorithm()
+		if format.ImplementsSigning() != (algorithm != "") {
+			t.Errorf("format %q implements signing = %v but names algorithm %q",
+				format.Name(), format.ImplementsSigning(), algorithm)
+			continue
+		}
+		if algorithm != "" && !known[algorithm] {
+			t.Errorf("format %q names unknown signing algorithm %q", format.Name(), algorithm)
 		}
 	}
 }

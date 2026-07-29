@@ -678,8 +678,13 @@ func validateRepositorySigning(name string, repository Repository, keys map[stri
 	}
 	previous := ""
 	for _, signingKey := range repository.SigningKeys {
-		if _, exists := keys[signingKey]; !exists {
+		configured, exists := keys[signingKey]
+		if !exists {
 			return fmt.Errorf("repository %q references unknown signing key %q", name, signingKey)
+		}
+		if configured.Algorithm != selected.SigningAlgorithm() {
+			return fmt.Errorf("repository %q is %s and its clients verify %s keys, but %q is %s",
+				name, repository.Format, selected.SigningAlgorithm(), signingKey, configured.Algorithm)
 		}
 		if signingKey <= previous {
 			return fmt.Errorf("repository %q signing keys must be unique and sorted", name)

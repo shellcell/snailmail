@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"reflect"
 	"sort"
 	"strings"
@@ -462,6 +463,14 @@ func AttachKey(request AttachKeyRequest) (AttachKeyResult, error) {
 	if !selected.ImplementsSigning() {
 		return AttachKeyResult{}, fmt.Errorf("snailmail does not produce repository signatures for format %q", repository.Format)
 	}
+	// A client that trusts one kind of key cannot verify a signature made with
+	// another, so the wrong algorithm does not fail at attach time by accident
+	// of validation — it would publish a repository nothing can read.
+	if key.Algorithm != selected.SigningAlgorithm() {
+		return AttachKeyResult{}, fmt.Errorf(
+			"repository %q is %s and its clients verify %s keys, but %q is %s",
+			request.Repository, repository.Format, selected.SigningAlgorithm(), request.Key, key.Algorithm)
+	}
 	if len(repository.SigningKeys) != 0 {
 		return AttachKeyResult{}, fmt.Errorf(
 			"repository %q is already signed by %s; use `snailmail keys rotate` so clients keep trusting it through the change",
@@ -470,16 +479,18 @@ func AttachKey(request AttachKeyRequest) (AttachKeyResult, error) {
 	if key.PublicKeyPath == "" {
 		return AttachKeyResult{}, fmt.Errorf("signing key %q has no published public form; run `snailmail keys publish %s` first", request.Key, request.Key)
 	}
-	// The keyring is what a client installs, so it is derived from the key the
-	// workspace already recorded rather than asked for a second time.
+	// The keyring names the merged set of trusted keys, which is built at
+	// publication rather than being any one key's file. Naming it after the key
+	// happened to work for Debian and produced an unusable path for a format
+	// whose key is not a .gpg, so it follows setup's convention instead.
 	repository.SigningKeys = []string{request.Key}
-	repository.SigningKeyring = key.PublicKeyPath
+	repository.SigningKeyring = path.Join("keys", request.Repository+"-archive-keyring.gpg")
 	manifest.Repositories[request.Repository] = repository
 	if err := state.WriteManifest(root, manifest); err != nil {
 		return AttachKeyResult{}, err
 	}
 	return AttachKeyResult{
 		Repository: request.Repository, Key: request.Key,
-		Fingerprint: key.Fingerprint, Keyring: key.PublicKeyPath,
+		Fingerprint: key.Fingerprint, Keyring: clientKeyPath(repository, key),
 	}, nil
 }

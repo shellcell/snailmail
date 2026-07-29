@@ -28,6 +28,7 @@ import (
 	"github.com/shellcell/snailmail/formats/raw"
 	"github.com/shellcell/snailmail/formats/rpm"
 	"github.com/shellcell/snailmail/internal/domain"
+	"github.com/shellcell/snailmail/signer"
 )
 
 // Identity is operator-supplied package identity, used only where an artifact
@@ -119,6 +120,11 @@ type Format interface {
 	// SupportsDistros reports whether placements in this format carry a
 	// distribution coordinate.
 	SupportsDistros() bool
+	// SigningAlgorithm is the kind of key this format's clients can verify, or
+	// empty where the format is not signed. A client that trusts one kind of key
+	// cannot check a signature made with another, so this is not a preference:
+	// attaching the wrong kind produces a repository nothing can read.
+	SigningAlgorithm() string
 	// ImplementsSigning reports whether snailmail can produce repository
 	// signatures for this format. This is narrower than what the ecosystem
 	// permits: the knowledge bundle records that Helm defines .prov signing,
@@ -200,6 +206,9 @@ func (pypiFormat) SupportsDistros() bool                       { return false }
 
 // PyPI dropped GPG signatures in 2023, so there is no repository signature to
 // carry.
+// PyPI dropped repository signing in 2023.
+func (pypiFormat) SigningAlgorithm() string { return "" }
+
 func (pypiFormat) ImplementsSigning() bool         { return false }
 func (pypiFormat) CommitPaths(Repository) []string { return []string{"simple/index.html"} }
 func (pypiFormat) Build(blobs []domain.Blob, _ BuildOptions) (domain.RepositoryArtifact, error) {
@@ -229,7 +238,11 @@ func (debFormat) Inspect(filename string, reader io.ReaderAt, size int64, suppli
 // A Debian package version holds one artifact per architecture.
 func (debFormat) ArtifactCoordinate(artifact Artifact) string { return artifact.Architecture }
 func (debFormat) SupportsDistros() bool                       { return true }
-func (debFormat) ImplementsSigning() bool                     { return true }
+
+// apt verifies OpenPGP over the Release document.
+func (debFormat) SigningAlgorithm() string { return signer.AlgorithmOpenPGPRSA4096 }
+
+func (debFormat) ImplementsSigning() bool { return true }
 
 // A signed suite additionally switches InRelease and Release.gpg, which must
 // become live together with the Release they authenticate.
@@ -280,6 +293,9 @@ func (helmFormat) ArtifactCoordinate(Artifact) string { return "chart" }
 func (helmFormat) SupportsDistros() bool              { return false }
 
 // Helm signs with a per-chart .prov file, which is not yet implemented.
+// Helm defines .prov signing, which is not produced here.
+func (helmFormat) SigningAlgorithm() string { return "" }
+
 func (helmFormat) ImplementsSigning() bool         { return false }
 func (helmFormat) CommitPaths(Repository) []string { return []string{"index.yaml"} }
 func (helmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
@@ -326,6 +342,9 @@ func (rawFormat) SupportsDistros() bool                       { return false }
 
 // Detached signatures over the listing are the documented raw scheme; they are
 // not implemented yet.
+// Loose files are not an ecosystem and define no signing.
+func (rawFormat) SigningAlgorithm() string { return "" }
+
 func (rawFormat) ImplementsSigning() bool         { return false }
 func (rawFormat) CommitPaths(Repository) []string { return []string{"index.html", "SHA256SUMS"} }
 func (rawFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
@@ -365,6 +384,9 @@ func (rpmFormat) SupportsDistros() bool { return false }
 // Detached OpenPGP over repomd.xml is what repo_gpgcheck verifies, and it is
 // produced. Per-package signing is not: that signature lives in the package
 // header and is made by whoever built the package, not by the repository.
+// repo_gpgcheck verifies OpenPGP over repomd.xml.
+func (rpmFormat) SigningAlgorithm() string { return signer.AlgorithmOpenPGPRSA4096 }
+
 func (rpmFormat) ImplementsSigning() bool         { return true }
 func (rpmFormat) CommitPaths(Repository) []string { return []string{"repodata/repomd.xml"} }
 func (rpmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
@@ -403,6 +425,9 @@ func (apkFormat) SupportsDistros() bool { return false }
 
 // apk signs an index by prepending a signature stream to it, with the signing
 // key's filename identifying which key to check. That is not produced yet.
+// apk verifies a bare RSA signature against a key held by filename.
+func (apkFormat) SigningAlgorithm() string { return signer.AlgorithmAPKRSA4096 }
+
 func (apkFormat) ImplementsSigning() bool { return true }
 func (apkFormat) CommitPaths(repository Repository) []string {
 	paths := make([]string, 0, len(repository.Architectures))
