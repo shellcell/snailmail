@@ -46,16 +46,36 @@ var ErrVerificationImageUnavailable = errors.New("container image for verificati
 // client's own output, and must never be mistaken for this.
 func registryUnavailable(output []byte) bool {
 	text := strings.ToLower(string(output))
+	// The gate is what keeps a client's own output from being read as a
+	// transfer problem. It only applies where the output could be a client's:
+	// see registryRefusal for the paths where it never can.
 	if !strings.Contains(text, "error response from daemon") &&
 		!strings.Contains(text, "failed to resolve") && !strings.Contains(text, "pulling") &&
 		!strings.Contains(text, "trying to pull") {
 		return false
 	}
+	return registryRefusal(text)
+}
+
+// registryRefusal reports whether a message describes a registry declining to
+// serve, without requiring the pull-shaped preamble registryUnavailable looks
+// for.
+//
+// It is separate because some failures happen before any container is created —
+// resolving a multi-platform index, for one — where the output cannot be a
+// client's verification output and there is nothing to disambiguate from. A
+// registry quota is worded differently on each of those paths, and demanding a
+// preamble that only the pull path prints would silently classify the same
+// refusal as a repository defect.
+func registryRefusal(text string) bool {
+	text = strings.ToLower(text)
 	for _, signature := range []string{
 		"received unexpected http status",
 		"bad gateway",
 		"service unavailable",
 		"toomanyrequests",
+		"rate limit",
+		"unauthorized",
 		"no such host",
 		"connection refused",
 		"i/o timeout",
@@ -101,6 +121,15 @@ func platformImage(ctx context.Context, runner, image, platform string) (referen
 	}
 	digest, err := childManifestDigest(ctx, runner, image, platform)
 	if err != nil {
+		// A registry that will not serve the index is the same condition as one
+		// that will not serve the image, and must be reported as such. Resolving
+		// the platform is a fetch like any other: an exhausted pull quota here
+		// says nothing about the repository, and calling it an unresolvable
+		// platform sends the reader to look at their image pin instead of at
+		// their registry credentials.
+		if registryRefusal(err.Error()) {
+			return "", false, fmt.Errorf("%w: %s as %s: %w", ErrVerificationImageUnavailable, image, platform, err)
+		}
 		return "", false, fmt.Errorf("%w: %s as %s: %w", ErrPlatformUnresolved, image, platform, err)
 	}
 	return repository + "@" + digest, false, nil

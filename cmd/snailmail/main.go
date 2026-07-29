@@ -744,6 +744,13 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	runner := flags.String("runner", "podman", "OCI runner for Debian and Helm verification")
 	debianImage := flags.String("debian-image", engine.DefaultDebianVerificationImage, "digest-pinned Debian image")
 	helmImage := flags.String("helm-image", engine.DefaultHelmVerificationImage, "digest-pinned Helm image")
+	// Every format that verifies through a container takes an override, so a
+	// workspace can point at a mirror or an authenticated pull-through cache.
+	// Without one, a repository is only publishable from a network that can
+	// reach Docker Hub anonymously, and an exhausted quota there is reported as
+	// an unresolvable image rather than as the quota it is.
+	rpmImage := flags.String("rpm-image", engine.DefaultRPMVerificationImage, "digest-pinned RPM image")
+	apkImage := flags.String("apk-image", engine.DefaultAPKVerificationImage, "digest-pinned Alpine image")
 	maxWorkspaceMiB := flags.Int64("max-workspace-mib", 4096, "maximum Debian verification workspace in MiB")
 	approvalFile := flags.String("approvals", "", "approval evidence file (defaults beside plan)")
 	if err := flags.parse(args); err != nil {
@@ -760,7 +767,8 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	result, err := engine.ApplyWorkspace(ctx, engine.ApplyWorkspaceRequest{
 		Root: flags.Root(), Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
-		DebianImage: *debianImage, HelmImage: *helmImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
+		DebianImage: *debianImage, HelmImage: *helmImage,
+		RPMImage: *rpmImage, APKImage: *apkImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
 		Hosts: hosts, Blobs: wire.NewBlobResolver(), Gates: gate.NewDefaultEvaluator(resolvedApprovalFile, wire.NewForgeResolver()),
 		Sources: httpsource.New(),
 	})

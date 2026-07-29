@@ -183,3 +183,40 @@ Error response from daemon: toomanyrequests: You have reached your unauthenticat
 		}
 	}
 }
+
+// Resolving a multi-platform index happens before any container exists, so a
+// registry refusing there is a transfer problem however it is worded. These are
+// the exact messages a rate-limited Docker Hub produced on that path; they carry
+// none of the pull-shaped preamble the run path prints, which is why they need
+// their own classification.
+func TestManifestPathRecognisesARegistryRefusal(t *testing.T) {
+	for _, message := range []string{
+		"/usr/local/bin/docker manifest inspect: toomanyrequests: You have reached your unauthenticated pull rate limit. https://www.docker.com/increase-rate-limit",
+		"docker manifest inspect: unauthorized: authentication required",
+		`docker manifest inspect: Get "https://registry-1.docker.io/v2/": received unexpected HTTP status: 503 Service Unavailable`,
+	} {
+		if !registryRefusal(message) {
+			t.Errorf("a registry refusal was not recognised: %q", message)
+		}
+		// The stricter pull-path check deliberately does not fire here, which is
+		// exactly why the manifest path needs its own.
+		if registryUnavailable([]byte(message)) {
+			t.Errorf("the pull-path gate should not match a manifest failure: %q", message)
+		}
+	}
+}
+
+// A missing or genuinely wrong image is the operator's pin to fix, and must not
+// be excused as somebody else's outage.
+func TestManifestPathKeepsRealResolutionFailures(t *testing.T) {
+	for _, message := range []string{
+		"docker manifest inspect: manifest unknown",
+		"docker manifest inspect: no matching manifest for linux/riscv64 in the manifest list entries",
+		"docker manifest inspect: invalid reference format",
+		"",
+	} {
+		if registryRefusal(message) {
+			t.Errorf("a real resolution failure was excused as a registry refusal: %q", message)
+		}
+	}
+}
