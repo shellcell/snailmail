@@ -25,6 +25,7 @@ import (
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
 	"github.com/shellcell/snailmail/formats/raw"
+	"github.com/shellcell/snailmail/formats/rpm"
 	"github.com/shellcell/snailmail/internal/domain"
 )
 
@@ -135,6 +136,7 @@ var registry = map[string]Format{
 	"deb":  debFormat{},
 	"helm": helmFormat{},
 	"raw":  rawFormat{},
+	"rpm":  rpmFormat{},
 }
 
 // For returns the format registered under name.
@@ -285,6 +287,7 @@ func (helmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.Repos
 // Compile-time proof that every registered value satisfies the interface.
 var (
 	_ Format = rawFormat{}
+	_ Format = rpmFormat{}
 	_ Format = pypiFormat{}
 	_ Format = debFormat{}
 	_ Format = helmFormat{}
@@ -324,4 +327,42 @@ func (rawFormat) ImplementsSigning() bool         { return false }
 func (rawFormat) CommitPaths(Repository) []string { return []string{"index.html", "SHA256SUMS"} }
 func (rawFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
 	return raw.Build(blobs, raw.BuildOptions{GeneratedAt: options.GeneratedAt})
+}
+
+// rpmFormat serves RPM packages through a yum/dnf repository.
+type rpmFormat struct{}
+
+func (rpmFormat) Name() string                     { return "rpm" }
+func (rpmFormat) ID() string                       { return rpm.FormatID }
+func (rpmFormat) MaxArtifactSize() int64           { return rpm.MaxArtifactSize }
+func (rpmFormat) IsArtifactFilename(n string) bool { return rpm.IsArtifactFilename(n) }
+
+// RPM names are case-sensitive and used verbatim by every client.
+func (rpmFormat) NormalizeName(n string) string { return n }
+func (rpmFormat) CompareVersions(l, r string) (int, error) {
+	return rpm.CompareVersions(l, r)
+}
+
+// An RPM names itself in its header; the filename is only a convention.
+func (rpmFormat) DerivesIdentityFromBytes() bool { return true }
+func (rpmFormat) Inspect(filename string, reader io.ReaderAt, size int64, supplied Identity) (domain.PackageFacts, error) {
+	if supplied.Supplied() {
+		return domain.PackageFacts{}, errors.New("RPM identity comes from the package header and cannot be supplied")
+	}
+	return rpm.Inspect(filename, reader, size)
+}
+
+// One RPM version holds one package per architecture, the same shape Debian has.
+func (rpmFormat) ArtifactCoordinate(artifact Artifact) string { return artifact.Architecture }
+
+// A yum repository is addressed by its own URL rather than by a distribution
+// coordinate inside it, so releases do not carry one.
+func (rpmFormat) SupportsDistros() bool { return false }
+
+// Detached OpenPGP over repomd.xml is the yum scheme, and per-package signing
+// happens at build time in the package itself. Neither is produced yet.
+func (rpmFormat) ImplementsSigning() bool         { return false }
+func (rpmFormat) CommitPaths(Repository) []string { return []string{"repodata/repomd.xml"} }
+func (rpmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
+	return rpm.Build(blobs, rpm.BuildOptions{GeneratedAt: options.GeneratedAt})
 }

@@ -948,7 +948,7 @@ func runBuildHelm(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail verify <pypi|deb|helm|raw> [options]")
+		return errors.New("usage: snailmail verify <pypi|deb|helm|raw|rpm> [options]")
 	}
 	switch args[0] {
 	case "pypi":
@@ -959,6 +959,8 @@ func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return runVerifyHelm(ctx, args[1:], stdout, stderr)
 	case "raw":
 		return runVerifyRaw(args[1:], stdout, stderr)
+	case "rpm":
+		return runVerifyRPM(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown verify format %q", args[0])
 	}
@@ -1099,6 +1101,35 @@ func runVersion(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
+func runVerifyRPM(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := newCommandFlags("verify rpm", stderr).withJSON()
+	repository := flags.String("repo", "", "generated repository directory")
+	runner := flags.String("runner", "podman", "OCI runner executable")
+	image := flags.String("image", engine.DefaultRPMVerificationImage, "digest-pinned RPM client image")
+	structuralOnly := flags.Bool("structural-only", false, "verify indexes without invoking dnf")
+	if err := flags.parse(args); err != nil {
+		return err
+	}
+	result, err := engine.VerifyRPM(ctx, engine.VerifyRPMRequest{
+		Repository: *repository, Runner: *runner, Image: *image, StructuralOnly: *structuralOnly,
+	})
+	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  verified %d repository %s\n", result.FileCount, plural(result.FileCount, "file", "files"))
+	if *structuralOnly {
+		fmt.Fprintln(stdout, "✉️   structural verification passed")
+	} else {
+		fmt.Fprintf(stdout, "✉️   dnf installed %d %s\n", result.InstalledCases, plural(result.InstalledCases, "package", "packages"))
+	}
+	fmt.Fprintf(stdout, "    tree sha256:%s\n", result.TreeSHA256)
+	return nil
+}
+
 func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("serve", stderr)
 	repository := flags.String("repo", "", "generated repository directory")
@@ -1185,6 +1216,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail verify deb --repo DIR [--runner podman]")
 	fmt.Fprintln(output, "  snailmail verify helm --repo DIR [--runner podman]")
 	fmt.Fprintln(output, "  snailmail verify raw --repo DIR")
+	fmt.Fprintln(output, "  snailmail verify rpm --repo DIR [--runner podman]")
 	fmt.Fprintln(output, "  snailmail serve --repo DIR [--listen 127.0.0.1:8080]")
 	fmt.Fprintln(output, "  snailmail version [--json]")
 	fmt.Fprintln(output)

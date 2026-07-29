@@ -11,6 +11,7 @@ import (
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
 	"github.com/shellcell/snailmail/formats/raw"
+	"github.com/shellcell/snailmail/formats/rpm"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
@@ -396,5 +397,47 @@ func VerifyRaw(request VerifyRawRequest) (VerifyResult, error) {
 		Format: manifest.Format, TreeSHA256: manifest.TreeSHA256,
 		FileCount: len(manifest.Files), InstalledCases: len(manifest.VerificationCases),
 		Manifest: manifest,
+	}, nil
+}
+
+// DefaultRPMVerificationImage is the client that proves a yum repository is
+// installable. Fedora rather than a minimal base because dnf, and the rpm
+// database it needs, are already there.
+const DefaultRPMVerificationImage = "docker.io/library/fedora@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d"
+
+type VerifyRPMRequest struct {
+	Repository     string
+	Runner         string
+	Image          string
+	StructuralOnly bool
+}
+
+// VerifyRPM checks a yum repository's indexes, and unless asked for structure
+// alone, has a real dnf install from it.
+func VerifyRPM(ctx context.Context, request VerifyRPMRequest) (VerifyResult, error) {
+	var manifest buildgraph.RepositoryManifest
+	var err error
+	installed := 0
+	if request.StructuralOnly {
+		manifest, err = app.VerifyRepository(request.Repository)
+	} else {
+		image := request.Image
+		if image == "" {
+			image = DefaultRPMVerificationImage
+		}
+		manifest, installed, err = app.VerifyRPMClient(ctx, request.Repository, request.Runner, image)
+	}
+	if err != nil {
+		return VerifyResult{}, err
+	}
+	if manifest.Format != rpm.FormatID {
+		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, rpm.FormatID)
+	}
+	return VerifyResult{
+		Format:         manifest.Format,
+		TreeSHA256:     manifest.TreeSHA256,
+		FileCount:      len(manifest.Files),
+		InstalledCases: installed,
+		Manifest:       manifest,
 	}, nil
 }

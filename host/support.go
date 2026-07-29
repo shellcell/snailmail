@@ -41,6 +41,7 @@ var formatSupport = map[string]map[string]FormatSupport{
 		"deb":  {Publish: true},
 		"helm": {Publish: true},
 		"raw":  {Publish: true},
+		"rpm":  {Publish: true},
 	},
 	// The first remote slice is PyPI. Extending a host to another format means
 	// its commit paths, install document, and endpoint client probe, so the two
@@ -58,6 +59,7 @@ var formatSupport = map[string]map[string]FormatSupport{
 		// Raw has no client to run: a consumer fetches a URL and checks it
 		// against SHA256SUMS, which host-served byte verification already does.
 		"raw": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		"rpm": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 	},
 }
 
