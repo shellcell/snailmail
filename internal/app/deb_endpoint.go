@@ -94,10 +94,10 @@ func VerifyDebClientEndpointAccess(ctx context.Context, root string, access host
 	// only reachable with host networking. A public endpoint uses the runner's
 	// default network and stays isolated from the host.
 	hostNetwork := isLoopbackHost(endpoint.Hostname())
-	for _, verification := range verificationCases {
-		if err := verifyDebEndpointCase(ctx, runner, image, access.Endpoint, trust, hostNetwork, workspaceBytes, manifest, verification); err != nil {
-			return buildgraph.RepositoryManifest{}, 0, err
-		}
+	if err := verifyCases(ctx, verificationCases, func(caseCtx context.Context, verification domain.VerificationCase) error {
+		return verifyDebEndpointCase(caseCtx, runner, image, access.Endpoint, trust, hostNetwork, workspaceBytes, manifest, verification)
+	}); err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
 	}
 	return manifest, len(manifest.VerificationCases), nil
 }

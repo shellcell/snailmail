@@ -55,14 +55,12 @@ func VerifyRPMClient(ctx context.Context, repository, runner, image string) (bui
 	if !digestPinnedImage(image) {
 		return buildgraph.RepositoryManifest{}, 0, errors.New("a digest-pinned RPM verification image is required")
 	}
-	installed := 0
-	for _, verification := range manifest.VerificationCases {
-		if err := verifyRPMCase(ctx, runner, image, snapshot, verification); err != nil {
-			return buildgraph.RepositoryManifest{}, 0, err
-		}
-		installed++
+	if err := verifyCases(ctx, manifest.VerificationCases, func(caseCtx context.Context, verification domain.VerificationCase) error {
+		return verifyRPMCase(caseCtx, runner, image, snapshot, verification)
+	}); err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
 	}
-	return manifest, installed, nil
+	return manifest, len(manifest.VerificationCases), nil
 }
 
 func verifyRPMCase(ctx context.Context, runner, image, snapshot string, verification domain.VerificationCase) error {

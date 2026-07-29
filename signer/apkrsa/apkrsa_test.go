@@ -67,7 +67,13 @@ func TestVerifyRejectsWhatItShould(t *testing.T) {
 		},
 		"altered signature": func() error {
 			altered := response
-			altered.Content = append(append([]byte(nil), response.Content[:len(response.Content)-1]...), 0x00)
+			// Flip a bit rather than write a fixed byte. Setting the last byte
+			// to zero leaves the signature untouched whenever it already ended
+			// in zero, which an RSA signature does about once in 256 runs — and
+			// an unaltered signature verifying is the test passing by accident,
+			// reported as a failure.
+			altered.Content = append([]byte(nil), response.Content...)
+			altered.Content[len(altered.Content)-1] ^= 0x01
 			return VerifyResponse(request, altered, publicDER(t, generated), generated.Identity.Fingerprint)
 		},
 		"another key": func() error {
