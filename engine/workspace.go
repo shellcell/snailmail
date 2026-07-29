@@ -1161,19 +1161,13 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	active := visiblePackageVersions(lock, repository)
 	var lockedBlobs []domain.Blob
 	lockedSources := make(map[string]string)
-	for _, packageVersion := range active {
-		for _, locked := range packageVersion.Blobs {
-			blob, source, err := ensureBlob(ctx, root, repository.Format, locked, blobStore,
-				formats.IdentityFor(selected, packageVersion.Package, packageVersion.Version), fetcher)
-			if err != nil {
-				return BuildResult{}, err
-			}
-			lockedBlobs = append(lockedBlobs, blob)
-			lockedSources[blob.SHA256] = source
-			if nativePackageName(repository.Format, blob.Facts.Name) != packageVersion.Package || blob.Facts.Version != packageVersion.Version {
-				return BuildResult{}, fmt.Errorf("blob %s disagrees with package version %s@%s", locked.SHA256, packageVersion.Package, packageVersion.Version)
-			}
-		}
+	loaded, err := loadLockedBlobs(ctx, root, repository, active, selected, blobStore, fetcher)
+	if err != nil {
+		return BuildResult{}, err
+	}
+	for _, entry := range loaded {
+		lockedBlobs = append(lockedBlobs, entry.blob)
+		lockedSources[entry.blob.SHA256] = entry.source
 	}
 	if output == "" {
 		temporary, err := os.MkdirTemp(staging, ".snailmail-plan-build-*")

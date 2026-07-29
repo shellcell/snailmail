@@ -156,3 +156,33 @@ func TestFailedApplyReleasesTheWorkspaceLock(t *testing.T) {
 	}
 	release()
 }
+
+// Artifacts are read concurrently, so a repository must build identically
+// however the goroutines were scheduled — and a failure must name the same
+// artifact every time.
+func TestConcurrentBlobLoadingIsDeterministic(t *testing.T) {
+	root := multiRepositoryWorkspace(t, "deb", "helm")
+	planName := filepath.Join(root, "plan.json")
+
+	digests := map[string]bool{}
+	for range 4 {
+		os.RemoveAll(filepath.Join(root, "public"))
+		if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+			Root: root, Output: planName, ExpiresIn: time.Hour, VerificationMode: "structural",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		plan, err := state.LoadPlan(planName)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, repository := range plan.Payload.Repositories {
+			digests[repository.Name+":"+repository.DesiredTreeSHA256] = true
+		}
+	}
+	// Two repositories, one digest each: more would mean the tree depended on
+	// which artifact finished reading first.
+	if len(digests) != 2 {
+		t.Fatalf("planning four times produced %d distinct trees: %v", len(digests), digests)
+	}
+}

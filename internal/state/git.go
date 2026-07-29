@@ -13,7 +13,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -533,15 +532,23 @@ func requireCompleteGitHistory(root string) error {
 }
 
 func requireCompleteGitHistoryContext(ctx context.Context, root string) error {
-	shallow, err := gitOutputContext(ctx, root, "rev-parse", "--is-shallow-repository")
+	// Whether a repository is shallow, or a partial clone, is a property of how
+	// it was cloned. It does not change while snailmail holds the workspace
+	// lock, and this is asked once per clean-workspace check.
+	shallow, err := cachedGitLayout(root, "is-shallow", func() (string, error) {
+		return gitOutputContext(ctx, root, "rev-parse", "--is-shallow-repository")
+	})
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if err != nil || shallow == "true" {
 		return errors.New("workspace requires complete, non-shallow Git history")
 	}
-	command := gitCommandContext(ctx, root, "config", "--get", "extensions.partialClone")
-	output, configErr := command.Output()
+	partial, partialErr := cachedGitLayout(root, "partial-clone", func() (string, error) {
+		output, err := gitCommandContext(ctx, root, "config", "--get", "extensions.partialClone").Output()
+		return string(output), err
+	})
+	output, configErr := []byte(partial), partialErr
 	if configErr == nil && strings.TrimSpace(string(output)) != "" {
 		return errors.New("workspace requires complete, non-partial Git history")
 	}
@@ -910,33 +917,18 @@ func publicationWorkspacePaths(repositories []string) map[string]bool {
 }
 
 // gitPrefix returns the workspace's path prefix inside its Git repository.
-// The prefix cannot change while a workspace operation holds its lock, and it
-// is consulted once per authoritative path, so it is resolved once per root
-// rather than through a subprocess per lookup.
-var gitPrefixes struct {
-	sync.Mutex
-	byRoot map[string]string
-}
-
+//
+// It is consulted once per authoritative path, and cannot change while a
+// workspace operation holds its lock — the same reason the other layout answers
+// are remembered, through the same cache rather than one of its own.
 func gitPrefix(ctx context.Context, root string) (string, error) {
-	gitPrefixes.Lock()
-	cached, found := gitPrefixes.byRoot[root]
-	gitPrefixes.Unlock()
-	if found {
-		return cached, nil
-	}
-	prefix, err := gitOutputContext(ctx, root, "rev-parse", "--show-prefix")
-	if err != nil {
-		return "", err
-	}
-	prefix = filepath.ToSlash(prefix)
-	gitPrefixes.Lock()
-	if gitPrefixes.byRoot == nil {
-		gitPrefixes.byRoot = make(map[string]string)
-	}
-	gitPrefixes.byRoot[root] = prefix
-	gitPrefixes.Unlock()
-	return prefix, nil
+	return cachedGitLayout(root, "show-prefix", func() (string, error) {
+		prefix, err := gitOutputContext(ctx, root, "rev-parse", "--show-prefix")
+		if err != nil {
+			return "", err
+		}
+		return filepath.ToSlash(prefix), nil
+	})
 }
 
 func workspaceGitPath(root, relative string) (string, error) {
@@ -1032,7 +1024,11 @@ func gitPathOutputContext(ctx context.Context, root string, arguments ...string)
 }
 
 func resolveGitPath(root, name string) (string, error) {
-	resolved, err := gitOutput(root, "rev-parse", "--git-path", name)
+	// Where a repository keeps its index, HEAD and refs is fixed for the life of
+	// the repository; only their contents change, and nothing here reads those.
+	resolved, err := cachedGitLayout(root, "git-path\x00"+name, func() (string, error) {
+		return gitOutput(root, "rev-parse", "--git-path", name)
+	})
 	if err != nil {
 		return "", err
 	}
