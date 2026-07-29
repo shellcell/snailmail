@@ -1483,13 +1483,10 @@ func requireSigningSupport(selected formats.Format, repository state.Repository,
 	if selected.ImplementsSigning() || (len(plannedSigning) == 0 && len(repository.SigningKeys) == 0) {
 		return nil
 	}
-	switch selected.Name() {
-	case "pypi":
-		return errors.New("PyPI repository cannot contain repository signing effects")
-	case "raw":
-		return errors.New("raw repositories have no signing scheme a client would check")
-	}
-	return fmt.Errorf("format %q cannot contain repository signing effects", selected.Name())
+	// One message rather than one per format: which formats sign is the
+	// registry's answer, and an engine keeping its own list of them is how the
+	// last two of these drifted out of date.
+	return fmt.Errorf("format %q produces no repository signature a client would check, so it cannot carry signing effects", selected.Name())
 }
 
 func materializeLockedArtifact(ctx context.Context, output string, generatedAt time.Time, artifact domain.RepositoryArtifact, sources map[string]string) (BuildResult, error) {
@@ -2250,7 +2247,7 @@ func (preparation *applyPreparation) prepareRepository(planned state.PlanReposit
 		// The tree has not been built here. The shape is still knowable: it
 		// follows from the repository's configuration and, for Helm, from the
 		// charts its lock says are published.
-		shape, err := signingShapeFor(repository, helmChartPathsFromLock(repository, lock))
+		shape, err := signingShapeFor(repository, lockedArtifactPaths(repository, lock))
 		if err != nil {
 			return applyRepository{}, fmt.Errorf("plan repository %q: %w", planned.Name, err)
 		}

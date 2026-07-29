@@ -5,14 +5,13 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"os"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/shellcell/snailmail/formats/apk"
-	"github.com/shellcell/snailmail/formats/deb"
-	"github.com/shellcell/snailmail/formats/helm"
-	"github.com/shellcell/snailmail/formats/rpm"
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/signer"
@@ -52,101 +51,86 @@ type signingOutput struct {
 // every other format. Helm signs one provenance file per chart rather than one
 // document per repository, so its shape is the only one that does not follow
 // from the repository's configuration alone.
-func signingShapeFor(repository state.Repository, charts []string) (signingRecipe, error) {
-	switch repository.Format {
-	case "deb":
-		suite := path.Join("dists", repository.Suite)
-		return signingRecipe{
-			payloadID: "deb-release",
-			outputs: []signingOutput{
-				{id: "deb-inrelease", scheme: signer.SchemeOpenPGPCleartext, path: path.Join(suite, "InRelease")},
-				{id: "deb-release-gpg", scheme: signer.SchemeOpenPGPDetached, path: path.Join(suite, "Release.gpg")},
-			},
-		}, nil
-	case "apk":
-		outputs := make([]signingOutput, 0, len(repository.Architectures))
-		for _, architecture := range repository.Architectures {
-			indexPath := path.Join(architecture, apk.IndexFilename)
-			outputs = append(outputs, signingOutput{
-				id: "apk-index-" + architecture, scheme: signer.SchemeAPKRSA256, path: indexPath,
-			})
-		}
-		if len(outputs) == 0 {
-			return signingRecipe{}, errors.New("an Alpine repository must serve at least one architecture to be signed")
-		}
-		return signingRecipe{payloadID: "apk-index", outputs: outputs}, nil
-	case "helm":
-		// One provenance file per chart, alongside the archive it covers, which
-		// is where `helm verify` and `helm install --verify` look for it.
-		outputs := make([]signingOutput, 0, len(charts))
-		for _, chart := range charts {
-			outputs = append(outputs, signingOutput{
-				id: "helm-provenance-" + chart, scheme: signer.SchemeOpenPGPCleartext,
-				path: chart + helm.ProvenanceSuffix,
-			})
-		}
-		// A repository with no charts signs nothing. That is not a
-		// misconfiguration: a signed repository that has published nothing yet
-		// is the ordinary state of one just set up.
-		return signingRecipe{payloadID: "helm-provenance", outputs: outputs}, nil
-	case "rpm":
-		return signingRecipe{
-			payloadID: "rpm-repomd",
-			outputs: []signingOutput{
-				{id: "rpm-repomd-asc", scheme: signer.SchemeOpenPGPDetached, path: rpm.SignaturePath},
-			},
-		}, nil
-	default:
-		return signingRecipe{}, fmt.Errorf("repository signing is not implemented for format %q", repository.Format)
+func signingShapeFor(repository state.Repository, published []string) (signingRecipe, error) {
+	signing, err := formats.SignerFor(repository.Format)
+	if err != nil {
+		return signingRecipe{}, err
+	}
+	shape, err := signing.SigningShape(signingRepositoryView(repository), published)
+	if err != nil {
+		return signingRecipe{}, err
+	}
+	outputs := make([]signingOutput, 0, len(shape.Outputs))
+	for _, output := range shape.Outputs {
+		outputs = append(outputs, signingOutput{id: output.ID, scheme: output.Scheme, path: output.Path})
+	}
+	return signingRecipe{payloadID: shape.PayloadID, outputs: outputs}, nil
+}
+
+// signingRepositoryView is what a format needs to know about a repository to
+// decide the shape of its signatures.
+func signingRepositoryView(repository state.Repository) formats.Repository {
+	return formats.Repository{
+		Suite: repository.Suite, Component: repository.Component,
+		Architectures: repository.Architectures, Signed: len(repository.SigningKeys) != 0,
 	}
 }
 
 // signingRecipeFor is the shape with the bytes those signatures must cover.
 func signingRecipeFor(repository state.Repository, artifact domain.RepositoryArtifact, sources map[string]string) (signingRecipe, error) {
-	recipe, err := signingShapeFor(repository, helmChartPaths(artifact))
+	signing, err := formats.SignerFor(repository.Format)
 	if err != nil {
 		return signingRecipe{}, err
 	}
-	switch repository.Format {
-	case "deb":
-		payload, err := deb.ReleasePayload(artifact, repository.Suite)
-		if err != nil {
-			return signingRecipe{}, err
+	view := signingRepositoryView(repository)
+	shape, err := signing.SigningShape(view, publishedArtifactPaths(artifact))
+	if err != nil {
+		return signingRecipe{}, err
+	}
+	payloads, err := signing.SigningPayloads(artifact, view, shape, storedContent(sources))
+	if err != nil {
+		return signingRecipe{}, err
+	}
+	outputs := make([]signingOutput, 0, len(shape.Outputs))
+	for _, output := range shape.Outputs {
+		payload, exists := payloads[output.Path]
+		if !exists {
+			return signingRecipe{}, fmt.Errorf("format %q produced no payload for %q", repository.Format, output.Path)
 		}
-		for index := range recipe.outputs {
-			recipe.outputs[index].payload = payload
-		}
-	case "rpm":
-		payload, err := rpm.RepomdPayload(artifact)
-		if err != nil {
-			return signingRecipe{}, err
-		}
-		for index := range recipe.outputs {
-			recipe.outputs[index].payload = payload
-		}
-	case "helm":
-		for index, output := range recipe.outputs {
-			chart := strings.TrimSuffix(output.path, helm.ProvenanceSuffix)
-			payload, err := helmProvenancePayload(artifact, chart, sources)
-			if err != nil {
-				return signingRecipe{}, err
-			}
-			recipe.outputs[index].payload = payload
-		}
-	case "apk":
-		payloads, err := apk.IndexPayloads(artifact)
-		if err != nil {
-			return signingRecipe{}, err
-		}
-		for index, output := range recipe.outputs {
-			payload, exists := payloads[output.path]
-			if !exists {
-				return signingRecipe{}, fmt.Errorf("repository has no index at %q to sign", output.path)
-			}
-			recipe.outputs[index].payload = payload
+		outputs = append(outputs, signingOutput{
+			id: output.ID, scheme: output.Scheme, path: output.Path, payload: payload,
+		})
+	}
+	return signingRecipe{payloadID: shape.PayloadID, outputs: outputs}, nil
+}
+
+// publishedArtifactPaths lists the files carrying artifact content, which is
+// what a format signing each artifact rather than an index needs to know.
+func publishedArtifactPaths(artifact domain.RepositoryArtifact) []string {
+	paths := make([]string, 0, len(artifact.Files))
+	for _, file := range artifact.Files {
+		if file.BlobSHA256 != "" {
+			paths = append(paths, file.Path)
 		}
 	}
-	return recipe, nil
+	sort.Strings(paths)
+	return paths
+}
+
+// storedContent reads a published artifact's bytes out of the workspace store,
+// so a signature over them attests to what the lock pinned rather than to
+// whatever was written into the staged tree.
+func storedContent(sources map[string]string) formats.ArtifactContent {
+	if sources == nil {
+		return nil
+	}
+	return func(digest string) ([]byte, error) {
+		name, stored := sources[digest]
+		if !stored {
+			return nil, fmt.Errorf("artifact sha256:%s has no stored content", digest)
+		}
+		return os.ReadFile(name)
+	}
 }
 
 // validateRecipeNodes checks planned signing responses against the recipe the
@@ -174,51 +158,26 @@ func validateRecipeNodes(nodes []state.SigningNode, recipe signingRecipe) error 
 // applyFormatSigning places the resolved signatures and the public material a
 // client verifies them with.
 func applyFormatSigning(repository state.Repository, artifact domain.RepositoryArtifact, key state.SigningKey, material signingInputs) (domain.RepositoryArtifact, error) {
-	switch repository.Format {
-	case "deb":
-		return deb.ApplySigning(artifact, repository.Suite, deb.SigningMaterial{
-			Fingerprint: key.Fingerprint, PublicKey: material.publicBinary,
-			KeyringPath: repository.SigningKeyring, PublicKeyring: material.publicKeyring,
-			TrustedFingerprints: material.trustedFingerprints, SignatureTime: material.signatureTime,
-			InRelease: material.contents[0], ReleaseGPG: material.contents[1],
-		})
-	case "rpm":
-		// A yum client imports an armored key, where apt takes a binary
-		// keyring, so the published form differs even though the key does not.
-		return rpm.ApplySigning(artifact, rpm.SigningMaterial{
-			Fingerprint: key.Fingerprint, PublicKey: material.publicBinary,
-			PublicArmor:   material.publicArmor,
-			ArmorPath:     strings.TrimSuffix(repository.SigningKeyring, ".gpg") + ".asc",
-			SignatureTime: material.signatureTime, Signature: material.contents[0],
-		})
-	case "helm":
-		// One provenance file per chart, keyed by the chart it covers: the
-		// output path is the chart's path with the suffix, so removing it
-		// recovers which chart each signature belongs to.
-		provenance := make(map[string][]byte, len(material.contents))
-		for index, content := range material.contents {
-			provenance[strings.TrimSuffix(material.outputPaths[index], helm.ProvenanceSuffix)] = content
-		}
-		return helm.ApplySigning(artifact, helm.SigningMaterial{
-			Fingerprint: key.Fingerprint, PublicKey: material.publicBinary,
-			PublicKeyring: material.publicKeyring, KeyringPath: repository.SigningKeyring,
-			SignatureTime: material.signatureTime, Provenance: provenance,
-		})
-	case "apk":
-		signatures := make(map[string][]byte, len(material.contents))
-		for index, content := range material.contents {
-			signatures[material.outputPaths[index]] = content
-		}
-		block, _ := pem.Decode(material.publicArmor)
-		if block == nil {
-			return domain.RepositoryArtifact{}, errors.New("invalid apk public key")
-		}
-		return apk.ApplySigning(artifact, apk.SigningMaterial{
-			Fingerprint: key.Fingerprint, PublicDER: block.Bytes, PublicPEM: material.publicArmor,
-			KeyName: path.Base(key.PublicArmorPath), SignatureTime: material.signatureTime, Signatures: signatures,
-		})
-	default:
-		return domain.RepositoryArtifact{}, fmt.Errorf("repository signing is not implemented for format %q", repository.Format)
+	signing, err := formats.SignerFor(repository.Format)
+	if err != nil {
+		return domain.RepositoryArtifact{}, err
+	}
+	return signing.PlaceSignatures(artifact, signingRepositoryView(repository), formatSigningMaterial(repository, key, material))
+}
+
+// formatSigningMaterial gathers what every format's signing draws on, whichever
+// parts of it that format actually publishes.
+func formatSigningMaterial(repository state.Repository, key state.SigningKey, material signingInputs) formats.SigningMaterial {
+	signatures := make(map[string][]byte, len(material.contents))
+	for index, content := range material.contents {
+		signatures[material.outputPaths[index]] = content
+	}
+	return formats.SigningMaterial{
+		Fingerprint: key.Fingerprint, PublicBinary: material.publicBinary,
+		PublicKeyring: material.publicKeyring, PublicArmor: material.publicArmor,
+		KeyringPath: repository.SigningKeyring, PublicArmorPath: key.PublicArmorPath,
+		TrustedFingerprints: material.trustedFingerprints, SignatureTime: material.signatureTime,
+		Signatures: signatures,
 	}
 }
 
@@ -234,24 +193,6 @@ type signingInputs struct {
 	// signing more than one document needs and one signing a single document
 	// ignores.
 	outputPaths []string
-}
-
-// knownPayloadIDs are the documents a format signs over. A plan checked without
-// a recipe still may not name anything else: the dependency is what ties a
-// reviewed signature to the bytes it was made over, so an unrecognised one
-// would let a signature claim to cover input nobody reviewed.
-// knownSchemes are the signature kinds any format may ask for.
-var knownSchemes = map[string]bool{
-	signer.SchemeOpenPGPCleartext: true,
-	signer.SchemeOpenPGPDetached:  true,
-	signer.SchemeAPKRSA256:        true,
-}
-
-var knownPayloadIDs = map[string]bool{
-	"deb-release":     true,
-	"rpm-repomd":      true,
-	"apk-index":       true,
-	"helm-provenance": true,
 }
 
 // inspectPublicForms reads a committed public key, whichever kind it is.
@@ -323,12 +264,42 @@ func signerMatchesPublic(algorithm string, private, public signer.Identity) bool
 // binary keyring, a yum client the armored form of the same keys, and apk the
 // single key file it will hold in /etc/apk/keys under exactly that name.
 func clientKeyPath(repository state.Repository, key state.SigningKey) string {
-	switch repository.Format {
-	case "rpm":
-		return strings.TrimSuffix(repository.SigningKeyring, ".gpg") + ".asc"
-	case "apk":
-		return key.PublicArmorPath
-	default:
+	signing, err := formats.SignerFor(repository.Format)
+	if err != nil {
 		return repository.SigningKeyring
 	}
+	return signing.ClientKeyPath(signingRepositoryView(repository), formats.SigningMaterial{
+		KeyringPath: repository.SigningKeyring, PublicArmorPath: key.PublicArmorPath,
+	})
+}
+
+// knownSigningNode reports whether a scheme and payload identifier are ones
+// some registered format produces.
+//
+// It asks the formats rather than consulting a list kept beside them. The list
+// this replaced had to be edited whenever a format gained a signing shape, and
+// forgetting to do so rejected a valid plan with a message about node identity
+// that named nothing an operator could act on — which is how it was found.
+func knownSigningNode(scheme, payloadID string) bool {
+	for _, name := range formats.Names() {
+		signing, err := formats.SignerFor(name)
+		if err != nil {
+			continue
+		}
+		// A shape wide enough to answer for the formats whose outputs depend on
+		// what a repository serves: one architecture and one artifact are
+		// enough to produce every identifier and scheme the format uses.
+		shape, err := signing.SigningShape(
+			formats.Repository{Suite: "stable", Component: "main", Architectures: []string{"amd64"}},
+			[]string{"artifact"})
+		if err != nil || shape.PayloadID != payloadID {
+			continue
+		}
+		for _, output := range shape.Outputs {
+			if output.Scheme == scheme {
+				return true
+			}
+		}
+	}
+	return false
 }

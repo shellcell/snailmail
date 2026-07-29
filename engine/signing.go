@@ -315,8 +315,7 @@ func validateSigningRecipeMetadata(signing state.PlanSigning, recipe *signingRec
 	// No recipe: every node must still be a well-formed signature at a safe
 	// path, which is what stops a plan smuggling one somewhere else.
 	for _, node := range signing.Nodes {
-		if node.Kind != "sign" || len(node.DependsOn) != 1 || !knownPayloadIDs[node.DependsOn[0]] ||
-			!knownSchemes[node.Scheme] ||
+		if node.Kind != "sign" || len(node.DependsOn) != 1 || !knownSigningNode(node.Scheme, node.DependsOn[0]) ||
 			node.OutputPath == "" || path.IsAbs(node.OutputPath) || path.Clean(node.OutputPath) != node.OutputPath ||
 			strings.HasPrefix(node.OutputPath, "../") {
 			return errors.New("signing recipe has invalid node identity or dependencies")

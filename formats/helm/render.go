@@ -46,7 +46,7 @@ func Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact
 			continue
 		}
 		identityDigests[identity] = blob.SHA256
-		chartPath := path.Join("charts", blob.SHA256, blob.Filename)
+		chartPath := ChartPath(blob.SHA256, blob.Filename)
 		charts[blob.Facts.Name] = append(charts[blob.Facts.Name], indexedChart{blob: blob, path: chartPath})
 		if !seenFiles[chartPath] {
 			files = append(files, domain.File{Path: chartPath, Size: blob.Size, SHA256: blob.SHA256, BlobSHA256: blob.SHA256})
@@ -143,4 +143,12 @@ func writeOptionalYAML(output *strings.Builder, indent, name, value string) {
 func yamlString(value string) string {
 	encoded, _ := json.Marshal(value)
 	return string(encoded)
+}
+
+// ChartPath is where a chart archive is served from.
+//
+// Content-addressed, so publishing a chart never replaces one already served
+// and the path is derivable from a lock without rendering anything.
+func ChartPath(digest, filename string) string {
+	return path.Join("charts", digest, filename)
 }
