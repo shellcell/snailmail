@@ -752,6 +752,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	rpmImage := flags.String("rpm-image", engine.DefaultRPMVerificationImage, "digest-pinned RPM image")
 	apkImage := flags.String("apk-image", engine.DefaultAPKVerificationImage, "digest-pinned Alpine image")
 	imageRegistry := flags.String("image-registry", "", "fetch every verification image from this registry instead")
+	verifyAllVersions := flags.Bool("verify-all-versions", false, "install every retained version with a client, not the newest and oldest of each")
 	maxWorkspaceMiB := flags.Int64("max-workspace-mib", 4096, "maximum Debian verification workspace in MiB")
 	approvalFile := flags.String("approvals", "", "approval evidence file (defaults beside plan)")
 	if err := flags.parse(args); err != nil {
@@ -779,8 +780,9 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	result, err := engine.ApplyWorkspace(ctx, engine.ApplyWorkspaceRequest{
 		Root: flags.Root(), Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
 		DebianImage: *debianImage, HelmImage: *helmImage,
-		RPMImage: *rpmImage, APKImage: *apkImage, MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
-		Hosts: hosts, Blobs: wire.NewBlobResolver(), Gates: gate.NewDefaultEvaluator(resolvedApprovalFile, wire.NewForgeResolver()),
+		RPMImage: *rpmImage, APKImage: *apkImage, VerifyAllVersions: *verifyAllVersions,
+		MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
+		Hosts:             hosts, Blobs: wire.NewBlobResolver(), Gates: gate.NewDefaultEvaluator(resolvedApprovalFile, wire.NewForgeResolver()),
 		Sources: httpsource.New(),
 	})
 	if err != nil {
@@ -1157,6 +1159,7 @@ func runVerifyRPM(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	flags := newCommandFlags("verify rpm", stderr).withJSON()
 	repository := flags.String("repo", "", "generated repository directory")
 	runner := flags.String("runner", "podman", "OCI runner executable")
+	allVersions := flags.Bool("all-versions", false, "install every retained version, not the newest and oldest of each")
 	image := flags.String("image", engine.DefaultRPMVerificationImage, "digest-pinned RPM client image")
 	structuralOnly := flags.Bool("structural-only", false, "verify indexes without invoking dnf")
 	if err := flags.parse(args); err != nil {
@@ -1164,6 +1167,7 @@ func runVerifyRPM(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	result, err := engine.VerifyRPM(ctx, engine.VerifyRPMRequest{
 		Repository: *repository, Runner: *runner, Image: *image, StructuralOnly: *structuralOnly,
+		VerifyAllVersions: *allVersions,
 	})
 	if err != nil {
 		return err
@@ -1186,6 +1190,7 @@ func runVerifyAPK(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	flags := newCommandFlags("verify apk", stderr).withJSON()
 	repository := flags.String("repo", "", "generated repository directory")
 	runner := flags.String("runner", "podman", "OCI runner executable")
+	allVersions := flags.Bool("all-versions", false, "install every retained version, not the newest and oldest of each")
 	image := flags.String("image", engine.DefaultAPKVerificationImage, "digest-pinned Alpine client image")
 	structuralOnly := flags.Bool("structural-only", false, "verify the index without invoking apk")
 	if err := flags.parse(args); err != nil {
@@ -1193,6 +1198,7 @@ func runVerifyAPK(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	}
 	result, err := engine.VerifyAPK(ctx, engine.VerifyAPKRequest{
 		Repository: *repository, Runner: *runner, Image: *image, StructuralOnly: *structuralOnly,
+		VerifyAllVersions: *allVersions,
 	})
 	if err != nil {
 		return err

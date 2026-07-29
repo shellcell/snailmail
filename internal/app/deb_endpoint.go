@@ -30,7 +30,7 @@ import (
 // the host serves is installable", which is the guarantee publication rests on:
 // relative paths inside Packages, the suite layout under dists/, and the
 // keyring apt is told to trust all have to survive the host's URL handling.
-func VerifyDebClientEndpointAccess(ctx context.Context, root string, access host.ClientAccess, runner, image string, maxWorkspaceBytes int64) (buildgraph.RepositoryManifest, int, error) {
+func VerifyDebClientEndpointAccess(ctx context.Context, root string, access host.ClientAccess, runner, image string, maxWorkspaceBytes int64, scope VersionScope) (buildgraph.RepositoryManifest, int, error) {
 	if access.Credential != nil {
 		defer access.Credential.Destroy()
 	}
@@ -94,12 +94,13 @@ func VerifyDebClientEndpointAccess(ctx context.Context, root string, access host
 	// only reachable with host networking. A public endpoint uses the runner's
 	// default network and stays isolated from the host.
 	hostNetwork := isLoopbackHost(endpoint.Hostname())
+	verificationCases = scope.selection(verificationCases, debCompare)
 	if err := verifyCases(ctx, verificationCases, func(caseCtx context.Context, verification domain.VerificationCase) error {
 		return verifyDebEndpointCase(caseCtx, runner, image, access.Endpoint, trust, hostNetwork, workspaceBytes, manifest, verification)
 	}); err != nil {
 		return buildgraph.RepositoryManifest{}, 0, err
 	}
-	return manifest, len(manifest.VerificationCases), nil
+	return manifest, len(verificationCases), nil
 }
 
 // endpointTrust is what apt needs on local disk to trust the endpoint.

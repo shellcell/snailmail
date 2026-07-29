@@ -82,6 +82,10 @@ type VerifyPyPIRequest struct {
 }
 
 type VerifyDebRequest struct {
+	// VerifyAllVersions installs every retained version rather than the
+	// newest and oldest of each package on each architecture. The sample is
+	// the default because the cost of the alternative grows with history.
+	VerifyAllVersions bool
 	Repository        string
 	Runner            string
 	Image             string
@@ -351,7 +355,7 @@ func VerifyDeb(ctx context.Context, request VerifyDebRequest) (VerifyResult, err
 		if maximum == 0 {
 			maximum = 4 << 30
 		}
-		manifest, installed, err = app.VerifyDebClient(ctx, request.Repository, request.Runner, image, maximum)
+		manifest, installed, err = app.VerifyDebClient(ctx, request.Repository, request.Runner, image, maximum, versionScope(request.VerifyAllVersions))
 	}
 	if err != nil {
 		return VerifyResult{}, err
@@ -460,10 +464,14 @@ func VerifyRaw(request VerifyRawRequest) (VerifyResult, error) {
 const DefaultRPMVerificationImage = "docker.io/library/fedora@sha256:f1a3fab47bcb3c3ddf3135d5ee7ba8b7b25f2e809a47440936212a3a50957f3d"
 
 type VerifyRPMRequest struct {
-	Repository     string
-	Runner         string
-	Image          string
-	StructuralOnly bool
+	// VerifyAllVersions installs every retained version rather than the
+	// newest and oldest of each package on each architecture. The sample is
+	// the default because the cost of the alternative grows with history.
+	VerifyAllVersions bool
+	Repository        string
+	Runner            string
+	Image             string
+	StructuralOnly    bool
 }
 
 // VerifyRPM checks a yum repository's indexes, and unless asked for structure
@@ -479,7 +487,7 @@ func VerifyRPM(ctx context.Context, request VerifyRPMRequest) (VerifyResult, err
 		if image == "" {
 			image = DefaultRPMVerificationImage
 		}
-		manifest, installed, err = app.VerifyRPMClient(ctx, request.Repository, request.Runner, image)
+		manifest, installed, err = app.VerifyRPMClient(ctx, request.Repository, request.Runner, image, versionScope(request.VerifyAllVersions))
 	}
 	if err != nil {
 		return VerifyResult{}, err
@@ -501,10 +509,14 @@ func VerifyRPM(ctx context.Context, request VerifyRPMRequest) (VerifyResult, err
 const DefaultAPKVerificationImage = "docker.io/library/alpine@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d"
 
 type VerifyAPKRequest struct {
-	Repository     string
-	Runner         string
-	Image          string
-	StructuralOnly bool
+	// VerifyAllVersions installs every retained version rather than the
+	// newest and oldest of each package on each architecture. The sample is
+	// the default because the cost of the alternative grows with history.
+	VerifyAllVersions bool
+	Repository        string
+	Runner            string
+	Image             string
+	StructuralOnly    bool
 }
 
 // VerifyAPK checks an Alpine repository's index, and unless asked for structure
@@ -520,7 +532,7 @@ func VerifyAPK(ctx context.Context, request VerifyAPKRequest) (VerifyResult, err
 		if image == "" {
 			image = DefaultAPKVerificationImage
 		}
-		manifest, installed, err = app.VerifyAPKClient(ctx, request.Repository, request.Runner, image)
+		manifest, installed, err = app.VerifyAPKClient(ctx, request.Repository, request.Runner, image, versionScope(request.VerifyAllVersions))
 	}
 	if err != nil {
 		return VerifyResult{}, err
@@ -535,4 +547,13 @@ func VerifyAPK(ctx context.Context, request VerifyAPKRequest) (VerifyResult, err
 		InstalledCases: installed,
 		Manifest:       manifest,
 	}, nil
+}
+
+// versionScope turns the flag an operator sets into the policy the verifiers
+// take. Sampling is the default; asking for everything is the deliberate act.
+func versionScope(all bool) app.VersionScope {
+	if all {
+		return app.AllVersions
+	}
+	return app.SampledVersions
 }

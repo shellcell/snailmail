@@ -160,18 +160,21 @@ type RenderStatusResult struct {
 }
 
 type ApplyWorkspaceRequest struct {
-	Root                   string
-	Sources                source.Fetcher
-	Plan                   string
-	now                    time.Time
-	clock                  func() time.Time
-	StructuralOnly         bool
-	Python                 string
-	Runner                 string
-	DebianImage            string
-	HelmImage              string
-	RPMImage               string
-	APKImage               string
+	Root           string
+	Sources        source.Fetcher
+	Plan           string
+	now            time.Time
+	clock          func() time.Time
+	StructuralOnly bool
+	Python         string
+	Runner         string
+	DebianImage    string
+	HelmImage      string
+	RPMImage       string
+	APKImage       string
+	// VerifyAllVersions installs every retained version with a real client
+	// rather than the newest and oldest of each package on each architecture.
+	VerifyAllVersions      bool
 	MaxWorkspaceBytes      int64
 	Hosts                  host.Resolver
 	Blobs                  blob.Resolver
@@ -1284,7 +1287,7 @@ func verifyEndpointClient(ctx context.Context, repository state.Repository, stag
 		if maximum == 0 {
 			maximum = 4 << 30
 		}
-		_, _, err := app.VerifyDebClientEndpointAccess(ctx, staged, access, request.Runner, image, maximum)
+		_, _, err := app.VerifyDebClientEndpointAccess(ctx, staged, access, request.Runner, image, maximum, versionScope(request.VerifyAllVersions))
 		return err
 	case "raw":
 		_, _, err := app.VerifyRawClientEndpointAccess(ctx, staged, access)
@@ -1565,7 +1568,7 @@ func verifyStaged(ctx context.Context, format, repository string, request ApplyW
 		result, err := VerifyPyPI(ctx, VerifyPyPIRequest{Repository: repository, Python: request.Python, StructuralOnly: request.StructuralOnly})
 		return result.Manifest, err
 	case "deb":
-		result, err := VerifyDeb(ctx, VerifyDebRequest{Repository: repository, Runner: request.Runner, Image: request.DebianImage, MaxWorkspaceBytes: request.MaxWorkspaceBytes, StructuralOnly: request.StructuralOnly})
+		result, err := VerifyDeb(ctx, VerifyDebRequest{Repository: repository, Runner: request.Runner, Image: request.DebianImage, MaxWorkspaceBytes: request.MaxWorkspaceBytes, StructuralOnly: request.StructuralOnly, VerifyAllVersions: request.VerifyAllVersions})
 		return result.Manifest, err
 	case "helm":
 		result, err := VerifyHelm(ctx, VerifyHelmRequest{Repository: repository, Runner: request.Runner, Image: request.HelmImage, StructuralOnly: request.StructuralOnly})
@@ -1576,13 +1579,13 @@ func verifyStaged(ctx context.Context, format, repository string, request ApplyW
 	case "rpm":
 		result, err := VerifyRPM(ctx, VerifyRPMRequest{
 			Repository: repository, Runner: request.Runner, Image: request.RPMImage,
-			StructuralOnly: request.StructuralOnly,
+			StructuralOnly: request.StructuralOnly, VerifyAllVersions: request.VerifyAllVersions,
 		})
 		return result.Manifest, err
 	case "apk":
 		result, err := VerifyAPK(ctx, VerifyAPKRequest{
 			Repository: repository, Runner: request.Runner, Image: request.APKImage,
-			StructuralOnly: request.StructuralOnly,
+			StructuralOnly: request.StructuralOnly, VerifyAllVersions: request.VerifyAllVersions,
 		})
 		return result.Manifest, err
 	default:

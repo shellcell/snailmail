@@ -99,7 +99,7 @@ func TestDebEndpointVerificationRejectsUnusableEndpoints(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, _, err := VerifyDebClientEndpointAccess(context.Background(), repository,
-				host.ClientAccess{Endpoint: endpoint}, "docker", debianVerificationImage, 4<<30)
+				host.ClientAccess{Endpoint: endpoint}, "docker", debianVerificationImage, 4<<30, AllVersions)
 			if err == nil {
 				t.Fatalf("endpoint %q was accepted", endpoint)
 			}
@@ -124,7 +124,7 @@ func TestDebEndpointVerificationDetectsServedDrift(t *testing.T) {
 	defer tampered.Close()
 
 	_, _, err := VerifyDebClientEndpointAccess(context.Background(), repository,
-		host.ClientAccess{Endpoint: tampered.URL}, "docker", debianVerificationImage, 4<<30)
+		host.ClientAccess{Endpoint: tampered.URL}, "docker", debianVerificationImage, 4<<30, AllVersions)
 	if err == nil {
 		t.Fatal("a host serving a different Release was accepted")
 	}
@@ -158,7 +158,7 @@ func TestDebEndpointVerificationInstallsOverHTTP(t *testing.T) {
 	// Loopback: the verifier gives the container host networking to reach it.
 	endpoint := "http://" + listener.Addr().String()
 	manifest, installed, err := VerifyDebClientEndpointAccess(context.Background(), repository,
-		host.ClientAccess{Endpoint: endpoint}, runner, debianVerificationImage, 4<<30)
+		host.ClientAccess{Endpoint: endpoint}, runner, debianVerificationImage, 4<<30, AllVersions)
 	if err != nil {
 		t.Fatalf("apt could not install from the served repository: %v", err)
 	}

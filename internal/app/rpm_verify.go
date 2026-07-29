@@ -21,7 +21,7 @@ import (
 // namespace it does not recognise, or a location it resolves differently all
 // produce a tree that looks correct and refuses to install. Only the client
 // settles that.
-func VerifyRPMClient(ctx context.Context, repository, runner, image string) (buildgraph.RepositoryManifest, int, error) {
+func VerifyRPMClient(ctx context.Context, repository, runner, image string, scope VersionScope) (buildgraph.RepositoryManifest, int, error) {
 	release, err := filepath.Abs(repository)
 	if err != nil {
 		return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("resolve repository: %w", err)
@@ -55,12 +55,13 @@ func VerifyRPMClient(ctx context.Context, repository, runner, image string) (bui
 	if !digestPinnedImage(image) {
 		return buildgraph.RepositoryManifest{}, 0, errors.New("a digest-pinned RPM verification image is required")
 	}
-	if err := verifyCases(ctx, manifest.VerificationCases, func(caseCtx context.Context, verification domain.VerificationCase) error {
+	verificationCases := scope.selection(manifest.VerificationCases, rpmCompare)
+	if err := verifyCases(ctx, verificationCases, func(caseCtx context.Context, verification domain.VerificationCase) error {
 		return verifyRPMCase(caseCtx, runner, image, snapshot, verification)
 	}); err != nil {
 		return buildgraph.RepositoryManifest{}, 0, err
 	}
-	return manifest, len(manifest.VerificationCases), nil
+	return manifest, len(verificationCases), nil
 }
 
 func verifyRPMCase(ctx context.Context, runner, image, snapshot string, verification domain.VerificationCase) error {

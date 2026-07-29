@@ -20,7 +20,7 @@ import (
 // refuses anything whose bytes disagree with it. Structural verification cannot
 // reach that: it would need to recompute a hash over a gzip member boundary,
 // which is precisely the thing most likely to be wrong. The client settles it.
-func VerifyAPKClient(ctx context.Context, repository, runner, image string) (buildgraph.RepositoryManifest, int, error) {
+func VerifyAPKClient(ctx context.Context, repository, runner, image string, scope VersionScope) (buildgraph.RepositoryManifest, int, error) {
 	release, err := filepath.Abs(repository)
 	if err != nil {
 		return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("resolve repository: %w", err)
@@ -52,12 +52,13 @@ func VerifyAPKClient(ctx context.Context, repository, runner, image string) (bui
 	if !digestPinnedImage(image) {
 		return buildgraph.RepositoryManifest{}, 0, errors.New("a digest-pinned Alpine verification image is required")
 	}
-	if err := verifyCases(ctx, manifest.VerificationCases, func(caseCtx context.Context, verification domain.VerificationCase) error {
+	verificationCases := scope.selection(manifest.VerificationCases, apkCompare)
+	if err := verifyCases(ctx, verificationCases, func(caseCtx context.Context, verification domain.VerificationCase) error {
 		return verifyAPKCase(caseCtx, runner, image, snapshot, verification)
 	}); err != nil {
 		return buildgraph.RepositoryManifest{}, 0, err
 	}
-	return manifest, len(manifest.VerificationCases), nil
+	return manifest, len(verificationCases), nil
 }
 
 func verifyAPKCase(ctx context.Context, runner, image, snapshot string, verification domain.VerificationCase) error {

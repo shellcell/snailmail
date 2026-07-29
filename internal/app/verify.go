@@ -514,7 +514,7 @@ func redactCredential(value, username, password string) string {
 
 // VerifyDebClient resolves and extracts each planned package version in its own
 // bounded, network-isolated Debian container.
-func VerifyDebClient(ctx context.Context, root, runner, image string, maxWorkspaceBytes int64) (buildgraph.RepositoryManifest, int, error) {
+func VerifyDebClient(ctx context.Context, root, runner, image string, maxWorkspaceBytes int64, scope VersionScope) (buildgraph.RepositoryManifest, int, error) {
 	release, err := filepath.Abs(root)
 	if err != nil {
 		return buildgraph.RepositoryManifest{}, 0, fmt.Errorf("resolve repository: %w", err)
@@ -559,12 +559,13 @@ func VerifyDebClient(ctx context.Context, root, runner, image string, maxWorkspa
 			verificationCases = append(verificationCases, domain.VerificationCase{Architecture: architecture})
 		}
 	}
-	for _, verification := range verificationCases {
-		if err := verifyDebCase(ctx, runner, image, snapshot, workspaceBytes, manifest, verification); err != nil {
-			return buildgraph.RepositoryManifest{}, 0, err
-		}
+	verificationCases = scope.selection(verificationCases, debCompare)
+	if err := verifyCases(ctx, verificationCases, func(caseCtx context.Context, verification domain.VerificationCase) error {
+		return verifyDebCase(caseCtx, runner, image, snapshot, workspaceBytes, manifest, verification)
+	}); err != nil {
+		return buildgraph.RepositoryManifest{}, 0, err
 	}
-	return manifest, len(manifest.VerificationCases), nil
+	return manifest, len(verificationCases), nil
 }
 
 func verifyDebCase(ctx context.Context, runner, image, snapshot string, workspaceBytes int64, manifest buildgraph.RepositoryManifest, verification domain.VerificationCase) error {
