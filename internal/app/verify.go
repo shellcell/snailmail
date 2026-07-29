@@ -1140,6 +1140,12 @@ func verifyHelmStructure(root string, manifest buildgraph.RepositoryManifest) ([
 		if file.Path == "index.yaml" {
 			continue
 		}
+		// Signing material is checked below by rebuilding it, the same way the
+		// Debian path does: the published key and each chart's provenance are
+		// re-applied to the rebuilt tree, which verifies every signature.
+		if strings.HasPrefix(file.Path, "keys/") || strings.HasSuffix(file.Path, helm.ProvenanceSuffix) {
+			continue
+		}
 		parts := strings.Split(file.Path, "/")
 		if len(parts) != 3 || parts[0] != "charts" || parts[1] != file.SHA256 || !helm.IsChartFilename(parts[2]) {
 			return nil, fmt.Errorf("unexpected Helm repository path %q", file.Path)
@@ -1171,6 +1177,48 @@ func verifyHelmStructure(root string, manifest buildgraph.RepositoryManifest) ([
 	expectedArtifact, err := helm.Build(blobs, helm.BuildOptions{GeneratedAt: generatedAt})
 	if err != nil {
 		return nil, fmt.Errorf("rebuild Helm structure: %w", err)
+	}
+	if manifest.Install.SigningKeyPath != "" {
+		if len(manifest.Signatures) == 0 || manifest.Install.SigningFingerprint == "" || path.IsAbs(manifest.Install.SigningKeyPath) ||
+			path.Clean(manifest.Install.SigningKeyPath) != manifest.Install.SigningKeyPath || !strings.HasPrefix(manifest.Install.SigningKeyPath, "keys/") {
+			return nil, errors.New("signed Helm repository has incomplete signature metadata")
+		}
+		keyring, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(manifest.Install.SigningKeyPath)))
+		if err != nil {
+			return nil, fmt.Errorf("read Helm public signing key: %w", err)
+		}
+		provenance := make(map[string][]byte, len(manifest.Signatures))
+		signatureTime, err := time.Parse(time.RFC3339, manifest.Signatures[0].CreatedAt)
+		if err != nil {
+			return nil, errors.New("Helm signature metadata has an invalid creation time")
+		}
+		for _, signature := range manifest.Signatures {
+			if signature.CreatedAt != manifest.Signatures[0].CreatedAt {
+				return nil, errors.New("Helm signature metadata has inconsistent creation times")
+			}
+			if !strings.HasSuffix(signature.Path, helm.ProvenanceSuffix) {
+				return nil, fmt.Errorf("Helm signature at %q is not a provenance file", signature.Path)
+			}
+			content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(signature.Path)))
+			if err != nil {
+				return nil, fmt.Errorf("read Helm provenance %q: %w", signature.Path, err)
+			}
+			provenance[strings.TrimSuffix(signature.Path, helm.ProvenanceSuffix)] = content
+		}
+		activePublic, err := openpgpsigner.ExtractPublicKey(keyring, manifest.Install.SigningFingerprint)
+		if err != nil {
+			return nil, fmt.Errorf("extract active Helm signing key: %w", err)
+		}
+		expectedArtifact, err = helm.ApplySigning(expectedArtifact, helm.SigningMaterial{
+			Fingerprint: manifest.Install.SigningFingerprint, PublicKey: activePublic,
+			PublicKeyring: keyring, KeyringPath: manifest.Install.SigningKeyPath,
+			SignatureTime: signatureTime, Provenance: provenance,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("verify Helm signatures: %w", err)
+		}
+	} else if len(manifest.Signatures) != 0 {
+		return nil, errors.New("unsigned Helm repository contains signature metadata")
 	}
 	_, expectedManifest, err := buildgraph.Finalize(expectedArtifact, generatedAt)
 	if err != nil {

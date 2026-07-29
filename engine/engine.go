@@ -240,7 +240,14 @@ func buildDeb(ctx context.Context, request BuildDebRequest, transform func(domai
 	}, nil
 }
 
+// transform is where signing happens, for the same reason the Debian path takes
+// one: the signatures have to be part of the tree before it is finalized, or
+// the manifest would describe a repository different from the one published.
 func BuildHelm(ctx context.Context, request BuildHelmRequest) (BuildResult, error) {
+	return buildHelm(ctx, request, nil)
+}
+
+func buildHelm(ctx context.Context, request BuildHelmRequest, transform func(domain.RepositoryArtifact) (domain.RepositoryArtifact, error)) (BuildResult, error) {
 	if request.Input == "" || request.Output == "" {
 		return BuildResult{}, fmt.Errorf("input and output directories are required")
 	}
@@ -274,6 +281,12 @@ func BuildHelm(ctx context.Context, request BuildHelmRequest) (BuildResult, erro
 	}, snapshot.Blobs)
 	if err != nil {
 		return BuildResult{}, err
+	}
+	if transform != nil {
+		artifact, err = transform(artifact)
+		if err != nil {
+			return BuildResult{}, err
+		}
 	}
 	artifact, manifest, err := buildgraph.Finalize(artifact, generatedAt)
 	if err != nil {

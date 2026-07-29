@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/state"
 )
@@ -158,7 +159,7 @@ func TestFinalYankBuildsEveryEmptyRepositoryFormat(t *testing.T) {
 			setup := SetupRepositoryRequest{
 				Root: root, Name: "packages", Format: format, HostType: "local", Output: "public/packages", Visibility: "public",
 			}
-			if format == "deb" {
+			if selected, err := formats.For(format); err == nil && selected.ImplementsSigning() {
 				setup.AllowUnsigned = true
 			}
 			if err := SetupRepository(setup); err != nil {

@@ -143,7 +143,7 @@ func TestAdoptArtifactRejectsWrongPinWithoutMutation(t *testing.T) {
 	if err := InitWorkspace(InitWorkspaceRequest{Root: root, Name: "adopt-pin"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := SetupRepository(SetupRepositoryRequest{Root: root, Name: "charts", Format: "helm", HostType: "local", Output: "public/charts", Visibility: "public"}); err != nil {
+	if err := SetupRepository(SetupRepositoryRequest{Root: root, Name: "charts", Format: "helm", HostType: "local", Output: "public/charts", Visibility: "public", AllowUnsigned: true}); err != nil {
 		t.Fatal(err)
 	}
 	origin := "https://downloads.example/demo-1.2.3.tgz"

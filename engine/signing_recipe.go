@@ -11,6 +11,7 @@ import (
 
 	"github.com/shellcell/snailmail/formats/apk"
 	"github.com/shellcell/snailmail/formats/deb"
+	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/rpm"
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/state"
@@ -47,7 +48,11 @@ type signingOutput struct {
 // signingShapeFor describes where a format's signatures go and what they are
 // made over, without the payload. The shape follows from the repository alone,
 // so a plan can be checked against it before anything is rebuilt.
-func signingShapeFor(repository state.Repository) (signingRecipe, error) {
+// charts is the set of chart archives a Helm repository publishes, empty for
+// every other format. Helm signs one provenance file per chart rather than one
+// document per repository, so its shape is the only one that does not follow
+// from the repository's configuration alone.
+func signingShapeFor(repository state.Repository, charts []string) (signingRecipe, error) {
 	switch repository.Format {
 	case "deb":
 		suite := path.Join("dists", repository.Suite)
@@ -70,6 +75,20 @@ func signingShapeFor(repository state.Repository) (signingRecipe, error) {
 			return signingRecipe{}, errors.New("an Alpine repository must serve at least one architecture to be signed")
 		}
 		return signingRecipe{payloadID: "apk-index", outputs: outputs}, nil
+	case "helm":
+		// One provenance file per chart, alongside the archive it covers, which
+		// is where `helm verify` and `helm install --verify` look for it.
+		outputs := make([]signingOutput, 0, len(charts))
+		for _, chart := range charts {
+			outputs = append(outputs, signingOutput{
+				id: "helm-provenance-" + chart, scheme: signer.SchemeOpenPGPCleartext,
+				path: chart + helm.ProvenanceSuffix,
+			})
+		}
+		// A repository with no charts signs nothing. That is not a
+		// misconfiguration: a signed repository that has published nothing yet
+		// is the ordinary state of one just set up.
+		return signingRecipe{payloadID: "helm-provenance", outputs: outputs}, nil
 	case "rpm":
 		return signingRecipe{
 			payloadID: "rpm-repomd",
@@ -83,8 +102,8 @@ func signingShapeFor(repository state.Repository) (signingRecipe, error) {
 }
 
 // signingRecipeFor is the shape with the bytes those signatures must cover.
-func signingRecipeFor(repository state.Repository, artifact domain.RepositoryArtifact) (signingRecipe, error) {
-	recipe, err := signingShapeFor(repository)
+func signingRecipeFor(repository state.Repository, artifact domain.RepositoryArtifact, sources map[string]string) (signingRecipe, error) {
+	recipe, err := signingShapeFor(repository, helmChartPaths(artifact))
 	if err != nil {
 		return signingRecipe{}, err
 	}
@@ -103,6 +122,15 @@ func signingRecipeFor(repository state.Repository, artifact domain.RepositoryArt
 			return signingRecipe{}, err
 		}
 		for index := range recipe.outputs {
+			recipe.outputs[index].payload = payload
+		}
+	case "helm":
+		for index, output := range recipe.outputs {
+			chart := strings.TrimSuffix(output.path, helm.ProvenanceSuffix)
+			payload, err := helmProvenancePayload(artifact, chart, sources)
+			if err != nil {
+				return signingRecipe{}, err
+			}
 			recipe.outputs[index].payload = payload
 		}
 	case "apk":
@@ -163,6 +191,19 @@ func applyFormatSigning(repository state.Repository, artifact domain.RepositoryA
 			ArmorPath:     strings.TrimSuffix(repository.SigningKeyring, ".gpg") + ".asc",
 			SignatureTime: material.signatureTime, Signature: material.contents[0],
 		})
+	case "helm":
+		// One provenance file per chart, keyed by the chart it covers: the
+		// output path is the chart's path with the suffix, so removing it
+		// recovers which chart each signature belongs to.
+		provenance := make(map[string][]byte, len(material.contents))
+		for index, content := range material.contents {
+			provenance[strings.TrimSuffix(material.outputPaths[index], helm.ProvenanceSuffix)] = content
+		}
+		return helm.ApplySigning(artifact, helm.SigningMaterial{
+			Fingerprint: key.Fingerprint, PublicKey: material.publicBinary,
+			PublicKeyring: material.publicKeyring, KeyringPath: repository.SigningKeyring,
+			SignatureTime: material.signatureTime, Provenance: provenance,
+		})
 	case "apk":
 		signatures := make(map[string][]byte, len(material.contents))
 		for index, content := range material.contents {
@@ -207,9 +248,10 @@ var knownSchemes = map[string]bool{
 }
 
 var knownPayloadIDs = map[string]bool{
-	"deb-release": true,
-	"rpm-repomd":  true,
-	"apk-index":   true,
+	"deb-release":     true,
+	"rpm-repomd":      true,
+	"apk-index":       true,
+	"helm-provenance": true,
 }
 
 // inspectPublicForms reads a committed public key, whichever kind it is.

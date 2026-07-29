@@ -84,10 +84,25 @@ func InstallSteps(format string, repository Repository) []string {
 			"sudo apk add <package>",
 		}
 	case "helm":
+		name := listName(repository)
+		if repository.Signing == nil {
+			return []string{
+				"# This repository is unsigned; nothing verifies the charts you install.",
+				"helm repo add " + name + " " + endpoint,
+				"helm repo update",
+				"helm install <release> " + name + "/<chart>",
+			}
+		}
+		// helm reads a binary OpenPGP keyring from a file it is pointed at,
+		// rather than a system trust store, so the key is downloaded and named
+		// on the command that uses it.
+		keyring := "~/.snailmail/" + name + ".gpg"
 		return []string{
-			"helm repo add " + listName(repository) + " " + endpoint,
+			"mkdir -p ~/.snailmail",
+			"curl -fsSL " + endpoint + "/" + repository.Signing.KeyPath + " -o " + keyring,
+			"helm repo add " + name + " " + endpoint,
 			"helm repo update",
-			"helm install <release> " + listName(repository) + "/<chart>",
+			"helm install <release> " + name + "/<chart> --verify --keyring " + keyring,
 		}
 	case "pypi":
 		return []string{"pip install --index-url " + endpoint + "/simple <package>"}

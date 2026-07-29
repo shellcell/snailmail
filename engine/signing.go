@@ -27,7 +27,10 @@ type deploymentSigningState struct {
 	minimumRefresh int64
 }
 
-func applyRepositorySigning(ctx context.Context, root string, repository state.Repository, keys map[string]state.SigningKey, artifact domain.RepositoryArtifact, signatureTime time.Time, planned []state.PlanSigning, resolver signer.Resolver) (domain.RepositoryArtifact, []state.PlanSigning, error) {
+// sources maps an artifact digest to where its bytes are stored. Only Helm
+// needs it: its signatures are made over documents built from each chart's
+// content, where every other format signs an index the render already holds.
+func applyRepositorySigning(ctx context.Context, root string, repository state.Repository, keys map[string]state.SigningKey, artifact domain.RepositoryArtifact, signatureTime time.Time, planned []state.PlanSigning, resolver signer.Resolver, sources map[string]string) (domain.RepositoryArtifact, []state.PlanSigning, error) {
 	activeKeyName, trustedKeyNames, rotationPhase, minimumRefresh, err := repositorySigningState(repository)
 	if err != nil {
 		return domain.RepositoryArtifact{}, nil, err
@@ -83,9 +86,14 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 	if signatureTime.Before(binaryIdentity.CreatedAt) || !signatureTime.Before(binaryIdentity.ExpiresAt) {
 		return domain.RepositoryArtifact{}, nil, errors.New("signature time is outside signing key validity")
 	}
-	recipe, err := signingRecipeFor(repository, artifact)
+	recipe, err := signingRecipeFor(repository, artifact, sources)
 	if err != nil {
 		return domain.RepositoryArtifact{}, nil, err
+	}
+	if len(recipe.outputs) == 0 {
+		// A signed repository that has published nothing yet has no document to
+		// sign. That is the ordinary state of one just set up, not an error.
+		return artifact, nil, nil
 	}
 	release := recipe.outputs[0].payload
 	var resolved *state.PlanSigning

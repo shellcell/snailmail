@@ -1359,7 +1359,7 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		if !selected.ImplementsSigning() {
 			return materializeLockedArtifact(ctx, output, generatedAt, artifact, sources)
 		}
-		artifact, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers)
+		artifact, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers, sources)
 		if err != nil {
 			return BuildResult{}, err
 		}
@@ -1387,14 +1387,25 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	case "deb":
 		var resolved []state.PlanSigning
 		result, err := buildDeb(ctx, BuildDebRequest{Input: input, Output: output, Suite: repository.Suite, Component: repository.Component, Architectures: repository.Architectures, GeneratedAt: generatedAt, Listing: listingView, Published: published}, func(artifact domain.RepositoryArtifact) (domain.RepositoryArtifact, error) {
-			signed, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers)
+			signed, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers, lockedSources)
 			resolved = signing
 			return signed, err
 		})
 		result.Signing = resolved
 		return result, err
 	case "helm":
-		return BuildHelm(ctx, BuildHelmRequest{Input: input, Output: output, GeneratedAt: generatedAt, Listing: listingView, Published: published})
+		var resolvedHelm []state.PlanSigning
+		helmResult, err := buildHelm(ctx, BuildHelmRequest{Input: input, Output: output, GeneratedAt: generatedAt, Listing: listingView, Published: published},
+			func(artifact domain.RepositoryArtifact) (domain.RepositoryArtifact, error) {
+				if len(repository.SigningKeys) == 0 {
+					return artifact, nil
+				}
+				signed, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers, lockedSources)
+				resolvedHelm = signing
+				return signed, err
+			})
+		helmResult.Signing = resolvedHelm
+		return helmResult, err
 	case "raw", "rpm", "apk":
 		return renderFromBlobs(lockedBlobs, lockedSources)
 	default:
@@ -1432,8 +1443,6 @@ func requireSigningSupport(selected formats.Format, repository state.Repository,
 	switch selected.Name() {
 	case "pypi":
 		return errors.New("PyPI repository cannot contain repository signing effects")
-	case "helm":
-		return errors.New("Helm repository signing is not implemented")
 	case "raw":
 		return errors.New("raw repositories have no signing scheme a client would check")
 	}
@@ -2169,6 +2178,26 @@ func (preparation *applyPreparation) prepareRepository(planned state.PlanReposit
 	if !exists || repository.Format != planned.Format || repository.Gate != planned.Gate || !reflect.DeepEqual(repository.ApprovalKeys, planned.ApprovalKeys) || len(planned.Signing) > 1 || (len(planned.Signing) == 0) != (len(repository.SigningKeys) == 0) {
 		return applyRepository{}, fmt.Errorf("stale plan: repository %q configuration changed", planned.Name)
 	}
+	// The lock is read before the signing shape is checked, because one format's
+	// shape depends on it: Helm signs a provenance file per chart, and which
+	// charts a repository publishes is desired state rather than configuration.
+	// The lock is reviewed and committed like the rest of it, so deriving the
+	// shape from it needs no rebuilt tree — only this ordering.
+	lockPath, err := state.WorkspacePath(preparation.root, repository.Lock)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	lockDigest, err := state.HashFile(lockPath)
+	if err != nil || lockDigest != planned.LockSHA256 {
+		return applyRepository{}, fmt.Errorf("stale plan: repository %q lock changed", planned.Name)
+	}
+	lock, err := state.LoadLock(preparation.root, repository)
+	if err != nil {
+		return applyRepository{}, err
+	}
+	if err := state.ValidateLock(lock, planned.Name, repository.Format); err != nil {
+		return applyRepository{}, err
+	}
 	activeSigningKey, _, _, _, signingStateErr := repositorySigningState(repository)
 	if signingStateErr != nil {
 		return applyRepository{}, signingStateErr
@@ -2185,9 +2214,10 @@ func (preparation *applyPreparation) prepareRepository(planned state.PlanReposit
 		if err != nil || preparation.expiresAt.After(keyExpiresAt) {
 			return applyRepository{}, fmt.Errorf("repository %q plan expires after its signing key", planned.Name)
 		}
-		// The repository is known here even though its tree is not, and the
-		// shape a format signs follows from the repository alone.
-		shape, err := signingShapeFor(repository)
+		// The tree has not been built here. The shape is still knowable: it
+		// follows from the repository's configuration and, for Helm, from the
+		// charts its lock says are published.
+		shape, err := signingShapeFor(repository, helmChartPathsFromLock(repository, lock))
 		if err != nil {
 			return applyRepository{}, fmt.Errorf("plan repository %q: %w", planned.Name, err)
 		}
@@ -2218,21 +2248,6 @@ func (preparation *applyPreparation) prepareRepository(planned state.PlanReposit
 	if capabilities.FaithfulPreview != planned.FaithfulPreview || capabilities.ConditionalCommit != planned.ConditionalCommit || capabilities.ConditionalRestore != planned.ConditionalRestore ||
 		capabilities.PrivateRead != planned.PrivateRead || capabilities.CredentialBrokerIdentity != planned.CredentialBrokerIdentity {
 		return applyRepository{}, fmt.Errorf("stale plan: repository %q host capabilities changed", planned.Name)
-	}
-	lockPath, err := state.WorkspacePath(preparation.root, repository.Lock)
-	if err != nil {
-		return applyRepository{}, err
-	}
-	lockDigest, err := state.HashFile(lockPath)
-	if err != nil || lockDigest != planned.LockSHA256 {
-		return applyRepository{}, fmt.Errorf("stale plan: repository %q lock changed", planned.Name)
-	}
-	lock, err := state.LoadLock(preparation.root, repository)
-	if err != nil {
-		return applyRepository{}, err
-	}
-	if err := state.ValidateLock(lock, planned.Name, repository.Format); err != nil {
-		return applyRepository{}, err
 	}
 	ledger, err := state.LoadLedgerHistory(preparation.root, planned.Name)
 	if err != nil {

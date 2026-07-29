@@ -27,7 +27,7 @@ func TestCheckWorkspaceAuditsPlacedAndUnplacedArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, format := range []string{"pypi", "deb", "helm"} {
-		setup := SetupRepositoryRequest{Root: root, Name: format, Format: format, HostType: "local", Output: "public/" + format, Visibility: "public"}
+		setup := SetupRepositoryRequest{Root: root, Name: format, Format: format, HostType: "local", Output: "public/" + format, Visibility: "public", AllowUnsigned: true}
 		if format == "deb" {
 			setup.AllowUnsigned = true
 		}

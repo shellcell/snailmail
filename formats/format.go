@@ -328,9 +328,13 @@ func (helmFormat) SupportsDistros() bool              { return false }
 
 // Helm signs with a per-chart .prov file, which is not yet implemented.
 // Helm defines .prov signing, which is not produced here.
-func (helmFormat) SigningAlgorithm() string { return "" }
+func (helmFormat) SigningAlgorithm() string { return signer.AlgorithmOpenPGPRSA4096 }
 
-func (helmFormat) ImplementsSigning() bool         { return false }
+func (helmFormat) ImplementsSigning() bool { return true }
+
+// A Helm signature is a provenance file beside the chart it covers, at a
+// content-addressed path nothing else ever writes. Only index.yaml is replaced
+// on a publication, so it remains the one path whose switch has to be atomic.
 func (helmFormat) CommitPaths(Repository) []string { return []string{"index.yaml"} }
 func (helmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
 	artifact, err := helm.Build(blobs, helm.BuildOptions{GeneratedAt: options.GeneratedAt})

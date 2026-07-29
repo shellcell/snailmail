@@ -1797,7 +1797,13 @@ func initializeRepository(t *testing.T, root, format string) {
 	}
 	request := SetupRepositoryRequest{Root: root, Name: format, Format: format, Output: filepath.ToSlash(filepath.Join("public", format))}
 	if format == "deb" {
-		request.Suite, request.Component, request.Architectures, request.AllowUnsigned = "stable", "main", []string{"amd64"}, true
+		request.Suite, request.Component, request.Architectures = "stable", "main", []string{"amd64"}
+	}
+	// Every format that can be signed refuses to be set up unsigned by accident.
+	// These fixtures are about reconciliation rather than signing, so they take
+	// the opt-out explicitly — which is the same thing an operator must do.
+	if selected, err := formats.For(format); err == nil && selected.ImplementsSigning() {
+		request.AllowUnsigned = true
 	}
 	if err := SetupRepository(request); err != nil {
 		t.Fatal(err)
