@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/shellcell/snailmail/blob"
 	"github.com/shellcell/snailmail/formats"
@@ -388,6 +389,7 @@ func validateLockedBlobOpenContext(ctx context.Context, file *os.File, pathInfo 
 	}
 	validated := domain.Blob{
 		Filename: locked.Filename,
+		Added:    parseLockTime(locked.Added),
 		Size:     size,
 		MD5:      hex.EncodeToString(md5Hash.Sum(nil)),
 		SHA1:     hex.EncodeToString(sha1Hash.Sum(nil)),
@@ -455,6 +457,24 @@ func randomCacheName() (string, error) {
 	}
 	return ".fetch-" + hex.EncodeToString(value[:]), nil
 }
+
+// parseLockTime reads a recorded timestamp, treating an unreadable one as
+// absent: the time is presentation, and a listing that refused to render
+// because a date was malformed would be worse than one that omits it.
+func parseLockTime(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed.UTC()
+}
+
+// LockTime formats an instant the way the lock records one. It exists so the
+// two commands that add artifacts agree on the format the reader parses back.
+func LockTime(at time.Time) string { return at.UTC().Format(time.RFC3339) }
 
 func ToLockedBlob(blob domain.Blob) LockedBlob {
 	return LockedBlob{

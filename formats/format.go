@@ -96,6 +96,14 @@ type RepositorySigning struct {
 // architecture matrix. Making the set explicit is what keeps a build a pure
 // function of declared inputs rather than of ambient state.
 type BuildOptions struct {
+	// Published maps an artifact digest to when it was locked.
+	//
+	// It exists because three formats are rebuilt by scanning a directory of
+	// materialized files rather than from the lock, and a file on disk cannot
+	// say when it was published. The map carries that one fact past the rescan;
+	// formats built from the locked blobs directly read it off the blob instead.
+	Published map[string]time.Time
+
 	Repository  Repository
 	GeneratedAt time.Time
 }
@@ -234,7 +242,7 @@ func (pypiFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.Repos
 	if err != nil {
 		return domain.RepositoryArtifact{}, err
 	}
-	return withListing(artifact, "pypi", options, blobs)
+	return AppendListing(artifact, "pypi", options, blobs)
 }
 
 type debFormat struct{}
@@ -292,7 +300,7 @@ func (debFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.Reposi
 	if err != nil {
 		return domain.RepositoryArtifact{}, err
 	}
-	return withListing(artifact, "deb", options, blobs)
+	return AppendListing(artifact, "deb", options, blobs)
 }
 
 type helmFormat struct{}
@@ -329,7 +337,7 @@ func (helmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.Repos
 	if err != nil {
 		return domain.RepositoryArtifact{}, err
 	}
-	return withListing(artifact, "helm", options, blobs)
+	return AppendListing(artifact, "helm", options, blobs)
 }
 
 // Compile-time proof that every registered value satisfies the interface.
@@ -382,7 +390,7 @@ func (rawFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.Reposi
 	if err != nil {
 		return domain.RepositoryArtifact{}, err
 	}
-	return withListing(artifact, "raw", options, blobs)
+	return AppendListing(artifact, "raw", options, blobs)
 }
 
 // rpmFormat serves RPM packages through a yum/dnf repository.
@@ -428,7 +436,7 @@ func (rpmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.Reposi
 	if err != nil {
 		return domain.RepositoryArtifact{}, err
 	}
-	return withListing(artifact, "rpm", options, blobs)
+	return AppendListing(artifact, "rpm", options, blobs)
 }
 
 // apkFormat serves Alpine packages through an APKINDEX repository.
@@ -481,5 +489,5 @@ func (apkFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.Reposi
 	if err != nil {
 		return domain.RepositoryArtifact{}, err
 	}
-	return withListing(artifact, "apk", options, blobs)
+	return AppendListing(artifact, "apk", options, blobs)
 }

@@ -95,6 +95,9 @@ func verifyAPKCase(ctx context.Context, runner, image, snapshot string, verifica
 	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()
 	if err != nil {
+		if registryUnavailable(output) {
+			return fmt.Errorf("%w: %s", ErrVerificationImageUnavailable, strings.TrimSpace(string(output)))
+		}
 		if foreignPlatformUnsupported(output) {
 			return fmt.Errorf("%w: verifying %s needs QEMU and binfmt_misc registered for it",
 				ErrForeignPlatformUnsupported, verification.Architecture)
@@ -134,8 +137,11 @@ func apkOCIPlatform(architecture string) (string, error) {
 const apkVerificationScript = `
 echo /target/repo > /tmp/repositories
 test -n "$SNAILMAIL_PACKAGE"
+# The request is pinned to the version under verification. Asking for the bare
+# name installs whatever is newest, which silently verifies the wrong package as
+# soon as the repository carries more than one version of it.
 apk --repositories-file /tmp/repositories --allow-untrusted --no-cache \
-    add "$SNAILMAIL_PACKAGE" >/dev/null
+    add "${SNAILMAIL_PACKAGE}=${SNAILMAIL_VERSION}" >/dev/null
 # The installed version must be the one the index advertised, or apk resolved
 # something other than what was published. "apk info -v" with a package name
 # prints its description rather than its version; with no name it lists every

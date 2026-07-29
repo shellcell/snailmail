@@ -47,15 +47,28 @@ button.copy {
 }
 button.copy:hover { border-color: var(--muted); }
 .snippet button.copy { position: absolute; top: .6rem; right: .6rem; }
+nav { margin-bottom: 1.25rem; font-size: .9rem; }
+nav a { color: var(--muted); text-decoration: none; }
+nav a:hover { color: var(--fg); text-decoration: underline; }
+/* The digest column is 64 characters wide, so the table scrolls inside its own
+   box rather than pushing the page sideways. */
+.table-scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
 th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line); }
-th { cursor: pointer; user-select: none; white-space: nowrap; font-weight: 600; }
-th::after { content: " \2195"; opacity: .35; }
+th { user-select: none; white-space: nowrap; font-weight: 600; }
+th[data-column] { cursor: pointer; }
+th[data-column]::after { content: " \2195"; opacity: .35; }
 th[data-order="asc"]::after { content: " \2191"; opacity: .9; }
 th[data-order="desc"]::after { content: " \2193"; opacity: .9; }
 /* Numbers align on their last digit so sizes compare down the column. */
 td.size { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-td.digest button { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+td.when { white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--muted); }
+td.when .unknown { opacity: .6; }
+/* The full digest is shown; it wraps rather than being cut off, because a
+   truncated hash cannot be compared against anything. */
+td.digest { white-space: nowrap; }
+td.digest code { font-size: .78em; color: var(--muted); margin-right: .5rem; }
+td.link { white-space: nowrap; }
 code.shell { display: block; }
 /* Shallow shell colouring: enough to find the command and its arguments. */
 .s-comment { color: var(--muted); font-style: italic; }
@@ -63,8 +76,26 @@ code.shell { display: block; }
 .s-flag    { color: var(--flag); }
 .s-string  { color: var(--string); }
 .empty { color: var(--muted); }
+.muted { color: var(--muted); font-weight: 400; font-size: .85em; }
+/* The matrix reads down a column as much as across a row, so the package name
+   stays put while the versions scroll. */
+td.tool { font-weight: 600; }
+td.version a { text-decoration: none; border-bottom: 1px solid var(--line); }
+td.absent { color: var(--muted); opacity: .5; }
+#matrix th a { text-decoration: none; }
+ul.repositories { list-style: none; padding: 0; }
+ul.repositories li { padding: .35rem 0; border-bottom: 1px solid var(--line); }
+.badge {
+  font-size: .72rem; text-transform: uppercase; letter-spacing: .04em;
+  border: 1px solid currentColor; border-radius: 999px; padding: .05rem .45rem;
+}
+.badge.signed { color: var(--ok); }
+.badge.unsigned { color: var(--warn); }
 footer { margin-top: 2.5rem; font-size: .85rem; color: var(--muted); }
 a { color: inherit; }
+/* On a narrow screen the digest is the first thing to go: it is the widest
+   column and the least likely to be read on a phone. */
+@media (max-width: 60rem) { td.digest code { display: none; } }
 @media (max-width: 34rem) { th:nth-child(3), td:nth-child(3) { display: none; } }`
 
 // pageScript adds sorting and copying. The page is complete without it: every

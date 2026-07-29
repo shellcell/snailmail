@@ -60,6 +60,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runCheck(ctx, args[1:], stdout, stderr)
 	case "status":
 		return runStatus(ctx, args[1:], stdout, stderr)
+	case "site":
+		return runSite(ctx, args[1:], stdout, stderr)
 	case "doctor":
 		return runDoctor(ctx, args[1:], stdout, stderr)
 	case "adopt":
@@ -514,6 +516,29 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	if len(result.Findings) != 0 {
 		return fmt.Errorf("check found %d unavailable or changed %s", len(result.Findings), plural(len(result.Findings), "artifact", "artifacts"))
 	}
+	return nil
+}
+
+func runSite(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := newCommandFlags("site", stderr).withWorkspace()
+	title := flags.String("title", "", "page title (defaults to the workspace name)")
+	description := flags.String("description", "", "one line shown under the title")
+	output := flags.String("output", "", "where to write the page (defaults to the directory the repositories share)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: snailmail site [--workspace DIR] [--title TITLE] [--description TEXT] [--output PATH]")
+	}
+	result, err := engine.SiteIndex(ctx, engine.SiteIndexRequest{
+		Root: flags.Root(), Title: *title, Description: *description, Output: *output,
+	})
+	if err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  wrote %s: %d packages across %d repositories\n",
+		result.Path, result.Packages, result.Repositories)
 	return nil
 }
 
@@ -1225,7 +1250,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR")
-	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]")
+	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]")
 	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")

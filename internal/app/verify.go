@@ -625,6 +625,9 @@ fi
 	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()
 	if err != nil {
+		if registryUnavailable(output) {
+			return fmt.Errorf("%w: %s", ErrVerificationImageUnavailable, strings.TrimSpace(string(output)))
+		}
 		if foreignPlatformUnsupported(output) {
 			return fmt.Errorf("%w: verifying %s needs QEMU and binfmt_misc registered for it",
 				ErrForeignPlatformUnsupported, verification.Architecture)

@@ -428,8 +428,18 @@ func validateRepositoryHost(name string, repository Repository) error {
 		if err := validateRelativePath(repository.Host.Path); err != nil {
 			return fmt.Errorf("repository %q local host path: %w", name, err)
 		}
-		if repository.Host.Bucket != "" || repository.Host.Prefix != "" || repository.Host.Endpoint != "" || repository.Host.CanonicalEndpoint != "" || repository.Host.ReadAuth != "" || repository.Host.CredentialBroker != "" || repository.Host.Repository != "" || repository.Host.PreviewRepository != "" || repository.Host.PreviewEndpoint != "" || repository.Host.Branch != "" || repository.Host.PreviewBranch != "" {
+		if repository.Host.Bucket != "" || repository.Host.Prefix != "" || repository.Host.Endpoint != "" || repository.Host.ReadAuth != "" || repository.Host.CredentialBroker != "" || repository.Host.Repository != "" || repository.Host.PreviewRepository != "" || repository.Host.PreviewEndpoint != "" || repository.Host.Branch != "" || repository.Host.PreviewBranch != "" {
 			return fmt.Errorf("repository %q local host has S3-only configuration", name)
+		}
+		// A local repository is written to a directory that something else
+		// serves, so snailmail cannot know its URL — but the operator does, and
+		// without it the published listing has no install instructions to show
+		// and clients get no address to point at. It is documentation only:
+		// nothing publishes to it, so it is validated and otherwise unused.
+		if repository.Host.CanonicalEndpoint != "" {
+			if err := validateHTTPURL(repository.Host.CanonicalEndpoint); err != nil {
+				return fmt.Errorf("repository %q base URL: %w", name, err)
+			}
 		}
 	case "s3":
 		if err := requireHostServesFormat(name, repository); err != nil {

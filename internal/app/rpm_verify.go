@@ -101,6 +101,9 @@ func verifyRPMCase(ctx context.Context, runner, image, snapshot string, verifica
 	command.Env = runnerEnvironment()
 	output, err := command.CombinedOutput()
 	if err != nil {
+		if registryUnavailable(output) {
+			return fmt.Errorf("%w: %s", ErrVerificationImageUnavailable, strings.TrimSpace(string(output)))
+		}
 		if foreignPlatformUnsupported(output) {
 			return fmt.Errorf("%w: verifying %s needs QEMU and binfmt_misc registered for it",
 				ErrForeignPlatformUnsupported, verification.Architecture)
@@ -149,7 +152,9 @@ metadata_expire=0
 REPO
 dnf --quiet --disablerepo='*' --enablerepo=snailmail makecache >/dev/null
 test -n "$SNAILMAIL_PACKAGE"
-dnf --quiet --disablerepo='*' --enablerepo=snailmail install -y "$SNAILMAIL_PACKAGE" >/dev/null
+# Pinned to the version under verification: the bare name resolves to whatever
+# is newest, which verifies the wrong package once the repository carries two.
+dnf --quiet --disablerepo='*' --enablerepo=snailmail install -y "${SNAILMAIL_PACKAGE}-${SNAILMAIL_VERSION}" >/dev/null
 # The installed version must be the one the index advertised, or the client
 # resolved something other than what was published.
 installed=$(rpm -q --qf '%{EPOCH}:%{VERSION}-%{RELEASE}' "$SNAILMAIL_PACKAGE")

@@ -1,5 +1,7 @@
 package domain
 
+import "time"
+
 // PackageFacts are facts read from package bytes rather than supplied by a
 // repository manifest.
 type PackageFacts struct {
@@ -20,7 +22,12 @@ type Blob struct {
 	MD5      string
 	SHA1     string
 	SHA256   string
-	Facts    PackageFacts
+	// Added is when this artifact was first locked, zero when the lock predates
+	// the field. It is carried alongside the content rather than derived at
+	// build time so a listing can report when a package was published instead of
+	// when the page happened to be regenerated.
+	Added time.Time
+	Facts PackageFacts
 }
 
 // File describes one immutable file in a generated repository. Exactly one of

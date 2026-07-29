@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/formats/apk"
 	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/formats/helm"
@@ -25,6 +26,12 @@ const DefaultDebianVerificationImage = "docker.io/library/debian@sha256:7b140f37
 const DefaultHelmVerificationImage = "docker.io/alpine/helm@sha256:e7ecbf4a200dea73d64bfb8cb0936829164945f2b4d02a0274093073ee8d264f"
 
 type BuildPyPIRequest struct {
+	// Listing describes the repository for its browsable page. Zero when a
+	// build is invoked outside a workspace, where no name or endpoint exists.
+	Listing formats.Repository
+	// Published maps an artifact digest to when it was locked, for the
+	// listing: this path rebuilds by scanning files, which cannot say.
+	Published   map[string]time.Time
 	Input       string
 	Output      string
 	GeneratedAt time.Time
@@ -42,6 +49,12 @@ type BuildResult struct {
 }
 
 type BuildDebRequest struct {
+	// Listing describes the repository for its browsable page. Zero when a
+	// build is invoked outside a workspace, where no name or endpoint exists.
+	Listing formats.Repository
+	// Published maps an artifact digest to when it was locked, for the
+	// listing: this path rebuilds by scanning files, which cannot say.
+	Published     map[string]time.Time
 	Input         string
 	Output        string
 	Suite         string
@@ -51,6 +64,12 @@ type BuildDebRequest struct {
 }
 
 type BuildHelmRequest struct {
+	// Listing describes the repository for its browsable page. Zero when a
+	// build is invoked outside a workspace, where no name or endpoint exists.
+	Listing formats.Repository
+	// Published maps an artifact digest to when it was locked, for the
+	// listing: this path rebuilds by scanning files, which cannot say.
+	Published   map[string]time.Time
 	Input       string
 	Output      string
 	GeneratedAt time.Time
@@ -122,6 +141,13 @@ func BuildPyPI(ctx context.Context, request BuildPyPIRequest) (BuildResult, erro
 	if generatedAt.IsZero() {
 		generatedAt = reproducibleEpoch
 	}
+	artifact, err = formats.AppendListing(artifact, "pypi", formats.BuildOptions{
+		Repository: request.Listing, GeneratedAt: generatedAt,
+		Published: request.Published,
+	}, snapshot.Blobs)
+	if err != nil {
+		return BuildResult{}, err
+	}
 	artifact, manifest, err := buildgraph.Finalize(artifact, generatedAt)
 	if err != nil {
 		return BuildResult{}, err
@@ -180,6 +206,13 @@ func buildDeb(ctx context.Context, request BuildDebRequest, transform func(domai
 	if err != nil {
 		return BuildResult{}, err
 	}
+	artifact, err = formats.AppendListing(artifact, "deb", formats.BuildOptions{
+		Repository: request.Listing, GeneratedAt: generatedAt,
+		Published: request.Published,
+	}, snapshot.Blobs)
+	if err != nil {
+		return BuildResult{}, err
+	}
 	if transform != nil {
 		artifact, err = transform(artifact)
 		if err != nil {
@@ -232,6 +265,13 @@ func BuildHelm(ctx context.Context, request BuildHelmRequest) (BuildResult, erro
 		generatedAt = reproducibleEpoch
 	}
 	artifact, err := helm.Build(snapshot.Blobs, helm.BuildOptions{GeneratedAt: generatedAt})
+	if err != nil {
+		return BuildResult{}, err
+	}
+	artifact, err = formats.AppendListing(artifact, "helm", formats.BuildOptions{
+		Repository: request.Listing, GeneratedAt: generatedAt,
+		Published: request.Published,
+	}, snapshot.Blobs)
 	if err != nil {
 		return BuildResult{}, err
 	}

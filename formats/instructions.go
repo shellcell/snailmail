@@ -5,6 +5,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/listing"
@@ -117,7 +118,12 @@ func defaulted(value, fallback string) string {
 	return value
 }
 
-// withListing appends the browsable index to a rendered repository.
+// AppendListing appends the browsable index to a rendered repository.
+//
+// It is exported because three formats are built by the engine directly rather
+// than through the format interface, and a listing that only some repositories
+// carried would be worse than none: a visitor would read its absence as the
+// repository being empty.
 //
 // It wraps each format's own render rather than living inside them: the page is
 // the same for every ecosystem, and a format subpackage cannot reach this one
@@ -126,7 +132,7 @@ func defaulted(value, fallback string) string {
 // The artifacts it lists are the files carrying blob content — the packages —
 // found by matching each blob's digest to where the render placed it. Index
 // files are generated and are not what a visitor came for.
-func withListing(artifact domain.RepositoryArtifact, format string, options BuildOptions, blobs []domain.Blob) (domain.RepositoryArtifact, error) {
+func AppendListing(artifact domain.RepositoryArtifact, format string, options BuildOptions, blobs []domain.Blob) (domain.RepositoryArtifact, error) {
 	placed := make(map[string]string, len(artifact.Files))
 	for _, file := range artifact.Files {
 		if file.BlobSHA256 != "" {
@@ -146,13 +152,13 @@ func withListing(artifact domain.RepositoryArtifact, format string, options Buil
 		seen[path] = true
 		artifacts = append(artifacts, listing.Artifact{
 			Name: blob.Facts.Name, Version: blob.Facts.Version, Architecture: blob.Facts.Architecture,
-			Path: path, Size: blob.Size, SHA256: blob.SHA256,
+			Path: path, Size: blob.Size, SHA256: blob.SHA256, Published: publicationTime(options, blob),
 		})
 	}
 	page := listing.Page{
 		Repository: listName(options.Repository), Format: format,
 		Endpoint: options.Repository.Endpoint, Install: InstallSteps(format, options.Repository),
-		Artifacts: artifacts, GeneratedAt: options.GeneratedAt,
+		Artifacts: artifacts,
 	}
 	if signing := options.Repository.Signing; signing != nil {
 		page.Signing = &listing.Signing{
@@ -164,4 +170,15 @@ func withListing(artifact domain.RepositoryArtifact, format string, options Buil
 	sort.Slice(files, func(left, right int) bool { return files[left].Path < files[right].Path })
 	artifact.Files = files
 	return artifact, nil
+}
+
+// publicationTime is when an artifact was locked, from whichever of the two
+// carriers has it: the blob itself where the build read the lock, and the
+// options where it rescanned materialized files and lost everything the bytes
+// do not themselves record.
+func publicationTime(options BuildOptions, blob domain.Blob) time.Time {
+	if !blob.Added.IsZero() {
+		return blob.Added
+	}
+	return options.Published[blob.SHA256]
 }

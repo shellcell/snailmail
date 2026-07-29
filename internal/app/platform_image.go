@@ -32,6 +32,43 @@ func foreignPlatformUnsupported(output []byte) bool {
 	return strings.Contains(strings.ToLower(string(output)), "exec format error")
 }
 
+// ErrVerificationImageUnavailable reports that the client image could not be
+// fetched, so no verification was attempted. It is not a verification failure:
+// the repository was never examined, and reporting a registry outage as though
+// the packages were bad would send someone looking in the wrong place.
+var ErrVerificationImageUnavailable = errors.New("container image for verification could not be fetched")
+
+// registryUnavailable reports whether a runner failed to obtain the image
+// rather than failing to run it.
+//
+// The signatures are deliberately narrow and all describe a transfer: a
+// verification that genuinely fails does so from inside the container, with the
+// client's own output, and must never be mistaken for this.
+func registryUnavailable(output []byte) bool {
+	text := strings.ToLower(string(output))
+	if !strings.Contains(text, "error response from daemon") &&
+		!strings.Contains(text, "failed to resolve") && !strings.Contains(text, "pulling") &&
+		!strings.Contains(text, "trying to pull") {
+		return false
+	}
+	for _, signature := range []string{
+		"received unexpected http status",
+		"bad gateway",
+		"service unavailable",
+		"toomanyrequests",
+		"no such host",
+		"connection refused",
+		"i/o timeout",
+		"tls handshake timeout",
+		"temporary failure in name resolution",
+	} {
+		if strings.Contains(text, signature) {
+			return true
+		}
+	}
+	return false
+}
+
 // platformImage resolves a pinned image reference to one that can run as the
 // requested platform.
 //

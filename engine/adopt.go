@@ -149,6 +149,9 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	}
 	distro := defaultPlacementDistro(repository, request.Distro)
 	locked := state.ToLockedBlob(blob)
+	// Stamped when the artifact is adopted, not when it is published: a lock is
+	// reviewed and applied later, and re-applying it must not move the date.
+	locked.Added = state.LockTime(time.Now())
 	locked.Origin = &state.ArtifactOrigin{Kind: "https", URL: originURL.String()}
 	added, err := state.AddBlob(&lock, repository.Format, track, distro, locked, packageName, blob.Facts.Version)
 	if err != nil {

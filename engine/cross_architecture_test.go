@@ -35,6 +35,10 @@ func TestVerifyDebInstallsForForeignArchitecture(t *testing.T) {
 		// without it nothing was checked, so there is nothing to report.
 		t.Skipf("cannot resolve the %s image: %v", foreign, err)
 	}
+	if errors.Is(err, app.ErrVerificationImageUnavailable) {
+		// The client image could not be fetched, so nothing was verified.
+		t.Skipf("verification image is unavailable: %v", err)
+	}
 	if errors.Is(err, app.ErrForeignPlatformUnsupported) {
 		// Resolving the image is not enough: executing it needs QEMU and
 		// binfmt_misc, which Docker Desktop registers and a plain Linux runner

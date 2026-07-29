@@ -311,7 +311,9 @@ func AddArtifacts(request AddArtifactsRequest) (AddArtifactsResult, error) {
 		}
 		distro := defaultPlacementDistro(repository, "")
 		packageName := nativePackageName(repository.Format, blob.Facts.Name)
-		added, err := state.AddBlob(&lock, repository.Format, request.Track, distro, state.ToLockedBlob(blob), packageName, blob.Facts.Version)
+		toLock := state.ToLockedBlob(blob)
+		toLock.Added = state.LockTime(time.Now())
+		added, err := state.AddBlob(&lock, repository.Format, request.Track, distro, toLock, packageName, blob.Facts.Version)
 		if err != nil {
 			return AddArtifactsResult{}, err
 		}
@@ -1368,12 +1370,23 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	if len(active) == 0 {
 		return renderFromBlobs(nil, nil)
 	}
+	// Three formats are built by the engine rather than through the format
+	// interface, so the listing inputs are handed to them explicitly.
+	listingView := formatRepositoryWithKeys(repository, name, keys)
+	// These paths rebuild by scanning materialized files, which cannot say when
+	// anything was published; the lock can, so it is carried alongside.
+	published := make(map[string]time.Time, len(lockedBlobs))
+	for _, locked := range lockedBlobs {
+		if !locked.Added.IsZero() {
+			published[locked.SHA256] = locked.Added
+		}
+	}
 	switch repository.Format {
 	case "pypi":
-		return BuildPyPI(ctx, BuildPyPIRequest{Input: input, Output: output, GeneratedAt: generatedAt})
+		return BuildPyPI(ctx, BuildPyPIRequest{Input: input, Output: output, GeneratedAt: generatedAt, Listing: listingView, Published: published})
 	case "deb":
 		var resolved []state.PlanSigning
-		result, err := buildDeb(ctx, BuildDebRequest{Input: input, Output: output, Suite: repository.Suite, Component: repository.Component, Architectures: repository.Architectures, GeneratedAt: generatedAt}, func(artifact domain.RepositoryArtifact) (domain.RepositoryArtifact, error) {
+		result, err := buildDeb(ctx, BuildDebRequest{Input: input, Output: output, Suite: repository.Suite, Component: repository.Component, Architectures: repository.Architectures, GeneratedAt: generatedAt, Listing: listingView, Published: published}, func(artifact domain.RepositoryArtifact) (domain.RepositoryArtifact, error) {
 			signed, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers)
 			resolved = signing
 			return signed, err
@@ -1381,7 +1394,7 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		result.Signing = resolved
 		return result, err
 	case "helm":
-		return BuildHelm(ctx, BuildHelmRequest{Input: input, Output: output, GeneratedAt: generatedAt})
+		return BuildHelm(ctx, BuildHelmRequest{Input: input, Output: output, GeneratedAt: generatedAt, Listing: listingView, Published: published})
 	case "raw", "rpm", "apk":
 		return renderFromBlobs(lockedBlobs, lockedSources)
 	default:

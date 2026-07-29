@@ -3,14 +3,12 @@ package listing
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func samplePage() Page {
 	return Page{
 		Repository: "releases", Format: "raw", Endpoint: "https://dl.example/releases",
-		Install:     []string{"# fetch it", "curl -LO https://dl.example/releases/a.tar.gz"},
-		GeneratedAt: time.Unix(1785300000, 0).UTC(),
+		Install: []string{"# fetch it", "curl -LO https://dl.example/releases/a.tar.gz"},
 		Artifacts: []Artifact{
 			{Name: "b-tool", Version: "1.0.0", Architecture: "amd64", Path: "b/1.0.0/b.tar.gz", Size: 2048, SHA256: strings.Repeat("a", 64)},
 			{Name: "a-tool", Version: "1.0.0", Architecture: "amd64", Path: "a/1.0.0/a.tar.gz", Size: 500, SHA256: strings.Repeat("b", 64)},

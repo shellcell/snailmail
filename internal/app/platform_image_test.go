@@ -49,6 +49,11 @@ func TestPlatformImageResolvesForeignArchitecture(t *testing.T) {
 		if foreignPlatformUnsupported([]byte(failure.String())) {
 			t.Skipf("host cannot execute %s containers: %s", foreign, strings.TrimSpace(failure.String()))
 		}
+		if registryUnavailable([]byte(failure.String())) {
+			// The registry was unreachable, so the reference was never run and
+			// there is nothing this test could have learned.
+			t.Skipf("registry is unavailable: %s", strings.TrimSpace(failure.String()))
+		}
 		t.Fatalf("resolved reference did not run: %v: %s", err, failure.String())
 	}
 	want := "amd64"
@@ -144,6 +149,37 @@ func TestForeignPlatformUnsupportedRecognisesAnUnrunnableImage(t *testing.T) {
 	} {
 		if foreignPlatformUnsupported([]byte(output)) {
 			t.Errorf("a verification failure was treated as an unrunnable host: %q", output)
+		}
+	}
+}
+
+// A registry outage and a broken repository must not look alike: the first
+// means nothing was checked, the second that something is wrong with what was
+// published. Both arrive as a failed container run.
+func TestRegistryUnavailableIsNotAVerificationFailure(t *testing.T) {
+	outages := []string{
+		`Unable to find image 'debian@sha256:9b67' locally
+docker: Error response from daemon: Get "https://registry-1.docker.io/v2/library/debian/manifests/sha256:9b67": received unexpected HTTP status: 502 Bad Gateway`,
+		`Trying to pull docker.io/library/alpine...
+Error response from daemon: toomanyrequests: You have reached your unauthenticated pull rate limit.`,
+		`Error response from daemon: Get "https://registry-1.docker.io/v2/": dial tcp: lookup registry-1.docker.io: no such host`,
+	}
+	for _, output := range outages {
+		if !registryUnavailable([]byte(output)) {
+			t.Errorf("did not recognise an outage in:\n%s", output)
+		}
+	}
+	// A client that ran and reported a problem is a verification failure, and
+	// treating it as an outage would hide a broken repository.
+	for _, output := range []string{
+		"E: Unable to locate package snailmail",
+		"ERROR: snailmail-0.0.8-r1: package mentioned in index not found",
+		"No match for argument: snail-demo",
+		"installed 1.2.3-1, index advertised 1.2.4-1",
+		"",
+	} {
+		if registryUnavailable([]byte(output)) {
+			t.Errorf("a verification failure was treated as an outage: %q", output)
 		}
 	}
 }

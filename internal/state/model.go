@@ -106,13 +106,19 @@ type PackageVersion struct {
 }
 
 type LockedBlob struct {
-	Filename     string          `toml:"filename"`
-	Architecture string          `toml:"architecture,omitempty"`
-	Size         int64           `toml:"size"`
-	MD5          string          `toml:"md5,omitempty"`
-	SHA1         string          `toml:"sha1,omitempty"`
-	SHA256       string          `toml:"sha256"`
-	Origin       *ArtifactOrigin `toml:"origin,omitempty"`
+	Filename     string `toml:"filename"`
+	Architecture string `toml:"architecture,omitempty"`
+	Size         int64  `toml:"size"`
+	MD5          string `toml:"md5,omitempty"`
+	SHA1         string `toml:"sha1,omitempty"`
+	SHA256       string `toml:"sha256"`
+	// Added is when this artifact entered the lock, RFC 3339. It is written once
+	// and never rewritten, so it says when the bytes were published rather than
+	// when the repository was last built — which is the question someone reading
+	// a listing is actually asking. Locks written before this field existed have
+	// no answer to give and leave it empty.
+	Added  string          `toml:"added,omitempty"`
+	Origin *ArtifactOrigin `toml:"origin,omitempty"`
 }
 
 type ArtifactOrigin struct {
