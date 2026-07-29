@@ -469,7 +469,14 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 	createdAt = createdAt.UTC().Truncate(time.Second)
 	generatedAt := request.GeneratedAt
 	if generatedAt.IsZero() {
-		generatedAt = createdAt
+		// Not the wall clock: generated content is dated by when the desired
+		// state last changed, so replanning unchanged inputs renders the same
+		// bytes and a publication with nothing to do does nothing.
+		committedAt, err := state.DesiredStateTime(ctx, root)
+		if err != nil {
+			return PlanWorkspaceResult{}, err
+		}
+		generatedAt = committedAt
 	}
 	generatedAt = generatedAt.UTC().Truncate(time.Second)
 	expiresIn := request.ExpiresIn
@@ -1342,7 +1349,7 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	}
 	renderFromBlobs := func(blobs []domain.Blob, sources map[string]string) (BuildResult, error) {
 		artifact, err := selected.Build(blobs, formats.BuildOptions{
-			Repository: formatRepository(repository), GeneratedAt: generatedAt,
+			Repository: formatRepositoryWithKeys(repository, name, keys), GeneratedAt: generatedAt,
 		})
 		if err != nil {
 			return BuildResult{}, err
@@ -1726,10 +1733,27 @@ func repositoryCommitPaths(repository state.Repository) []string {
 // formatRepository projects a configured repository onto the fields a format
 // reasons about.
 func formatRepository(repository state.Repository) formats.Repository {
-	return formats.Repository{
-		Suite: repository.Suite, Component: repository.Component,
+	return formatRepositoryWithKeys(repository, "", nil)
+}
+
+// formatRepositoryWithKeys adds what only the manifest knows: the repository's
+// own name, where it is served, and which key verifies it. A listing states all
+// three, and none of them can be recovered from the artifacts alone.
+func formatRepositoryWithKeys(repository state.Repository, name string, keys map[string]state.SigningKey) formats.Repository {
+	view := formats.Repository{
+		Name: name, Suite: repository.Suite, Component: repository.Component,
 		Architectures: repository.Architectures, Signed: len(repository.SigningKeys) != 0,
+		Endpoint: repository.Host.CanonicalEndpoint,
 	}
+	if len(repository.SigningKeys) == 1 && keys != nil {
+		if key, exists := keys[repository.SigningKeys[0]]; exists {
+			view.Signing = &formats.RepositorySigning{
+				Fingerprint: key.Fingerprint, Algorithm: key.Algorithm,
+				KeyPath: clientKeyPath(repository, key),
+			}
+		}
+	}
+	return view
 }
 
 func validateApplyPlan(plan state.Plan) error {

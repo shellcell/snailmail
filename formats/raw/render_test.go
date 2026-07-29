@@ -123,9 +123,8 @@ func TestBuildRendersAnEmptyRepository(t *testing.T) {
 	if len(checksums.Content) != 0 {
 		t.Fatalf("empty repository checksums are not empty: %q", checksums.Content)
 	}
-	if _, found := fileNamed(artifact, "index.html"); !found {
-		t.Fatal("an empty repository has no listing")
-	}
+	// The browsable page is rendered once for every format by the adapter, not
+	// here; what raw owns is the checksum file a client verifies against.
 }
 
 // A name or version that escaped into a path would let an artifact be written

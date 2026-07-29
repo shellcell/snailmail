@@ -1277,3 +1277,32 @@ func replaceEnvironment(environment []string, values ...string) []string {
 	}
 	return result
 }
+
+// DesiredStateTime is when the desired state was last changed.
+//
+// It is what generated content is dated with, in place of the wall clock. A
+// repository is a function of its inputs, and a timestamp taken at build time
+// is not one: the same lock would render different bytes every run, so nothing
+// could distinguish "nothing changed" from "something changed" and every
+// publication would replace a tree identical in everything that matters.
+//
+// It deliberately follows the manifest and the locks rather than HEAD. A
+// publication commits its own ledgers and receipts, so dating content by HEAD
+// would mean each publication changed the next build's input — the same
+// treadmill, reached by a different route.
+func DesiredStateTime(ctx context.Context, root string) (time.Time, error) {
+	value, err := gitOutputContext(ctx, root, "log", "-1", "--format=%cI", "--", "snailmail.toml", "repos")
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read desired state time: %w", err)
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		// Nothing has been committed yet, so there is no desired state to date.
+		return time.Time{}, errors.New("desired state has not been committed")
+	}
+	committedAt, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, errors.New("desired state commit has an invalid timestamp")
+	}
+	return committedAt.UTC(), nil
+}

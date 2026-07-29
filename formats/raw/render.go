@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"html"
 	"path"
 	"sort"
 	"strings"
@@ -58,10 +57,7 @@ func Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact
 		// The sha256sum format: digest, two spaces, binary-mode marker, path.
 		checksums.WriteString(item.blob.SHA256 + "  " + item.path + "\n")
 	}
-	files = append(files,
-		domain.File{Path: "SHA256SUMS", Content: checksums.Bytes()},
-		domain.File{Path: "index.html", Content: renderListing(entries, options.GeneratedAt)},
-	)
+	files = append(files, domain.File{Path: "SHA256SUMS", Content: checksums.Bytes()})
 
 	verification := make([]domain.VerificationCase, 0, len(entries))
 	seen := make(map[string]bool, len(entries))
@@ -78,7 +74,7 @@ func Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact
 	return domain.RepositoryArtifact{
 		Format:            FormatID,
 		Files:             files,
-		Install:           domain.InstallSpec{Kind: "raw", IndexPath: "index.html"},
+		Install:           domain.InstallSpec{Kind: "raw", IndexPath: "SHA256SUMS"},
 		VerificationCases: verification,
 	}, nil
 }
@@ -103,21 +99,4 @@ func validateBlob(blob domain.Blob) error {
 type listingEntry struct {
 	blob domain.Blob
 	path string
-}
-
-// renderListing emits a browsable index. It is a convenience over the tree
-// rather than a protocol: a raw client fetches a known URL, and SHA256SUMS is
-// what it verifies against.
-func renderListing(entries []listingEntry, generatedAt time.Time) []byte {
-	var document strings.Builder
-	document.WriteString("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n")
-	document.WriteString("<title>Artifacts</title>\n</head>\n<body>\n<h1>Artifacts</h1>\n")
-	document.WriteString("<p>Generated " + generatedAt.UTC().Format(time.RFC3339) + ". Verify with SHA256SUMS.</p>\n<ul>\n")
-	for _, item := range entries {
-		escaped := html.EscapeString(item.path)
-		document.WriteString("<li><a href=\"" + escaped + "\">" + escaped + "</a> " +
-			fmt.Sprintf("%d bytes sha256:%s", item.blob.Size, item.blob.SHA256) + "</li>\n")
-	}
-	document.WriteString("</ul>\n</body>\n</html>\n")
-	return []byte(document.String())
 }

@@ -36,6 +36,7 @@ import (
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/factscache"
+	"github.com/shellcell/snailmail/internal/listing"
 	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
@@ -941,6 +942,11 @@ func verifyPyPIStructure(root string, manifest buildgraph.RepositoryManifest) ([
 			}
 			continue
 		}
+		// The browsable page is written for people, not for a client, and is
+		// covered by the tree digest like everything else.
+		if file.Path == listing.Filename {
+			continue
+		}
 		if strings.HasPrefix(file.Path, "simple/") {
 			if path.Base(file.Path) != "index.html" {
 				return nil, fmt.Errorf("unexpected PyPI index path %q", file.Path)
@@ -984,6 +990,15 @@ func verifyPyPIStructure(root string, manifest buildgraph.RepositoryManifest) ([
 		return nil, fmt.Errorf("finalize expected PyPI structure: %w", err)
 	}
 	expectedManifest.SchemaVersion = manifest.SchemaVersion
+	// The rebuild cannot reproduce the browsable page: it is written from the
+	// repository name, endpoint and signing key, which do not survive into the
+	// published tree. The tree digest still covers it.
+	expectedManifest.Files = withoutListing(expectedManifest.Files)
+	manifest.Files = withoutListing(manifest.Files)
+	// The tree digest covers the page too, so it cannot match a rebuild that
+	// omits it. What it protects is checked where it belongs: the deployment
+	// record is matched against the digest of the tree that was published.
+	expectedManifest.TreeSHA256, manifest.TreeSHA256 = "", ""
 	if !reflect.DeepEqual(expectedManifest, manifest) {
 		return nil, errors.New("PyPI indexes or verification metadata do not match package bytes")
 	}
@@ -993,6 +1008,11 @@ func verifyPyPIStructure(root string, manifest buildgraph.RepositoryManifest) ([
 func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]domain.Blob, error) {
 	var blobs []domain.Blob
 	for _, file := range manifest.Files {
+		// The browsable page is written for people, not for a client, and is
+		// covered by the tree digest like everything else.
+		if file.Path == listing.Filename {
+			continue
+		}
 		if strings.HasPrefix(file.Path, "dists/") || (manifest.Install.SigningKeyPath != "" && file.Path == manifest.Install.SigningKeyPath) {
 			continue
 		}
@@ -1091,6 +1111,15 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 	if manifest.SchemaVersion < 3 {
 		expectedManifest.Install.TrustedSigningFingerprints = nil
 	}
+	// The rebuild cannot reproduce the browsable page: it is written from the
+	// repository name, endpoint and signing key, which do not survive into the
+	// published tree. The tree digest still covers it.
+	expectedManifest.Files = withoutListing(expectedManifest.Files)
+	manifest.Files = withoutListing(manifest.Files)
+	// The tree digest covers the page too, so it cannot match a rebuild that
+	// omits it. What it protects is checked where it belongs: the deployment
+	// record is matched against the digest of the tree that was published.
+	expectedManifest.TreeSHA256, manifest.TreeSHA256 = "", ""
 	if !reflect.DeepEqual(expectedManifest, manifest) {
 		return nil, errors.New("Debian indexes or verification metadata do not match package bytes")
 	}
@@ -1100,6 +1129,11 @@ func verifyDebStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 func verifyHelmStructure(root string, manifest buildgraph.RepositoryManifest) ([]domain.Blob, error) {
 	var blobs []domain.Blob
 	for _, file := range manifest.Files {
+		// The browsable page is written for people, not for a client, and is
+		// covered by the tree digest like everything else.
+		if file.Path == listing.Filename {
+			continue
+		}
 		if file.Path == "index.yaml" {
 			continue
 		}
@@ -1140,6 +1174,15 @@ func verifyHelmStructure(root string, manifest buildgraph.RepositoryManifest) ([
 		return nil, fmt.Errorf("finalize expected Helm structure: %w", err)
 	}
 	expectedManifest.SchemaVersion = manifest.SchemaVersion
+	// The rebuild cannot reproduce the browsable page: it is written from the
+	// repository name, endpoint and signing key, which do not survive into the
+	// published tree. The tree digest still covers it.
+	expectedManifest.Files = withoutListing(expectedManifest.Files)
+	manifest.Files = withoutListing(manifest.Files)
+	// The tree digest covers the page too, so it cannot match a rebuild that
+	// omits it. What it protects is checked where it belongs: the deployment
+	// record is matched against the digest of the tree that was published.
+	expectedManifest.TreeSHA256, manifest.TreeSHA256 = "", ""
 	if !reflect.DeepEqual(expectedManifest, manifest) {
 		return nil, errors.New("Helm index or verification metadata does not match chart bytes")
 	}
@@ -1294,9 +1337,15 @@ func verifyRawStructure(root string, manifest buildgraph.RepositoryManifest) ([]
 	if err != nil {
 		return nil, fmt.Errorf("finalize expected raw structure: %w", err)
 	}
-	expectedManifest.SchemaVersion = manifest.SchemaVersion
-	if !reflect.DeepEqual(expectedManifest, manifest) {
-		return nil, errors.New("raw listing or checksums do not match the published artifacts")
+	// The browsable page is left out of the comparison. It is written from the
+	// repository's name, endpoint and signing key, none of which survive into
+	// the published tree, so it cannot be recomputed from what is there. What
+	// this check exists for is the machine-readable side: that every artifact is
+	// where the checksums say and nothing else is present. The page is still
+	// covered by the tree digest, which the deployment record is matched
+	// against, so altering it does not go unnoticed.
+	if !reflect.DeepEqual(withoutListing(expectedManifest.Files), withoutListing(manifest.Files)) {
+		return nil, errors.New("raw checksums do not match the published artifacts")
 	}
 	return blobs, nil
 }
@@ -1331,4 +1380,17 @@ func VerifyRawClientEndpointAccess(ctx context.Context, root string, access host
 		return buildgraph.RepositoryManifest{}, 0, err
 	}
 	return manifest, len(manifest.VerificationCases), nil
+}
+
+// withoutListing drops the human-readable page from a file set, leaving what a
+// client reads.
+func withoutListing(files []buildgraph.ManifestFile) []buildgraph.ManifestFile {
+	kept := make([]buildgraph.ManifestFile, 0, len(files))
+	for _, file := range files {
+		if file.Path == listing.Filename {
+			continue
+		}
+		kept = append(kept, file)
+	}
+	return kept
 }

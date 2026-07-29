@@ -67,10 +67,28 @@ type Artifact struct {
 
 // Repository is the format-relevant part of a configured repository.
 type Repository struct {
+	Name          string
 	Suite         string
 	Component     string
 	Architectures []string
 	Signed        bool
+	// Endpoint is the public URL a client fetches from, used to write install
+	// instructions into the browsable listing. Empty for a repository published
+	// to a directory, where no URL is known and instructions are omitted rather
+	// than invented.
+	Endpoint string
+	// Signing describes what verifies the repository, for the listing to state.
+	// It is known before the build because it comes from configuration; the
+	// signature itself is applied afterwards.
+	Signing *RepositorySigning
+}
+
+// RepositorySigning is the signing state a listing reports.
+type RepositorySigning struct {
+	Fingerprint string
+	Algorithm   string
+	// KeyPath is the file a client installs, relative to the repository root.
+	KeyPath string
 }
 
 // BuildOptions carries every input an index render may need. A format uses
@@ -211,8 +229,12 @@ func (pypiFormat) SigningAlgorithm() string { return "" }
 
 func (pypiFormat) ImplementsSigning() bool         { return false }
 func (pypiFormat) CommitPaths(Repository) []string { return []string{"simple/index.html"} }
-func (pypiFormat) Build(blobs []domain.Blob, _ BuildOptions) (domain.RepositoryArtifact, error) {
-	return pypi.Build(blobs)
+func (pypiFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
+	artifact, err := pypi.Build(blobs)
+	if err != nil {
+		return domain.RepositoryArtifact{}, err
+	}
+	return withListing(artifact, "pypi", options, blobs)
 }
 
 type debFormat struct{}
@@ -261,12 +283,16 @@ func (debFormat) CommitPaths(repository Repository) []string {
 }
 
 func (debFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
-	return deb.Build(blobs, deb.BuildOptions{
+	artifact, err := deb.Build(blobs, deb.BuildOptions{
 		Suite:         options.Repository.Suite,
 		Component:     options.Repository.Component,
 		Architectures: options.Repository.Architectures,
 		GeneratedAt:   options.GeneratedAt,
 	})
+	if err != nil {
+		return domain.RepositoryArtifact{}, err
+	}
+	return withListing(artifact, "deb", options, blobs)
 }
 
 type helmFormat struct{}
@@ -299,7 +325,11 @@ func (helmFormat) SigningAlgorithm() string { return "" }
 func (helmFormat) ImplementsSigning() bool         { return false }
 func (helmFormat) CommitPaths(Repository) []string { return []string{"index.yaml"} }
 func (helmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
-	return helm.Build(blobs, helm.BuildOptions{GeneratedAt: options.GeneratedAt})
+	artifact, err := helm.Build(blobs, helm.BuildOptions{GeneratedAt: options.GeneratedAt})
+	if err != nil {
+		return domain.RepositoryArtifact{}, err
+	}
+	return withListing(artifact, "helm", options, blobs)
 }
 
 // Compile-time proof that every registered value satisfies the interface.
@@ -348,7 +378,11 @@ func (rawFormat) SigningAlgorithm() string { return "" }
 func (rawFormat) ImplementsSigning() bool         { return false }
 func (rawFormat) CommitPaths(Repository) []string { return []string{"index.html", "SHA256SUMS"} }
 func (rawFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
-	return raw.Build(blobs, raw.BuildOptions{GeneratedAt: options.GeneratedAt})
+	artifact, err := raw.Build(blobs, raw.BuildOptions{GeneratedAt: options.GeneratedAt})
+	if err != nil {
+		return domain.RepositoryArtifact{}, err
+	}
+	return withListing(artifact, "raw", options, blobs)
 }
 
 // rpmFormat serves RPM packages through a yum/dnf repository.
@@ -390,7 +424,11 @@ func (rpmFormat) SigningAlgorithm() string { return signer.AlgorithmOpenPGPRSA40
 func (rpmFormat) ImplementsSigning() bool         { return true }
 func (rpmFormat) CommitPaths(Repository) []string { return []string{"repodata/repomd.xml"} }
 func (rpmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
-	return rpm.Build(blobs, rpm.BuildOptions{GeneratedAt: options.GeneratedAt})
+	artifact, err := rpm.Build(blobs, rpm.BuildOptions{GeneratedAt: options.GeneratedAt})
+	if err != nil {
+		return domain.RepositoryArtifact{}, err
+	}
+	return withListing(artifact, "rpm", options, blobs)
 }
 
 // apkFormat serves Alpine packages through an APKINDEX repository.
@@ -437,7 +475,11 @@ func (apkFormat) CommitPaths(repository Repository) []string {
 	return paths
 }
 func (apkFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
-	return apk.Build(blobs, apk.BuildOptions{
+	artifact, err := apk.Build(blobs, apk.BuildOptions{
 		GeneratedAt: options.GeneratedAt, Architectures: options.Repository.Architectures,
 	})
+	if err != nil {
+		return domain.RepositoryArtifact{}, err
+	}
+	return withListing(artifact, "apk", options, blobs)
 }
