@@ -362,9 +362,10 @@ func (rpmFormat) ArtifactCoordinate(artifact Artifact) string { return artifact.
 // coordinate inside it, so releases do not carry one.
 func (rpmFormat) SupportsDistros() bool { return false }
 
-// Detached OpenPGP over repomd.xml is the yum scheme, and per-package signing
-// happens at build time in the package itself. Neither is produced yet.
-func (rpmFormat) ImplementsSigning() bool         { return false }
+// Detached OpenPGP over repomd.xml is what repo_gpgcheck verifies, and it is
+// produced. Per-package signing is not: that signature lives in the package
+// header and is made by whoever built the package, not by the repository.
+func (rpmFormat) ImplementsSigning() bool         { return true }
 func (rpmFormat) CommitPaths(Repository) []string { return []string{"repodata/repomd.xml"} }
 func (rpmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
 	return rpm.Build(blobs, rpm.BuildOptions{GeneratedAt: options.GeneratedAt})

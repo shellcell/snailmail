@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/state"
@@ -41,16 +40,14 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 		return artifact, nil, nil
 	}
 	if len(planned) > 1 {
-		return domain.RepositoryArtifact{}, nil, errors.New("Debian repository has more than one active signer")
-	}
-	if repository.Format != "deb" {
-		return domain.RepositoryArtifact{}, nil, fmt.Errorf("repository signing is not implemented for format %q", repository.Format)
+		return domain.RepositoryArtifact{}, nil, errors.New("repository has more than one active signer")
 	}
 	key, exists := keys[activeKeyName]
 	if !exists {
 		return domain.RepositoryArtifact{}, nil, fmt.Errorf("unknown signing key %q", activeKeyName)
 	}
 	var publicKeyring []byte
+	var publicArmorKeyring []byte
 	trustedPlanKeys := make([]state.PlanPublicKey, 0, len(trustedKeyNames))
 	trustedFingerprints := make([]string, 0, len(trustedKeyNames))
 	var publicBinary []byte
@@ -70,6 +67,7 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 			return domain.RepositoryArtifact{}, nil, errors.New("committed public forms do not match the configured signing identity")
 		}
 		publicKeyring = append(publicKeyring, binary...)
+		publicArmorKeyring = append(publicArmorKeyring, armored...)
 		trustedPlanKeys = append(trustedPlanKeys, state.PlanPublicKey{
 			KeyName: trustedKeyName, Fingerprint: trustedKey.Fingerprint,
 			PublicKeyPath: trustedKey.PublicKeyPath, PublicKeySHA256: trustedKey.PublicKeySHA256,
@@ -87,10 +85,11 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 	if signatureTime.Before(binaryIdentity.CreatedAt) || !signatureTime.Before(binaryIdentity.ExpiresAt) {
 		return domain.RepositoryArtifact{}, nil, errors.New("signature time is outside signing key validity")
 	}
-	release, err := deb.ReleasePayload(artifact, repository.Suite)
+	recipe, err := signingRecipeFor(repository, artifact)
 	if err != nil {
 		return domain.RepositoryArtifact{}, nil, err
 	}
+	release := recipe.payload
 	payloadDigest := sha256.Sum256(release)
 	var resolved *state.PlanSigning
 	if len(planned) == 1 {
@@ -117,8 +116,8 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 			KeyringSHA256: hex.EncodeToString(keyringDigest[:]), TrustedKeys: trustedPlanKeys,
 			RotationPhase: rotationPhase, MinimumRefreshSeconds: minimumRefresh,
 		}
-		for index, scheme := range []string{signer.SchemeOpenPGPCleartext, signer.SchemeOpenPGPDetached} {
-			request := signer.Request{Scheme: scheme, Payload: release, CreatedAt: signatureTime}
+		for _, output := range recipe.outputs {
+			request := signer.Request{Scheme: output.scheme, Payload: release, CreatedAt: signatureTime}
 			response, err := selected.Sign(ctx, request)
 			if err != nil {
 				return domain.RepositoryArtifact{}, nil, err
@@ -131,22 +130,24 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 				return domain.RepositoryArtifact{}, nil, err
 			}
 			contentDigest := sha256.Sum256(response.Content)
-			ids := []string{"deb-inrelease", "deb-release-gpg"}
-			outputs := []string{"dists/" + repository.Suite + "/InRelease", "dists/" + repository.Suite + "/Release.gpg"}
 			resolved.Nodes = append(resolved.Nodes, state.SigningNode{
-				ID: ids[index], Kind: "sign", DependsOn: []string{"deb-release"}, Scheme: scheme, OutputPath: outputs[index], PayloadSHA256: hex.EncodeToString(payloadDigest[:]),
+				ID: output.id, Kind: "sign", DependsOn: []string{recipe.payloadID}, Scheme: output.scheme,
+				OutputPath: output.path, PayloadSHA256: hex.EncodeToString(payloadDigest[:]),
 				ContentSHA256: hex.EncodeToString(contentDigest[:]), Content: append([]byte(nil), response.Content...),
 			})
 		}
 		resolved.RecipeSHA256 = signingRecipeDigest(*resolved)
 	}
-	if err := validatePlannedSigning(*resolved, activeKeyName, key, trustedPlanKeys, repository.SigningKeyring, rotationPhase, minimumRefresh, repository.Suite, signatureTime, release, publicBinary, publicKeyring); err != nil {
+	if err := validatePlannedSigning(*resolved, activeKeyName, key, trustedPlanKeys, repository.SigningKeyring, rotationPhase, minimumRefresh, recipe, signatureTime, release, publicBinary, publicKeyring); err != nil {
 		return domain.RepositoryArtifact{}, nil, err
 	}
-	signed, err := deb.ApplySigning(artifact, repository.Suite, deb.SigningMaterial{
-		Fingerprint: key.Fingerprint, PublicKey: publicBinary,
-		KeyringPath: repository.SigningKeyring, PublicKeyring: publicKeyring, TrustedFingerprints: trustedFingerprints, SignatureTime: signatureTime,
-		InRelease: resolved.Nodes[0].Content, ReleaseGPG: resolved.Nodes[1].Content,
+	contents := make([][]byte, 0, len(resolved.Nodes))
+	for _, node := range resolved.Nodes {
+		contents = append(contents, node.Content)
+	}
+	signed, err := applyFormatSigning(repository, artifact, key, signingInputs{
+		publicBinary: publicBinary, publicArmor: publicArmorKeyring, publicKeyring: publicKeyring,
+		trustedFingerprints: trustedFingerprints, signatureTime: signatureTime, contents: contents,
 	})
 	if err != nil {
 		return domain.RepositoryArtifact{}, nil, err
@@ -161,7 +162,7 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 	return signed, []state.PlanSigning{copyResolved}, nil
 }
 
-func validatePlannedSigning(planned state.PlanSigning, keyName string, key state.SigningKey, trustedKeys []state.PlanPublicKey, keyringPath, rotationPhase string, minimumRefresh int64, suite string, generatedAt time.Time, release, publicBinary, publicKeyring []byte) error {
+func validatePlannedSigning(planned state.PlanSigning, keyName string, key state.SigningKey, trustedKeys []state.PlanPublicKey, keyringPath, rotationPhase string, minimumRefresh int64, recipe signingRecipe, generatedAt time.Time, release, publicBinary, publicKeyring []byte) error {
 	keyringDigest := sha256.Sum256(publicKeyring)
 	if planned.KeyName != keyName || planned.Algorithm != key.Algorithm || planned.Fingerprint != key.Fingerprint ||
 		planned.PublicKeyPath != key.PublicKeyPath || planned.PublicKeySHA256 != key.PublicKeySHA256 ||
@@ -170,19 +171,21 @@ func validatePlannedSigning(planned state.PlanSigning, keyName string, key state
 		!reflect.DeepEqual(planned.TrustedKeys, trustedKeys) || planned.RotationPhase != rotationPhase || planned.MinimumRefreshSeconds != minimumRefresh {
 		return errors.New("planned signing identity or response set does not match repository configuration")
 	}
-	if err := validateSigningRecipeMetadata(planned, suite); err != nil {
+	if err := validateSigningRecipeMetadata(planned, &recipe); err != nil {
 		return err
 	}
 	payloadDigest := sha256.Sum256(release)
-	for index, scheme := range []string{signer.SchemeOpenPGPCleartext, signer.SchemeOpenPGPDetached} {
+	// Every signature the recipe calls for, whatever their number: Debian makes
+	// two over one Release, a yum repository one over repomd.xml.
+	for index, output := range recipe.outputs {
 		node := planned.Nodes[index]
 		contentDigest := sha256.Sum256(node.Content)
-		if node.Scheme != scheme || node.PayloadSHA256 != hex.EncodeToString(payloadDigest[:]) || node.ContentSHA256 != hex.EncodeToString(contentDigest[:]) {
+		if node.Scheme != output.scheme || node.PayloadSHA256 != hex.EncodeToString(payloadDigest[:]) || node.ContentSHA256 != hex.EncodeToString(contentDigest[:]) {
 			return errors.New("planned signing response digest does not match its content")
 		}
 		if err := openpgpsigner.VerifyResponse(
-			signer.Request{Scheme: scheme, Payload: release, CreatedAt: generatedAt},
-			signer.Response{Scheme: scheme, Fingerprint: key.Fingerprint, Content: node.Content}, publicBinary, key.Fingerprint,
+			signer.Request{Scheme: output.scheme, Payload: release, CreatedAt: generatedAt},
+			signer.Response{Scheme: output.scheme, Fingerprint: key.Fingerprint, Content: node.Content}, publicBinary, key.Fingerprint,
 		); err != nil {
 			return fmt.Errorf("planned signing response: %w", err)
 		}
@@ -256,8 +259,12 @@ func signingRecipeDigest(signing state.PlanSigning) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func validateSigningRecipeMetadata(signing state.PlanSigning, suite string) error {
-	if len(signing.Nodes) != 2 || signing.RecipeSHA256 != signingRecipeDigest(signing) || !validSHA256(signing.KeyringSHA256) ||
+// validateSigningRecipeMetadata checks what a plan can be checked against on
+// its own. A recipe pins the exact shape a format signs; without one — when a
+// plan is read before its repository is rebuilt — only the format-independent
+// invariants can be enforced.
+func validateSigningRecipeMetadata(signing state.PlanSigning, recipe *signingRecipe) error {
+	if len(signing.Nodes) == 0 || len(signing.Nodes) > 2 || signing.RecipeSHA256 != signingRecipeDigest(signing) || !validSHA256(signing.KeyringSHA256) ||
 		path.IsAbs(signing.KeyringPath) || path.Clean(signing.KeyringPath) != signing.KeyringPath || !strings.HasPrefix(signing.KeyringPath, "keys/") || !strings.HasSuffix(signing.KeyringPath, ".gpg") || len(signing.TrustedKeys) == 0 {
 		return errors.New("signing recipe digest does not match its nodes")
 	}
@@ -279,19 +286,16 @@ func validateSigningRecipeMetadata(signing state.PlanSigning, suite string) erro
 	if !foundActive {
 		return errors.New("signing recipe trust set omits active signer")
 	}
-	if suite == "" {
-		firstDirectory := path.Dir(signing.Nodes[0].OutputPath)
-		if path.Base(signing.Nodes[0].OutputPath) != "InRelease" || path.Dir(signing.Nodes[1].OutputPath) != firstDirectory || path.Base(signing.Nodes[1].OutputPath) != "Release.gpg" ||
-			path.IsAbs(firstDirectory) || path.Clean(firstDirectory) != firstDirectory || !strings.HasPrefix(firstDirectory, "dists/") {
-			return errors.New("signing recipe has invalid Debian output paths")
-		}
-	} else if signing.Nodes[0].OutputPath != "dists/"+suite+"/InRelease" || signing.Nodes[1].OutputPath != "dists/"+suite+"/Release.gpg" {
-		return errors.New("signing recipe output paths do not match Debian suite")
+	if recipe != nil {
+		return validateRecipeNodes(signing.Nodes, *recipe)
 	}
-	ids := []string{"deb-inrelease", "deb-release-gpg"}
-	schemes := []string{signer.SchemeOpenPGPCleartext, signer.SchemeOpenPGPDetached}
-	for index, node := range signing.Nodes {
-		if node.ID != ids[index] || node.Kind != "sign" || !reflect.DeepEqual(node.DependsOn, []string{"deb-release"}) || node.Scheme != schemes[index] {
+	// No recipe: every node must still be a well-formed signature at a safe
+	// path, which is what stops a plan smuggling one somewhere else.
+	for _, node := range signing.Nodes {
+		if node.Kind != "sign" || len(node.DependsOn) != 1 || !knownPayloadIDs[node.DependsOn[0]] ||
+			(node.Scheme != signer.SchemeOpenPGPCleartext && node.Scheme != signer.SchemeOpenPGPDetached) ||
+			node.OutputPath == "" || path.IsAbs(node.OutputPath) || path.Clean(node.OutputPath) != node.OutputPath ||
+			strings.HasPrefix(node.OutputPath, "../") {
 			return errors.New("signing recipe has invalid node identity or dependencies")
 		}
 	}

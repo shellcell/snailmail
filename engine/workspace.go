@@ -1821,19 +1821,24 @@ func validateApplyPlan(plan state.Plan) error {
 		}
 		for _, signing := range repository.Signing {
 			if !formatSupportsSigning(repository.Format) || signing.KeyName == "" || signing.Algorithm != signer.AlgorithmOpenPGPRSA4096 || !validFingerprint(signing.Fingerprint) ||
-				!validSHA256(signing.PublicKeySHA256) || !validSHA256(signing.PublicArmorSHA256) || !validSHA256(signing.RecipeSHA256) || signing.PublicKeyPath == "" || signing.PublicArmorPath == "" || len(signing.Nodes) != 2 {
+				!validSHA256(signing.PublicKeySHA256) || !validSHA256(signing.PublicArmorSHA256) || !validSHA256(signing.RecipeSHA256) || signing.PublicKeyPath == "" || signing.PublicArmorPath == "" ||
+				// A format decides how many signatures it makes; only that there
+				// is at least one, and not more than any format calls for, is
+				// checkable without the repository.
+				len(signing.Nodes) == 0 || len(signing.Nodes) > 2 {
 				return fmt.Errorf("plan repository %q has invalid signing metadata", repository.Name)
 			}
 			if _, err := time.Parse(time.RFC3339, signing.SignatureTime); err != nil {
 				return fmt.Errorf("plan repository %q has invalid signature time", repository.Name)
 			}
-			if err := validateSigningRecipeMetadata(signing, ""); err != nil {
+			// The repository has not been rebuilt here, so there is no artifact
+			// to derive a recipe from; what a plan can be checked against alone
+			// is that every response is a well-formed signature.
+			if err := validateSigningRecipeMetadata(signing, nil); err != nil {
 				return fmt.Errorf("plan repository %q: %w", repository.Name, err)
 			}
-			ids := []string{"deb-inrelease", "deb-release-gpg"}
-			for index, scheme := range []string{signer.SchemeOpenPGPCleartext, signer.SchemeOpenPGPDetached} {
-				node := signing.Nodes[index]
-				if node.ID != ids[index] || node.Kind != "sign" || len(node.DependsOn) == 0 || node.Scheme != scheme || !validSHA256(node.PayloadSHA256) || !validSHA256(node.ContentSHA256) || node.OutputPath == "" || len(node.Content) == 0 || len(node.Content) > 8<<20 {
+			for _, node := range signing.Nodes {
+				if !validSHA256(node.PayloadSHA256) || !validSHA256(node.ContentSHA256) || len(node.Content) == 0 || len(node.Content) > 8<<20 {
 					return fmt.Errorf("plan repository %q has invalid signing response", repository.Name)
 				}
 			}
@@ -2143,7 +2148,13 @@ func (preparation *applyPreparation) prepareRepository(planned state.PlanReposit
 		if err != nil || preparation.expiresAt.After(keyExpiresAt) {
 			return applyRepository{}, fmt.Errorf("repository %q plan expires after its signing key", planned.Name)
 		}
-		if err := validateSigningRecipeMetadata(signing, repository.Suite); err != nil {
+		// The repository is known here even though its tree is not, and the
+		// shape a format signs follows from the repository alone.
+		shape, err := signingShapeFor(repository)
+		if err != nil {
+			return applyRepository{}, fmt.Errorf("plan repository %q: %w", planned.Name, err)
+		}
+		if err := validateSigningRecipeMetadata(signing, &shape); err != nil {
 			return applyRepository{}, fmt.Errorf("plan repository %q: %w", planned.Name, err)
 		}
 	}

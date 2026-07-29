@@ -145,6 +145,25 @@ func InspectArmoredPublic(content []byte) (signer.Identity, error) {
 	return inspectEntity(entities[0])
 }
 
+// InspectArmoredPublicKeyring reads several armored keys from one file, which
+// is how a format that publishes armored keys serves a rotation: the successor
+// sits beside the key clients already hold.
+func InspectArmoredPublicKeyring(content []byte) ([]signer.Identity, error) {
+	entities, err := protonopenpgp.ReadArmoredKeyRing(bytes.NewReader(content))
+	if err != nil || len(entities) == 0 {
+		return nil, errors.New("invalid armored OpenPGP public keyring")
+	}
+	identities := make([]signer.Identity, 0, len(entities))
+	for _, entity := range entities {
+		identity, err := inspectEntity(entity)
+		if err != nil {
+			return nil, err
+		}
+		identities = append(identities, identity)
+	}
+	return identities, nil
+}
+
 func (local *Local) Identity(context.Context) (signer.Identity, error) {
 	return local.identity, nil
 }

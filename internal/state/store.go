@@ -107,7 +107,7 @@ func Setup(root string, options SetupOptions) error {
 		return err
 	}
 	if selectedFormat.ImplementsSigning() && len(options.SigningKeys) == 0 && !options.AllowUnsigned {
-		return errors.New("new Debian repository requires a signing key or explicit unsigned opt-out")
+		return fmt.Errorf("a new %s repository requires a signing key or explicit unsigned opt-out", options.Format)
 	}
 	if _, exists := manifest.Repositories[options.Name]; exists {
 		return fmt.Errorf("repository %q already exists", options.Name)
@@ -166,9 +166,13 @@ func Setup(root string, options SetupOptions) error {
 		if len(repository.Architectures) == 0 {
 			repository.Architectures = []string{"amd64"}
 		}
-		if len(repository.SigningKeys) == 1 {
-			repository.SigningKeyring = filepath.ToSlash(filepath.Join("keys", options.Name+"-archive-keyring.gpg"))
-		}
+	}
+	// Every signing format publishes the set of keys a client should trust, so
+	// the merged keyring is named here rather than per format. What a client
+	// installs differs — apt takes the binary keyring, a yum client the armored
+	// form — but which keys are in it does not.
+	if len(repository.SigningKeys) == 1 {
+		repository.SigningKeyring = filepath.ToSlash(filepath.Join("keys", options.Name+"-archive-keyring.gpg"))
 	}
 	if err := validateRepositorySigning(options.Name, repository, manifest.Keys); err != nil {
 		return err
