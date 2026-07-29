@@ -140,3 +140,28 @@ func TestBuildRendersAnEmptyRepository(t *testing.T) {
 		t.Fatalf("an empty repository has a non-empty index: %q", index)
 	}
 }
+
+// apk derives a package's URL from its index entry rather than from the
+// filename it was built with, so the published path has to be
+// <arch>/<pkgname>-<pkgver>.apk whatever the artifact was called. abuild
+// already names files that way, which is why a fixture from abuild alone
+// cannot show this; nfpm does not, and a real client reported the difference as
+// "package mentioned in index not found".
+func TestPublishedPathIsDerivedFromIdentity(t *testing.T) {
+	blob := realBlob(t)
+	blob.Filename = "snailmail_1.2.3-r4_x86_64.apk"
+	blob.Facts.Name = "snail-demo"
+	blob.Facts.Version = "1.2.3-r4"
+	blob.Facts.Architecture = "x86_64"
+	artifact := buildIndex(t, blob)
+
+	var published string
+	for _, file := range artifact.Files {
+		if file.BlobSHA256 != "" {
+			published = file.Path
+		}
+	}
+	if published != "x86_64/snail-demo-1.2.3-r4.apk" {
+		t.Fatalf("published at %q, want the name apk will ask for", published)
+	}
+}

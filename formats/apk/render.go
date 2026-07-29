@@ -145,7 +145,12 @@ func collectEntries(blobs []domain.Blob) ([]entry, error) {
 		if err != nil {
 			return nil, err
 		}
-		location := path.Join(pkg.Architecture, path.Base(blob.Filename))
+		// apk builds the download URL from the index entry, not from wherever the
+		// file happens to sit: <arch>/<pkgname>-<pkgver>.apk. A package whose
+		// filename differs — anything not produced by abuild — is reported as
+		// "package mentioned in index not found", so the published name is
+		// derived from identity rather than carried over from the artifact.
+		location := path.Join(pkg.Architecture, pkg.Name+"-"+pkg.Version+".apk")
 		if previous, taken := occupied[location]; taken {
 			if previous != blob.SHA256 {
 				return nil, fmt.Errorf("different bytes would occupy %q", location)
