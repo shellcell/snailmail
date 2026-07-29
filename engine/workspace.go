@@ -694,37 +694,53 @@ func restoreFailedPublication(ctx context.Context, item applyRepository, referen
 // staged trees on disk at the same time.
 const maxConcurrentRepositories = 4
 
-func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWorkspaceResult, error) {
+// openApply reads the plan and the workspace it was planned from, and refuses
+// anything that no longer matches: an expired plan, a changed manifest, a git
+// revision the plan was not made at. Every phase after this works from state
+// already checked against the plan, which is what lets them be read on their
+// own.
+//
+// The returned function releases the workspace lock. It is the caller's to
+// defer, because the lock has to outlive this call and everything it enables.
+func openApply(ctx context.Context, request ApplyWorkspaceRequest) (*applyPreparation, func(), error) {
 	root, err := workspaceRoot(request.Root)
 	if err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
 	unlock, err := state.AcquireWorkspaceLock(root)
 	if err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
-	defer unlock()
+	// The lock outlives this call on success, so it cannot simply be deferred —
+	// but every way of failing from here on has to release it, or the next run
+	// finds the workspace locked by a process that is no longer there.
+	opened := false
+	defer func() {
+		if !opened {
+			unlock()
+		}
+	}()
 	planName := request.Plan
 	if !filepath.IsAbs(planName) {
 		planName = filepath.Join(root, planName)
 	}
 	plan, err := state.LoadPlan(planName)
 	if err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
 	if plan.Payload.EngineVersion != phase1EngineVersion {
-		return ApplyWorkspaceResult{}, errors.New("plan engine version is incompatible")
+		return nil, nil, errors.New("plan engine version is incompatible")
 	}
 	now := request.currentTime()
 	expiresAt, err := time.Parse(time.RFC3339, plan.Payload.ExpiresAt)
 	if err != nil || !now.Before(expiresAt) {
-		return ApplyWorkspaceResult{}, errors.New("plan has expired")
+		return nil, nil, errors.New("plan has expired")
 	}
 	if err := validateApplyPlan(plan); err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
 	if request.StructuralOnly && plan.Payload.VerificationMode != "structural" {
-		return ApplyWorkspaceResult{}, errors.New("apply verification mode does not match the reviewed plan")
+		return nil, nil, errors.New("apply verification mode does not match the reviewed plan")
 	}
 	request.StructuralOnly = plan.Payload.VerificationMode == "structural"
 	plannedLedgerRepositories := make([]string, 0, len(plan.Payload.Repositories))
@@ -739,40 +755,39 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 	}
 	ledgerCommitted, err := state.ValidatePlanGit(root, plan.Payload.GitRevision, plan.PlanID, plannedLedgerRepositories, plannedDeploymentRepositories)
 	if err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
 	manifestPath, err := state.WorkspacePath(root, state.ManifestFilename)
 	if err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
 	manifestDigest, err := state.HashFile(manifestPath)
 	if err != nil || manifestDigest != plan.Payload.ManifestSHA256 {
-		return ApplyWorkspaceResult{}, errors.New("stale plan: manifest changed")
+		return nil, nil, errors.New("stale plan: manifest changed")
 	}
 	manifest, err := state.LoadManifest(root)
 	if err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
 	if len(plan.Payload.Repositories) != len(manifest.Repositories) {
-		return ApplyWorkspaceResult{}, errors.New("plan does not cover every configured repository")
+		return nil, nil, errors.New("plan does not cover every configured repository")
 	}
 	blobIdentity, err := blobStoreIdentity(manifest)
 	if err != nil || plan.Payload.WorkspaceID != manifest.Workspace.ID || plan.Payload.ForgeRepository != manifest.Workspace.ForgeRepository || plan.Payload.BlobStore != manifest.BlobStore || plan.Payload.BlobStoreIdentitySHA256 != blobIdentity {
-		return ApplyWorkspaceResult{}, errors.New("stale plan: blob store changed")
+		return nil, nil, errors.New("stale plan: blob store changed")
 	}
 	blobStore, err := resolveBlobStore(ctx, manifest, request.Blobs)
 	if err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
 	generatedAt, err := time.Parse(time.RFC3339, plan.Payload.GeneratedAt)
 	if err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
 	signatureTime, err := time.Parse(time.RFC3339, plan.Payload.CreatedAt)
 	if err != nil {
-		return ApplyWorkspaceResult{}, err
+		return nil, nil, err
 	}
-	var prepared []applyRepository
 	hosts := request.Hosts
 	if hosts == nil {
 		hosts = localHostResolver{}
@@ -782,49 +797,32 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		ctx: ctx, root: root, request: request, plan: plan, manifest: manifest, hosts: hosts,
 		blobStore: blobStore, now: now, expiresAt: expiresAt, generatedAt: generatedAt,
 		signatureTime: signatureTime, ledgerCommitted: ledgerCommitted,
+		plannedLedgerRepositories: plannedLedgerRepositories, plannedDeploymentRepositories: plannedDeploymentRepositories,
 	}
 	for _, planned := range plan.Payload.Repositories {
 		if seenRepositories[planned.Name] {
-			return ApplyWorkspaceResult{}, fmt.Errorf("plan contains duplicate repository %q", planned.Name)
+			return nil, nil, fmt.Errorf("plan contains duplicate repository %q", planned.Name)
 		}
 		seenRepositories[planned.Name] = true
 	}
-	// Repositories are prepared concurrently and committed in order.
-	//
-	// Preparing one reads desired state, builds into a staging directory of its
-	// own, and verifies it with real clients — none of which touches anything a
-	// sibling reads. Committing is where the shared state is: ledgers, receipts
-	// and the host itself, in the order the plan lists them. So the containers
-	// overlap and nothing else does. The container budget is process-wide, so
-	// this widens the pipe rather than asking for more of them at once.
-	prepared = make([]applyRepository, len(plan.Payload.Repositories))
-	failures := make([]error, len(plan.Payload.Repositories))
-	repositorySlots := make(chan struct{}, maxConcurrentRepositories)
-	var preparing sync.WaitGroup
-	for index, planned := range plan.Payload.Repositories {
-		preparing.Add(1)
-		go func(index int, planned state.PlanRepository) {
-			defer preparing.Done()
-			repositorySlots <- struct{}{}
-			defer func() { <-repositorySlots }()
-			prepared[index], failures[index] = preparation.prepareRepository(planned)
-		}(index, planned)
+	opened = true
+	return preparation, unlock, nil
+}
+
+func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWorkspaceResult, error) {
+	preparation, unlock, err := openApply(ctx, request)
+	if err != nil {
+		return ApplyWorkspaceResult{}, err
 	}
-	preparing.Wait()
-	for _, err := range failures {
-		if err == nil {
-			continue
-		}
-		// Every stage is removed, including those of repositories that prepared
-		// successfully alongside the one that did not: nothing is published
-		// from this apply, so nothing it built should be left behind.
-		for _, item := range prepared {
-			if item.stageRoot != "" {
-				_ = os.RemoveAll(item.stageRoot)
-			}
-		}
-		// The first failure in plan order, so a repeated apply names the same
-		// repository however the goroutines were scheduled.
+	defer unlock()
+	// The phases below are the order an apply happens in: build and verify
+	// every repository, check that each may take effect, stage them all on
+	// their hosts, record that they are about to be published, and only then
+	// switch them live. Everything before the last one can be abandoned without
+	// a host having changed, which is why the deferred cleanups sit here rather
+	// than inside the phases.
+	prepared, err := preparation.prepareRepositories()
+	if err != nil {
 		return ApplyWorkspaceResult{}, err
 	}
 	defer func() {
@@ -832,222 +830,37 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			_ = os.RemoveAll(item.stageRoot)
 		}
 	}()
-	authorize := func(item applyRepository) error {
-		if item.planned.Action == "noop" {
-			return nil
-		}
-		effectNow := request.currentTime()
-		if !effectNow.Before(expiresAt) {
-			return errors.New("plan expired before publication effect")
-		}
-		if item.repository.Gate == "auto" {
-			return nil
-		}
-		if request.Gates == nil {
-			return fmt.Errorf("repository %q requires %s gate evidence", item.planned.Name, item.repository.Gate)
-		}
-		if err := request.Gates.Authorize(ctx, gate.Requirement{
-			Policy: item.repository.Gate, PlanID: plan.PlanID, Repository: item.planned.Name,
-			GitRevision: plan.Payload.GitRevision, Root: root, Now: effectNow,
-			ForgeRepository: plan.Payload.ForgeRepository, ApprovalKeys: item.planned.ApprovalKeys,
-		}); err != nil {
-			return fmt.Errorf("repository %q gate: %w", item.planned.Name, err)
-		}
-		return nil
-	}
 	for _, item := range prepared {
-		if err := authorize(item); err != nil {
+		if err := preparation.authorize(item); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
 	}
 	defer func() {
 		for _, item := range prepared {
 			if item.hostStage.ID != "" {
-				cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+				cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(preparation.ctx), 30*time.Second)
 				_ = item.host.Abort(cleanupCtx, item.hostRepository, item.hostStage)
 				cancelCleanup()
 			}
 		}
 	}()
-	for index := range prepared {
-		item := &prepared[index]
-		if item.current {
-			continue
-		}
-		files, err := stagedHostFiles(item.stage, item.stagedManifest)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		if err := authorize(*item); err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		item.hostStage, err = item.host.Stage(ctx, item.hostRepository, host.StageRequest{
-			PlanID: plan.PlanID, ChangeID: item.planned.ChangeID, PreviousRevision: item.planned.ObservedRevision, Directory: item.stage,
-			TreeSHA256: item.planned.DesiredTreeSHA256, Files: files,
-			CommitPaths: repositoryCommitPaths(item.repository),
-		})
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		if request.StructuralOnly {
-			continue
-		}
-		if item.hostRepository.Type == "local" {
-			if _, err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
-				return ApplyWorkspaceResult{}, err
-			}
-			continue
-		}
-		if !host.Supports(item.hostRepository.Type, item.repository.Format).RemoteClientVerification {
-			return ApplyWorkspaceResult{}, fmt.Errorf("host preview verification is not implemented for format %q on host %q",
-				item.repository.Format, item.hostRepository.Type)
-		}
-		access := item.hostStage.Access
-		if access.Endpoint == "" {
-			access.Endpoint = item.hostStage.PreviewEndpoint
-		}
-		if access.Endpoint == "" {
-			// No preview site was configured, so there is no endpoint to install
-			// from before production changes. The staged tree is still checked by
-			// a real client, exactly as a local host is; what is not checked is
-			// that the host serves it correctly, which is what a preview buys.
-			if _, err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
-				return ApplyWorkspaceResult{}, err
-			}
-			continue
-		}
-		if err := verifyEndpointClient(ctx, item.repository, item.stage, access, request); err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-	}
-	if !ledgerCommitted {
-		for _, item := range prepared {
-			if item.planned.PublicationRecords {
-				if err := authorize(item); err != nil {
-					return ApplyWorkspaceResult{}, err
-				}
-			}
-		}
-	}
-	ledgerRepositories := plannedLedgerRepositories
-	ledgerRevision := ""
-	applyGitRevision := ""
-	if ledgerCommitted {
-		applyGitRevision, err = state.RequireCleanGit(root)
-		if err != nil {
-			return ApplyWorkspaceResult{}, errors.New("committed publication ledgers do not match the plan")
-		}
-		if len(ledgerRepositories) == 0 {
-			ledgerRevision = plan.Payload.GitRevision
-		} else {
-			ledgerRevision, err = state.PlanLedgerRevision(root, plan.PlanID)
-			if err != nil {
-				return ApplyWorkspaceResult{}, err
-			}
-			if err := state.ValidatePublicationCommitPaths(root, ledgerRevision, ledgerRepositories); err != nil {
-				return ApplyWorkspaceResult{}, err
-			}
-			for _, item := range prepared {
-				if !item.planned.PublicationRecords {
-					continue
-				}
-				if err := state.ValidateCommittedPublicationLedger(
-					root, plan.Payload.GitRevision, ledgerRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
-					item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, activeRepositoryLock(item.lock, item.repository),
-				); err != nil {
-					return ApplyWorkspaceResult{}, err
-				}
-			}
-		}
-	}
-	for _, item := range prepared {
-		if !item.planned.PublicationRecords {
-			continue
-		}
-		publishedLock := activeRepositoryLock(item.lock, item.repository)
-		if err := state.PreparePublicationRecords(
-			root, plan.Payload.GitRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
-			item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, publishedLock,
-		); err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-	}
-	if !ledgerCommitted && len(ledgerRepositories) != 0 {
-		ledgerRevision, err = state.CommitPublicationLedgers(root, plan.PlanID, plan.Payload.GitRevision, ledgerRepositories)
-		if err != nil {
-			return ApplyWorkspaceResult{}, fmt.Errorf("commit publication ledgers for %v: %w", ledgerRepositories, err)
-		}
-		applyGitRevision = ledgerRevision
-		if err := state.ValidatePublicationCommitPaths(root, ledgerRevision, ledgerRepositories); err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		for _, item := range prepared {
-			if !item.planned.PublicationRecords {
-				continue
-			}
-			if err := state.ValidateCommittedPublicationLedger(
-				root, plan.Payload.GitRevision, ledgerRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
-				item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, activeRepositoryLock(item.lock, item.repository),
-			); err != nil {
-				return ApplyWorkspaceResult{}, err
-			}
-		}
-	} else if !ledgerCommitted {
-		ledgerRevision = plan.Payload.GitRevision
-		applyGitRevision = ledgerRevision
-	}
-	needsPublication := false
-	for _, item := range prepared {
-		if !item.current {
-			needsPublication = true
-			break
-		}
-	}
-	var unlockGit func()
-	if needsPublication {
-		unlockGit, err = state.AcquireGitRevisionLock(root, applyGitRevision)
-		if err != nil {
-			return ApplyWorkspaceResult{}, err
-		}
-		defer func() {
-			if unlockGit != nil {
-				unlockGit()
-			}
-		}()
-	} else if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
+	if err := preparation.stageOnHosts(prepared); err != nil {
 		return ApplyWorkspaceResult{}, err
 	}
-	result := ApplyWorkspaceResult{PlanID: plan.PlanID}
-	deployments := make([]state.DeploymentRecord, 0, len(prepared))
-	execution := &applyExecution{
-		ctx: ctx, root: root, request: request, plan: plan,
-		applyGitRevision: applyGitRevision, authorize: authorize, result: result,
-	}
-	for _, item := range prepared {
-		var err error
-		if item.current {
-			err = execution.verifyCurrent(item)
-		} else {
-			err = execution.publish(item)
-		}
-		if err != nil {
-			return execution.result, err
+	if !preparation.ledgerCommitted {
+		for _, item := range prepared {
+			if item.planned.PublicationRecords {
+				if err := preparation.authorize(item); err != nil {
+					return ApplyWorkspaceResult{}, err
+				}
+			}
 		}
 	}
-	result, deployments = execution.result, execution.deployments
-	if unlockGit != nil {
-		unlockGit()
-		unlockGit = nil
+	applyGitRevision, err := preparation.commitPublicationLedgers(prepared)
+	if err != nil {
+		return ApplyWorkspaceResult{}, err
 	}
-	if request.beforeDeploymentCommit != nil {
-		if err := request.beforeDeploymentCommit(); err != nil {
-			return result, fmt.Errorf("before deployment receipt commit: %w", err)
-		}
-	}
-	if _, err := state.CommitDeployments(root, plan.PlanID, applyGitRevision, deployments); err != nil {
-		return result, fmt.Errorf("record successful deployments: %w", err)
-	}
-	return result, nil
+	return preparation.publishAndRecord(prepared, applyGitRevision)
 }
 
 func (request ApplyWorkspaceRequest) currentTime() time.Time {
@@ -2117,6 +1930,298 @@ type applyPreparation struct {
 	generatedAt     time.Time
 	signatureTime   time.Time
 	ledgerCommitted bool
+	// The repositories whose ledgers and deployment receipts this plan expects
+	// to write, gathered while the plan was being checked.
+	plannedLedgerRepositories     []string
+	plannedDeploymentRepositories []string
+}
+
+// commitPublicationLedgers records that these trees are about to be published,
+// and returns the git revision the apply is bound to.
+//
+// The ledger is written and committed before anything reaches a host, so a
+// publication that is interrupted leaves evidence it was attempted rather than
+// a tree nothing accounts for. A plan whose ledgers were already committed by
+// an earlier run is validated instead of rewritten, which is what makes a
+// retried apply safe.
+func (preparation *applyPreparation) commitPublicationLedgers(prepared []applyRepository) (string, error) {
+	root, plan := preparation.root, preparation.plan
+	ledgerCommitted := preparation.ledgerCommitted
+	ledgerRepositories := preparation.plannedLedgerRepositories
+	ledgerRevision := ""
+	applyGitRevision := ""
+	var err error
+	if ledgerCommitted {
+		applyGitRevision, err = state.RequireCleanGit(root)
+		if err != nil {
+			return "", errors.New("committed publication ledgers do not match the plan")
+		}
+		if len(ledgerRepositories) == 0 {
+			ledgerRevision = plan.Payload.GitRevision
+		} else {
+			ledgerRevision, err = state.PlanLedgerRevision(root, plan.PlanID)
+			if err != nil {
+				return "", err
+			}
+			if err := state.ValidatePublicationCommitPaths(root, ledgerRevision, ledgerRepositories); err != nil {
+				return "", err
+			}
+			for _, item := range prepared {
+				if !item.planned.PublicationRecords {
+					continue
+				}
+				if err := state.ValidateCommittedPublicationLedger(
+					root, plan.Payload.GitRevision, ledgerRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
+					item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, activeRepositoryLock(item.lock, item.repository),
+				); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+	for _, item := range prepared {
+		if !item.planned.PublicationRecords {
+			continue
+		}
+		publishedLock := activeRepositoryLock(item.lock, item.repository)
+		if err := state.PreparePublicationRecords(
+			root, plan.Payload.GitRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
+			item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, publishedLock,
+		); err != nil {
+			return "", err
+		}
+	}
+	if !ledgerCommitted && len(ledgerRepositories) != 0 {
+		ledgerRevision, err = state.CommitPublicationLedgers(root, plan.PlanID, plan.Payload.GitRevision, ledgerRepositories)
+		if err != nil {
+			return "", fmt.Errorf("commit publication ledgers for %v: %w", ledgerRepositories, err)
+		}
+		applyGitRevision = ledgerRevision
+		if err := state.ValidatePublicationCommitPaths(root, ledgerRevision, ledgerRepositories); err != nil {
+			return "", err
+		}
+		for _, item := range prepared {
+			if !item.planned.PublicationRecords {
+				continue
+			}
+			if err := state.ValidateCommittedPublicationLedger(
+				root, plan.Payload.GitRevision, ledgerRevision, item.planned.Name, plan.PlanID, item.planned.ChangeID,
+				item.planned.DesiredTreeSHA256, plan.Payload.CreatedAt, activeRepositoryLock(item.lock, item.repository),
+			); err != nil {
+				return "", err
+			}
+		}
+	} else if !ledgerCommitted {
+		ledgerRevision = plan.Payload.GitRevision
+		applyGitRevision = ledgerRevision
+	}
+	return applyGitRevision, nil
+}
+
+// publishAndRecord switches every staged repository live and writes the
+// deployment receipts.
+//
+// This is the irreversible part, and it is last for that reason: everything
+// before it can be abandoned without a host having changed. The git revision is
+// locked for the duration so nothing commits underneath a publication, and
+// released before the receipts are written — a receipt is a record of what has
+// already happened, and holding the lock to write one would block the very
+// commit it describes.
+func (preparation *applyPreparation) publishAndRecord(prepared []applyRepository, applyGitRevision string) (ApplyWorkspaceResult, error) {
+	ctx, root, request, plan := preparation.ctx, preparation.root, preparation.request, preparation.plan
+	var err error
+	needsPublication := false
+	for _, item := range prepared {
+		if !item.current {
+			needsPublication = true
+			break
+		}
+	}
+	var unlockGit func()
+	if needsPublication {
+		unlockGit, err = state.AcquireGitRevisionLock(root, applyGitRevision)
+		if err != nil {
+			return ApplyWorkspaceResult{}, err
+		}
+		defer func() {
+			if unlockGit != nil {
+				unlockGit()
+			}
+		}()
+	} else if err := state.AssertGitRevision(root, applyGitRevision); err != nil {
+		return ApplyWorkspaceResult{}, err
+	}
+	result := ApplyWorkspaceResult{PlanID: plan.PlanID}
+	deployments := make([]state.DeploymentRecord, 0, len(prepared))
+	execution := &applyExecution{
+		ctx: ctx, root: root, request: request, plan: plan,
+		applyGitRevision: applyGitRevision, authorize: preparation.authorize, result: result,
+	}
+	for _, item := range prepared {
+		var err error
+		if item.current {
+			err = execution.verifyCurrent(item)
+		} else {
+			err = execution.publish(item)
+		}
+		if err != nil {
+			return execution.result, err
+		}
+	}
+	result, deployments = execution.result, execution.deployments
+	if unlockGit != nil {
+		unlockGit()
+		unlockGit = nil
+	}
+	if request.beforeDeploymentCommit != nil {
+		if err := request.beforeDeploymentCommit(); err != nil {
+			return result, fmt.Errorf("before deployment receipt commit: %w", err)
+		}
+	}
+	if _, err := state.CommitDeployments(root, plan.PlanID, applyGitRevision, deployments); err != nil {
+		return result, fmt.Errorf("record successful deployments: %w", err)
+	}
+	return result, nil
+}
+
+// stageOnHosts puts every repository that is not already current onto its host,
+// leaving each staged but not yet live.
+//
+// Staging and switching are separate so a run that fails partway leaves nothing
+// half-published: the stages are aborted by the caller's cleanup, and the hosts
+// go on serving what they were serving. The gate is checked again for each
+// repository here, immediately before its bytes reach a host, because building
+// and verifying takes long enough for an approval to expire in between.
+func (preparation *applyPreparation) stageOnHosts(prepared []applyRepository) error {
+	ctx, request, plan := preparation.ctx, preparation.request, preparation.plan
+	for index := range prepared {
+		item := &prepared[index]
+		if item.current {
+			continue
+		}
+		files, err := stagedHostFiles(item.stage, item.stagedManifest)
+		if err != nil {
+			return err
+		}
+		if err := preparation.authorize(*item); err != nil {
+			return err
+		}
+		item.hostStage, err = item.host.Stage(ctx, item.hostRepository, host.StageRequest{
+			PlanID: plan.PlanID, ChangeID: item.planned.ChangeID, PreviousRevision: item.planned.ObservedRevision, Directory: item.stage,
+			TreeSHA256: item.planned.DesiredTreeSHA256, Files: files,
+			CommitPaths: repositoryCommitPaths(item.repository),
+		})
+		if err != nil {
+			return err
+		}
+		if request.StructuralOnly {
+			continue
+		}
+		if item.hostRepository.Type == "local" {
+			if _, err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
+				return err
+			}
+			continue
+		}
+		if !host.Supports(item.hostRepository.Type, item.repository.Format).RemoteClientVerification {
+			return fmt.Errorf("host preview verification is not implemented for format %q on host %q",
+				item.repository.Format, item.hostRepository.Type)
+		}
+		access := item.hostStage.Access
+		if access.Endpoint == "" {
+			access.Endpoint = item.hostStage.PreviewEndpoint
+		}
+		if access.Endpoint == "" {
+			// No preview site was configured, so there is no endpoint to install
+			// from before production changes. The staged tree is still checked by
+			// a real client, exactly as a local host is; what is not checked is
+			// that the host serves it correctly, which is what a preview buys.
+			if _, err := verifyStaged(ctx, item.repository.Format, item.stage, request); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := verifyEndpointClient(ctx, item.repository, item.stage, access, request); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// authorize checks that a repository may take effect now.
+//
+// The expiry is rechecked here rather than only when the plan was read, because
+// building and verifying takes time: a plan that was live when the apply
+// started can have expired by the time it reaches a host, and publishing then
+// would be acting on a review that has run out.
+func (preparation *applyPreparation) authorize(item applyRepository) error {
+	if item.planned.Action == "noop" {
+		return nil
+	}
+	effectNow := preparation.request.currentTime()
+	if !effectNow.Before(preparation.expiresAt) {
+		return errors.New("plan expired before publication effect")
+	}
+	if item.repository.Gate == "auto" {
+		return nil
+	}
+	if preparation.request.Gates == nil {
+		return fmt.Errorf("repository %q requires %s gate evidence", item.planned.Name, item.repository.Gate)
+	}
+	plan := preparation.plan
+	if err := preparation.request.Gates.Authorize(preparation.ctx, gate.Requirement{
+		Policy: item.repository.Gate, PlanID: plan.PlanID, Repository: item.planned.Name,
+		GitRevision: plan.Payload.GitRevision, Root: preparation.root, Now: effectNow,
+		ForgeRepository: plan.Payload.ForgeRepository, ApprovalKeys: item.planned.ApprovalKeys,
+	}); err != nil {
+		return fmt.Errorf("repository %q gate: %w", item.planned.Name, err)
+	}
+	return nil
+}
+
+// prepareRepositories builds and verifies every planned repository.
+//
+// They are prepared concurrently and committed in order. Preparing one reads
+// desired state, builds into a staging directory of its own, and verifies it
+// with real clients — none of which touches anything a sibling reads.
+// Committing is where the shared state is: ledgers, receipts and the host
+// itself, in the order the plan lists them. So the containers overlap and
+// nothing else does. The container budget is process-wide, so this widens the
+// pipe rather than asking for more containers at once.
+//
+// On failure nothing is left behind: every stage is removed, including those of
+// repositories that prepared successfully alongside the one that did not, since
+// nothing is published from an apply that failed.
+func (preparation *applyPreparation) prepareRepositories() ([]applyRepository, error) {
+	planned := preparation.plan.Payload.Repositories
+	prepared := make([]applyRepository, len(planned))
+	failures := make([]error, len(planned))
+	slots := make(chan struct{}, maxConcurrentRepositories)
+	var preparing sync.WaitGroup
+	for index, planned := range planned {
+		preparing.Add(1)
+		go func(index int, planned state.PlanRepository) {
+			defer preparing.Done()
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			prepared[index], failures[index] = preparation.prepareRepository(planned)
+		}(index, planned)
+	}
+	preparing.Wait()
+	for _, err := range failures {
+		if err == nil {
+			continue
+		}
+		for _, item := range prepared {
+			if item.stageRoot != "" {
+				_ = os.RemoveAll(item.stageRoot)
+			}
+		}
+		// The first failure in plan order, so a repeated apply names the same
+		// repository however the goroutines were scheduled.
+		return nil, err
+	}
+	return prepared, nil
 }
 
 // prepareRepository checks one planned repository against the workspace it was

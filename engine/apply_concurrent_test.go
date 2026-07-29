@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/shellcell/snailmail/internal/state"
 )
 
 // A workspace of several repositories is prepared concurrently and committed in
@@ -115,4 +117,42 @@ func TestApplyReportsTheFirstFailureInPlanOrder(t *testing.T) {
 			t.Fatalf("the same defect was reported two ways:\n%s\n%s", first, err)
 		}
 	}
+}
+
+// A failed apply releases the workspace lock.
+//
+// openApply takes the lock and hands it back for the caller to defer, so the
+// lock outlives the call that acquired it. Every way of failing in between has
+// to release it — when one did not, the workspace stayed locked by a process
+// that had already exited, and the next run failed with "another snailmail
+// workspace operation is running" instead of the real problem.
+func TestFailedApplyReleasesTheWorkspaceLock(t *testing.T) {
+	root := multiRepositoryWorkspace(t, "pypi", "deb")
+	planName := filepath.Join(root, "plan.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: planName, ExpiresIn: time.Hour, VerificationMode: "structural",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Make the plan stale, so the apply fails after the lock has been taken.
+	lock := filepath.Join(root, "repos", "deb.lock.toml")
+	content, err := os.ReadFile(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lock, append(content, []byte("\n# changed after planning\n")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, StructuralOnly: true,
+	}); err == nil {
+		t.Fatal("a stale plan was accepted")
+	}
+	// The lock must be free: taking it here is what proves the failed apply let
+	// go of it, and any other workspace operation would find the same.
+	release, err := state.AcquireWorkspaceLock(root)
+	if err != nil {
+		t.Fatalf("the workspace stayed locked after a failed apply: %v", err)
+	}
+	release()
 }
