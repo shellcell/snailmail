@@ -6,14 +6,15 @@ import (
 	"github.com/shellcell/snailmail/formats"
 )
 
-// knownSigningNode recognises a plan's signing nodes by asking each format what
-// shape it produces, using fabricated inputs. This checks that answer against
-// the shapes real repositories actually produce.
+// knownSigningNode is what a plan's signing nodes are checked against before
+// its repository is rebuilt, and it asks the formats what they declare. This
+// checks that a node a real repository actually produces is one it accepts.
 //
 // It matters because the failure is quiet: an unrecognised node rejects a valid
-// plan with a message about node identity, which is exactly how the hand-kept
-// allow-list this replaced was found to be out of date.
-func TestProbeMatchesRealShapes(t *testing.T) {
+// plan with a message about node identity, naming nothing an operator can act
+// on. That is how the hand-kept allow-list this replaced was found to be out of
+// date, and it is why the answer is now declared rather than inferred.
+func TestKnownSigningNodeAcceptsWhatFormatsProduce(t *testing.T) {
 	real := []struct {
 		name       string
 		repository formats.Repository
@@ -24,10 +25,8 @@ func TestProbeMatchesRealShapes(t *testing.T) {
 		{"apk", formats.Repository{Architectures: []string{"x86_64", "aarch64", "armv7"}}, nil},
 		{"helm", formats.Repository{}, []string{"charts/aa/x-1.0.0.tgz", "charts/bb/y-2.0.0.tgz"}},
 	}
-	// Every signing format must appear above. knownSigningNode probes the
-	// formats with fabricated inputs, so a format whose shape depends on
-	// something the probe does not supply would be silently unrecognised — the
-	// same failure as the hand-kept allow-list this replaced, and harder to see.
+	// Every signing format must appear above, so no format's real nodes go
+	// unchecked against what the engine will accept.
 	covered := make(map[string]bool, len(real))
 	for _, c := range real {
 		covered[c.name] = true

@@ -458,8 +458,14 @@ func validateLockedBlobOpenContext(ctx context.Context, file *os.File, pathInfo 
 	// Establish that these bytes are exactly the locked content before consulting
 	// any memo, so a cached parse is only ever reused for content this call has
 	// itself just verified.
+	// A recorded MD5 or SHA-1 is compared only where one was derived. A lock
+	// written before these were computed by need records both for every format;
+	// this reads a format that publishes neither, so there is nothing to compare
+	// against and an absent value is not a disagreement. The content is still
+	// pinned: SHA-256 is checked on the line above, and bytes matching it match
+	// every other digest of them.
 	if size != info.Size() || validated.Size != locked.Size || validated.SHA256 != locked.SHA256 ||
-		(locked.MD5 != "" && validated.MD5 != locked.MD5) || (locked.SHA1 != "" && validated.SHA1 != locked.SHA1) {
+		legacyDigestConflict(locked, LockedBlob{MD5: validated.MD5, SHA1: validated.SHA1}) {
 		return domain.Blob{}, fmt.Errorf("%w: blob sha256:%s disagrees with its lock", blob.ErrCorrupt, locked.SHA256)
 	}
 	facts, cached := factscache.Lookup(format, validated.SHA256)

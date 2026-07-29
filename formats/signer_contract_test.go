@@ -14,6 +14,7 @@ import (
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/testutil"
 	"github.com/shellcell/snailmail/signer"
+	apkrsa "github.com/shellcell/snailmail/signer/apkrsa"
 	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
@@ -288,5 +289,163 @@ func TestSignerForRefusesUnsignedFormats(t *testing.T) {
 	}
 	if _, err := SignerFor("not-a-format"); err == nil {
 		t.Error("an unknown format was offered as a signer")
+	}
+}
+
+// apk is the one format that does not verify with OpenPGP: its clients hold a
+// bare RSA public key by filename, so it needs its own key and its own round
+// trip. Its PlaceSignatures was the last one no automated test reached.
+func TestAPKPlaceSignaturesRefusesASignatureThatDoesNotVerify(t *testing.T) {
+	at := time.Unix(1_700_000_100, 0).UTC()
+	generated, err := apkrsa.Generate(time.Unix(1_700_000_000, 0).UTC(), 48*time.Hour, []byte(signingPassphrase))
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, err := apkrsa.Open(generated.PrivateArmor, []byte(signingPassphrase), generated.Identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+
+	selected, err := For("apk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob := fixtureBlob(t, "apk", "snail-demo-1.2.3-r4.apk")
+	// A noarch package is served under every architecture the repository has,
+	// so the index architecture is the repository's rather than the package's.
+	repository := Repository{Architectures: []string{"x86_64"}}
+	artifact, err := selected.Build([]domain.Blob{blob}, BuildOptions{Repository: repository, GeneratedAt: at})
+	if err != nil {
+		t.Fatal(err)
+	}
+	signing, err := SignerFor("apk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shape, err := signing.SigningShape(repository, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloads, err := signing.SigningPayloads(artifact, repository, shape, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signatures := make(map[string][]byte, len(shape.Outputs))
+	for _, output := range shape.Outputs {
+		response, err := local.Sign(context.Background(), signer.Request{
+			Scheme: output.Scheme, Payload: payloads[output.Path], CreatedAt: at,
+		})
+		if err != nil {
+			t.Fatalf("signing %s: %v", output.Path, err)
+		}
+		signatures[output.Path] = response.Content
+	}
+	material := SigningMaterial{
+		Fingerprint: generated.Identity.Fingerprint,
+		PublicArmor: generated.PublicArmor, PublicArmorPath: "keys/alpine.rsa.pub",
+		SignatureTime: at, Signatures: signatures,
+	}
+	if _, err := signing.PlaceSignatures(artifact, repository, material); err != nil {
+		t.Fatalf("a sound apk signature was refused: %v", err)
+	}
+
+	// The check that matters: a signature which does not verify must not reach
+	// a repository, because apk reports one as a corrupt index.
+	for _, output := range shape.Outputs {
+		altered := material
+		altered.Signatures = map[string][]byte{}
+		for path, content := range signatures {
+			altered.Signatures[path] = append([]byte(nil), content...)
+		}
+		corrupted := altered.Signatures[output.Path]
+		corrupted[len(corrupted)/2] ^= 0x01
+		if _, err := signing.PlaceSignatures(artifact, repository, altered); err == nil {
+			t.Errorf("a corrupted apk signature at %s was published", output.Path)
+		}
+	}
+}
+
+// A format that signs an index rather than each artifact predicts no paths:
+// its signing shape follows from the repository's configuration alone, so it
+// has nothing to say about which artifacts happen to be published.
+func TestOnlyPerArtifactSignersPredictPaths(t *testing.T) {
+	artifacts := []PublishedArtifact{{Filename: "x-1.0.0.tgz", SHA256: "aa"}}
+	for _, name := range []string{"deb", "rpm", "apk"} {
+		signing, err := SignerFor(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if paths := signing.PublishedPaths(artifacts); len(paths) != 0 {
+			t.Errorf("format %q predicts %v, but signs an index", name, paths)
+		}
+	}
+	helm, err := SignerFor("helm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths := helm.PublishedPaths(artifacts); len(paths) != 1 {
+		t.Errorf("helm predicted %v, want one path per chart", paths)
+	}
+}
+
+// The refusal an operator sees when a format cannot sign has to name it.
+func TestUnsignedFormatErrorNamesTheFormat(t *testing.T) {
+	_, err := SignerFor("pypi")
+	if err == nil || !strings.Contains(err.Error(), "pypi") {
+		t.Fatalf("error %v does not name the format", err)
+	}
+}
+
+// A format declares the payload its signatures depend on and the schemes they
+// use, and that declaration is what a plan is checked against before anything
+// is rebuilt. It has to agree with what the format actually produces, or a
+// valid plan is refused — or worse, an invalid one accepted.
+func TestDeclaredNodesMatchTheShapes(t *testing.T) {
+	realistic := map[string]struct {
+		repository Repository
+		published  []string
+	}{
+		"deb":  {Repository{Suite: "bookworm", Component: "main", Architectures: []string{"amd64", "arm64"}}, nil},
+		"rpm":  {Repository{}, nil},
+		"apk":  {Repository{Architectures: []string{"x86_64", "aarch64", "armv7"}}, nil},
+		"helm": {Repository{}, []string{"charts/aa/x-1.0.0.tgz", "charts/bb/y-2.0.0.tgz"}},
+	}
+	for _, name := range Names() {
+		signing, err := SignerFor(name)
+		if err != nil {
+			continue
+		}
+		shaped, covered := realistic[name]
+		if !covered {
+			t.Errorf("format %q signs but has no realistic repository here, so its declaration is unchecked", name)
+			continue
+		}
+		shape, err := signing.SigningShape(shaped.repository, shaped.published)
+		if err != nil {
+			t.Fatalf("format %q: %v", name, err)
+		}
+		payloadID, schemes := signing.SigningNode()
+		if payloadID != shape.PayloadID {
+			t.Errorf("format %q declares payload %q but produces %q", name, payloadID, shape.PayloadID)
+		}
+		declared := map[string]bool{}
+		for _, scheme := range schemes {
+			declared[scheme] = true
+		}
+		produced := map[string]bool{}
+		for _, output := range shape.Outputs {
+			produced[output.Scheme] = true
+			if !declared[output.Scheme] {
+				t.Errorf("format %q produces scheme %q it does not declare", name, output.Scheme)
+			}
+		}
+		// The other direction too: a declared scheme nothing produces would let
+		// a plan carry a signature this format never makes.
+		for scheme := range declared {
+			if !produced[scheme] {
+				t.Errorf("format %q declares scheme %q it never produces", name, scheme)
+			}
+		}
 	}
 }

@@ -286,17 +286,12 @@ func knownSigningNode(scheme, payloadID string) bool {
 		if err != nil {
 			continue
 		}
-		// A shape wide enough to answer for the formats whose outputs depend on
-		// what a repository serves: one architecture and one artifact are
-		// enough to produce every identifier and scheme the format uses.
-		shape, err := signing.SigningShape(
-			formats.Repository{Suite: "stable", Component: "main", Architectures: []string{"amd64"}},
-			[]string{"artifact"})
-		if err != nil || shape.PayloadID != payloadID {
+		declared, schemes := signing.SigningNode()
+		if declared != payloadID {
 			continue
 		}
-		for _, output := range shape.Outputs {
-			if output.Scheme == scheme {
+		for _, candidate := range schemes {
+			if candidate == scheme {
 				return true
 			}
 		}

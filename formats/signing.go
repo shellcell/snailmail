@@ -88,6 +88,18 @@ type Signer interface {
 	// PlaceSignatures writes the signatures and the public material into the
 	// artifact, verifying each one before it is published.
 	PlaceSignatures(artifact domain.RepositoryArtifact, repository Repository, material SigningMaterial) (domain.RepositoryArtifact, error)
+	// SigningNode names the payload every signature of this format depends on,
+	// and the schemes those signatures are made with.
+	//
+	// A reviewed plan carries signing nodes, and a plan read before its
+	// repository is rebuilt can only be checked against what the formats say
+	// they produce. Declared rather than inferred: deriving it by calling
+	// SigningShape with invented inputs meant a format whose shape depended on
+	// something those inputs did not supply went silently unrecognised, and a
+	// valid plan was refused with a message naming nothing an operator could
+	// act on. TestDeclaredNodesMatchTheShapes holds the declaration to what the
+	// shapes actually produce.
+	SigningNode() (payloadID string, schemes []string)
 	// PublishedPaths says where locked artifacts will be served from, for a
 	// format whose signing shape depends on which artifacts there are.
 	//
@@ -125,6 +137,15 @@ func (err *UnsignedFormatError) Error() string {
 	return "repository signing is not implemented for format " + err.Format
 }
 
+// The payload each format signs over. Named once so the shape and the
+// declaration below are the same string rather than two literals.
+const (
+	debPayloadID  = "deb-release"
+	rpmPayloadID  = "rpm-repomd"
+	apkPayloadID  = "apk-index"
+	helmPayloadID = "helm-provenance"
+)
+
 // --- deb ---------------------------------------------------------------
 
 func (debFormat) SigningShape(repository Repository, _ []string) (SigningShape, error) {
@@ -133,7 +154,7 @@ func (debFormat) SigningShape(repository Repository, _ []string) (SigningShape, 
 	// can check the suite.
 	suite := path.Join("dists", defaulted(repository.Suite, "stable"))
 	return SigningShape{
-		PayloadID: "deb-release",
+		PayloadID: debPayloadID,
 		Outputs: []SigningOutput{
 			{ID: "deb-inrelease", Scheme: signer.SchemeOpenPGPCleartext, Path: path.Join(suite, "InRelease")},
 			{ID: "deb-release-gpg", Scheme: signer.SchemeOpenPGPDetached, Path: path.Join(suite, "Release.gpg")},
@@ -171,6 +192,11 @@ func (format debFormat) PlaceSignatures(artifact domain.RepositoryArtifact, repo
 	})
 }
 
+// apt accepts either an inline or a detached signature over the same document.
+func (debFormat) SigningNode() (string, []string) {
+	return debPayloadID, []string{signer.SchemeOpenPGPCleartext, signer.SchemeOpenPGPDetached}
+}
+
 func (debFormat) PublishedPaths([]PublishedArtifact) []string { return nil }
 
 func (debFormat) ClientKeyPath(_ Repository, material SigningMaterial) string {
@@ -181,7 +207,7 @@ func (debFormat) ClientKeyPath(_ Repository, material SigningMaterial) string {
 
 func (rpmFormat) SigningShape(Repository, []string) (SigningShape, error) {
 	return SigningShape{
-		PayloadID: "rpm-repomd",
+		PayloadID: rpmPayloadID,
 		Outputs:   []SigningOutput{{ID: "rpm-repomd-asc", Scheme: signer.SchemeOpenPGPDetached, Path: rpm.SignaturePath}},
 	}, nil
 }
@@ -205,6 +231,10 @@ func (format rpmFormat) PlaceSignatures(artifact domain.RepositoryArtifact, _ Re
 
 // A yum client imports an armored key where apt takes a binary keyring, so the
 // published form differs even though the key does not.
+func (rpmFormat) SigningNode() (string, []string) {
+	return rpmPayloadID, []string{signer.SchemeOpenPGPDetached}
+}
+
 func (rpmFormat) PublishedPaths([]PublishedArtifact) []string { return nil }
 
 func (rpmFormat) ClientKeyPath(_ Repository, material SigningMaterial) string {
@@ -228,7 +258,7 @@ func (apkFormat) SigningShape(repository Repository, _ []string) (SigningShape, 
 	if len(outputs) == 0 {
 		return SigningShape{}, errors.New("an Alpine repository must serve at least one architecture to be signed")
 	}
-	return SigningShape{PayloadID: "apk-index", Outputs: outputs}, nil
+	return SigningShape{PayloadID: apkPayloadID, Outputs: outputs}, nil
 }
 
 func (apkFormat) SigningPayloads(artifact domain.RepositoryArtifact, _ Repository, shape SigningShape, _ ArtifactContent) (map[string][]byte, error) {
@@ -256,6 +286,10 @@ func (apkFormat) PlaceSignatures(artifact domain.RepositoryArtifact, _ Repositor
 	})
 }
 
+func (apkFormat) SigningNode() (string, []string) {
+	return apkPayloadID, []string{signer.SchemeAPKRSA256}
+}
+
 func (apkFormat) PublishedPaths([]PublishedArtifact) []string { return nil }
 
 // apk finds a key by the filename its index names, so the client path is the
@@ -278,7 +312,7 @@ func (helmFormat) SigningShape(_ Repository, published []string) (SigningShape, 
 			Path: chart + helm.ProvenanceSuffix,
 		})
 	}
-	return SigningShape{PayloadID: "helm-provenance", Outputs: outputs}, nil
+	return SigningShape{PayloadID: helmPayloadID, Outputs: outputs}, nil
 }
 
 func (helmFormat) SigningPayloads(artifact domain.RepositoryArtifact, repository Repository, shape SigningShape, content ArtifactContent) (map[string][]byte, error) {
@@ -324,6 +358,10 @@ func (helmFormat) PlaceSignatures(artifact domain.RepositoryArtifact, _ Reposito
 		PublicKeyring: material.PublicKeyring, KeyringPath: material.KeyringPath,
 		SignatureTime: material.SignatureTime, Provenance: provenance,
 	})
+}
+
+func (helmFormat) SigningNode() (string, []string) {
+	return helmPayloadID, []string{signer.SchemeOpenPGPCleartext}
 }
 
 // A chart is served from a content-addressed directory, which is what makes a

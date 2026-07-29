@@ -91,3 +91,26 @@ func TestSHA256IsAlwaysComputed(t *testing.T) {
 		}
 	}
 }
+
+// The blob validator compares a recorded digest against a derived one, and it
+// must apply the same rule as the lock writer: compare where both are known.
+//
+// This was missed when the writer was fixed, and every existing workspace
+// reported its own artifacts as corrupt — "blob sha256:... disagrees with its
+// lock" — because the lock recorded an MD5 the reader no longer derives.
+func TestValidationDoesNotDemandDigestsItNoLongerDerives(t *testing.T) {
+	recorded := LockedBlob{
+		SHA256: "abc",
+		MD5:    "d41d8cd98f00b204e9800998ecf8427e",
+		SHA1:   "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+	}
+	derived := LockedBlob{SHA256: "abc"}
+	if legacyDigestConflict(recorded, derived) {
+		t.Fatal("a lock recording digests this format no longer derives was read as corrupt")
+	}
+	// A format that does derive them still has them checked.
+	wrong := LockedBlob{SHA256: "abc", MD5: "00000000000000000000000000000000"}
+	if !legacyDigestConflict(recorded, wrong) {
+		t.Error("a derived MD5 that contradicts the lock was accepted")
+	}
+}

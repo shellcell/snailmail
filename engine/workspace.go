@@ -435,6 +435,155 @@ func ConfigureBlobStore(ctx context.Context, request ConfigureBlobStoreRequest) 
 	return state.WriteManifest(root, candidate)
 }
 
+// planPreparation is the workspace a plan is being made from, read once and
+// then asked about each repository in turn.
+type planPreparation struct {
+	ctx         context.Context
+	root        string
+	request     PlanWorkspaceRequest
+	manifest    state.Manifest
+	hosts       host.Resolver
+	blobStore   blob.Store
+	createdAt   time.Time
+	generatedAt time.Time
+	expiresIn   time.Duration
+}
+
+// planRepository works out what one repository needs, without changing
+// anything: it reads desired state, asks its host what is being served, and
+// says which of the two a plan would have to reconcile.
+//
+// It returns the planned repository and the artifacts the plan will have to
+// acquire. Whether that amounts to a change is the caller's to total, because
+// a plan's size is a property of the workspace rather than of any one
+// repository in it.
+func (preparation *planPreparation) planRepository(name string) (state.PlanRepository, []PlannedAcquisition, error) {
+	ctx, root, request := preparation.ctx, preparation.root, preparation.request
+	manifest, hosts, blobStore := preparation.manifest, preparation.hosts, preparation.blobStore
+	createdAt, generatedAt, expiresIn := preparation.createdAt, preparation.generatedAt, preparation.expiresIn
+	var planned []PlannedAcquisition
+	repository := manifest.Repositories[name]
+	lock, err := state.LoadLock(root, repository)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	if err := state.ValidateLock(lock, name, repository.Format); err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	ledger, err := state.LoadLedgerHistory(root, name)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	if err := validateRotationKeyValidity(repository, manifest.Keys, createdAt); err != nil {
+		return state.PlanRepository{}, nil, fmt.Errorf("repository %q: %w", name, err)
+	}
+	deployment, err := state.LoadDeployment(root, name)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	lockPath, err := state.WorkspacePath(root, repository.Lock)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	lockDigest, err := state.HashFile(lockPath)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	desired, err := buildLockedRepository(ctx, root, name, repository, lock, generatedAt, createdAt, "", blobStore, manifest.Keys, nil, request.Signers, request.Sources)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	if len(desired.Signing) != 0 {
+		activeKey, _, _, _, signingErr := repositorySigningState(repository)
+		keyExpiresAt, err := time.Parse(time.RFC3339, manifest.Keys[activeKey].ExpiresAt)
+		if signingErr != nil || err != nil || createdAt.Add(expiresIn).After(keyExpiresAt) {
+			return state.PlanRepository{}, nil, fmt.Errorf("repository %q plan expires after its signing key", name)
+		}
+	}
+	hostIdentity, err := repositoryHostIdentity(repository)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	hostRepository := toHostRepository(root, manifest.Workspace.ID, hostIdentity, name, repository)
+	selectedHost, err := hosts.Resolve(ctx, hostRepository)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	capabilities, err := selectedHost.Capabilities(ctx, hostRepository)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	if !capabilities.FaithfulPreview || !capabilities.ConditionalCommit || (repository.Visibility == "private" && !capabilities.PrivateRead) {
+		return state.PlanRepository{}, nil, fmt.Errorf("repository %q host cannot provide verified conditional publication", name)
+	}
+	observed, err := selectedHost.Observe(ctx, hostRepository)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	trustNotBefore := time.Time{}
+	if repository.SigningRotation != nil || deployment.SigningRotationPhase != "" {
+		trustNotBefore, err = state.AuthoritativeDeploymentTrustSince(root, name, deployment)
+		if err != nil {
+			return state.PlanRepository{}, nil, err
+		}
+	}
+	if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, observed, createdAt, trustNotBefore); err != nil {
+		return state.PlanRepository{}, nil, fmt.Errorf("repository %q: %w", name, err)
+	}
+	desiredSigningState, err := repositoryDeploymentSigningState(repository, manifest.Keys)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	missingBindings := missingPublicationBindings(lock, repository, ledger)
+	acquisitions := planAcquisitionsForVersions(visiblePackageVersions(lock, repository))
+	for _, acquisition := range acquisitions {
+		planned = append(planned, PlannedAcquisition{
+			Repository: name, Package: acquisition.Package, Version: acquisition.Version,
+			Filename: acquisition.Filename, SHA256: acquisition.SHA256, OriginURL: acquisition.OriginURL,
+		})
+	}
+	publicationBindings := []state.PlanPublicationBinding(nil)
+	if len(missingBindings) != 0 {
+		publicationBindings = publicationBindingsForVersions(visiblePackageVersions(lock, repository))
+	}
+	publicationRecords := len(publicationBindings) != 0
+	action := "noop"
+	if observed.TreeSHA256 != desired.TreeSHA256 || ((hostRepository.Type == "s3" || hostRepository.Type == "github-pages") && observed.ManifestSHA256 != desired.ManifestSHA256) || publicationRecords || !deploymentMatchesDesired(deployment, observed, desired.TreeSHA256, desired.ManifestSHA256, desiredSigningState) {
+		action = "update"
+		if observed.NativeRevision == "" {
+			action = "create"
+		}
+	}
+	installDocDigest, err := repositoryInstallDocDigest(root, name, repository)
+	if err != nil {
+		return state.PlanRepository{}, nil, err
+	}
+	return state.PlanRepository{
+		Name: name, Gate: repository.Gate, ApprovalKeys: append([]string(nil), repository.ApprovalKeys...), Format: repository.Format, LockSHA256: lockDigest,
+		Host: repository.Host, Visibility: repository.Visibility, HostIdentitySHA256: hostIdentity,
+		CanonicalEndpoint: hostRepository.CanonicalEndpoint, ObservedRevision: observed.NativeRevision,
+		ObservedPlanID: observed.PlanID, ObservedChangeID: observed.ChangeID,
+		ObservedReleaseSHA256: observed.ReleaseSHA256, ObservedManifestSHA256: observed.ManifestSHA256,
+		ObservedRestoreID: observed.RestoreID, ObservedRestoreSHA256: observed.RestoreSHA256,
+		ObservedRestoreRootSHA256: observed.RestoreRootSHA256,
+		ObservedDeployment:        deployment,
+		Signing:                   desired.Signing,
+		PublicationRecords:        publicationRecords,
+		PublicationBindings:       publicationBindings,
+		Acquisitions:              acquisitions,
+		FaithfulPreview:           capabilities.FaithfulPreview, ConditionalCommit: capabilities.ConditionalCommit,
+		ConditionalRestore:       capabilities.ConditionalRestore,
+		PrivateRead:              capabilities.PrivateRead,
+		CredentialBrokerIdentity: capabilities.CredentialBrokerIdentity,
+		InstallDocSHA256:         installDocDigest,
+		ObservedTreeSHA256:       observed.TreeSHA256, DesiredTreeSHA256: desired.TreeSHA256, DesiredManifestSHA256: desired.ManifestSHA256,
+		ChangeID: name + ":" + desired.TreeSHA256[:12], Action: action,
+	}, planned, nil
+}
+
 func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorkspaceResult, error) {
 	root, err := workspaceRoot(request.Root)
 	if err != nil {
@@ -513,128 +662,20 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 	if hosts == nil {
 		hosts = localHostResolver{}
 	}
+	preparation := &planPreparation{
+		ctx: ctx, root: root, request: request, manifest: manifest, hosts: hosts,
+		blobStore: blobStore, createdAt: createdAt, generatedAt: generatedAt, expiresIn: expiresIn,
+	}
 	for _, name := range state.RepositoryNames(manifest) {
-		repository := manifest.Repositories[name]
-		lock, err := state.LoadLock(root, repository)
+		repositoryPlan, acquired, err := preparation.planRepository(name)
 		if err != nil {
 			return PlanWorkspaceResult{}, err
 		}
-		if err := state.ValidateLock(lock, name, repository.Format); err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		ledger, err := state.LoadLedgerHistory(root, name)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		if err := validateRotationKeyValidity(repository, manifest.Keys, createdAt); err != nil {
-			return PlanWorkspaceResult{}, fmt.Errorf("repository %q: %w", name, err)
-		}
-		deployment, err := state.LoadDeployment(root, name)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		lockPath, err := state.WorkspacePath(root, repository.Lock)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		lockDigest, err := state.HashFile(lockPath)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		desired, err := buildLockedRepository(ctx, root, name, repository, lock, generatedAt, createdAt, "", blobStore, manifest.Keys, nil, request.Signers, request.Sources)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		if len(desired.Signing) != 0 {
-			activeKey, _, _, _, signingErr := repositorySigningState(repository)
-			keyExpiresAt, err := time.Parse(time.RFC3339, manifest.Keys[activeKey].ExpiresAt)
-			if signingErr != nil || err != nil || createdAt.Add(expiresIn).After(keyExpiresAt) {
-				return PlanWorkspaceResult{}, fmt.Errorf("repository %q plan expires after its signing key", name)
-			}
-		}
-		hostIdentity, err := repositoryHostIdentity(repository)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		hostRepository := toHostRepository(root, manifest.Workspace.ID, hostIdentity, name, repository)
-		selectedHost, err := hosts.Resolve(ctx, hostRepository)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		capabilities, err := selectedHost.Capabilities(ctx, hostRepository)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		if !capabilities.FaithfulPreview || !capabilities.ConditionalCommit || (repository.Visibility == "private" && !capabilities.PrivateRead) {
-			return PlanWorkspaceResult{}, fmt.Errorf("repository %q host cannot provide verified conditional publication", name)
-		}
-		observed, err := selectedHost.Observe(ctx, hostRepository)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		trustNotBefore := time.Time{}
-		if repository.SigningRotation != nil || deployment.SigningRotationPhase != "" {
-			trustNotBefore, err = state.AuthoritativeDeploymentTrustSince(root, name, deployment)
-			if err != nil {
-				return PlanWorkspaceResult{}, err
-			}
-		}
-		if err := validateRepositorySigningTransition(repository, manifest.Keys, deployment, observed, createdAt, trustNotBefore); err != nil {
-			return PlanWorkspaceResult{}, fmt.Errorf("repository %q: %w", name, err)
-		}
-		desiredSigningState, err := repositoryDeploymentSigningState(repository, manifest.Keys)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		missingBindings := missingPublicationBindings(lock, repository, ledger)
-		acquisitions := planAcquisitionsForVersions(visiblePackageVersions(lock, repository))
-		for _, acquisition := range acquisitions {
-			plannedAcquisitions = append(plannedAcquisitions, PlannedAcquisition{
-				Repository: name, Package: acquisition.Package, Version: acquisition.Version,
-				Filename: acquisition.Filename, SHA256: acquisition.SHA256, OriginURL: acquisition.OriginURL,
-			})
-		}
-		publicationBindings := []state.PlanPublicationBinding(nil)
-		if len(missingBindings) != 0 {
-			publicationBindings = publicationBindingsForVersions(visiblePackageVersions(lock, repository))
-		}
-		publicationRecords := len(publicationBindings) != 0
-		action := "noop"
-		if observed.TreeSHA256 != desired.TreeSHA256 || ((hostRepository.Type == "s3" || hostRepository.Type == "github-pages") && observed.ManifestSHA256 != desired.ManifestSHA256) || publicationRecords || !deploymentMatchesDesired(deployment, observed, desired.TreeSHA256, desired.ManifestSHA256, desiredSigningState) {
-			action = "update"
-			if observed.NativeRevision == "" {
-				action = "create"
-			}
+		if repositoryPlan.Action != "noop" {
 			changes++
 		}
-		installDocDigest, err := repositoryInstallDocDigest(root, name, repository)
-		if err != nil {
-			return PlanWorkspaceResult{}, err
-		}
-		payload.Repositories = append(payload.Repositories, state.PlanRepository{
-			Name: name, Gate: repository.Gate, ApprovalKeys: append([]string(nil), repository.ApprovalKeys...), Format: repository.Format, LockSHA256: lockDigest,
-			Host: repository.Host, Visibility: repository.Visibility, HostIdentitySHA256: hostIdentity,
-			CanonicalEndpoint: hostRepository.CanonicalEndpoint, ObservedRevision: observed.NativeRevision,
-			ObservedPlanID: observed.PlanID, ObservedChangeID: observed.ChangeID,
-			ObservedReleaseSHA256: observed.ReleaseSHA256, ObservedManifestSHA256: observed.ManifestSHA256,
-			ObservedRestoreID: observed.RestoreID, ObservedRestoreSHA256: observed.RestoreSHA256,
-			ObservedRestoreRootSHA256: observed.RestoreRootSHA256,
-			ObservedDeployment:        deployment,
-			Signing:                   desired.Signing,
-			PublicationRecords:        publicationRecords,
-			PublicationBindings:       publicationBindings,
-			Acquisitions:              acquisitions,
-			FaithfulPreview:           capabilities.FaithfulPreview, ConditionalCommit: capabilities.ConditionalCommit,
-			ConditionalRestore:       capabilities.ConditionalRestore,
-			PrivateRead:              capabilities.PrivateRead,
-			CredentialBrokerIdentity: capabilities.CredentialBrokerIdentity,
-			InstallDocSHA256:         installDocDigest,
-			ObservedTreeSHA256:       observed.TreeSHA256, DesiredTreeSHA256: desired.TreeSHA256, DesiredManifestSHA256: desired.ManifestSHA256,
-			ChangeID: name + ":" + desired.TreeSHA256[:12], Action: action,
-		})
+		plannedAcquisitions = append(plannedAcquisitions, acquired...)
+		payload.Repositories = append(payload.Repositories, repositoryPlan)
 	}
 	plan, err := state.FinalizePlan(payload)
 	if err != nil {
