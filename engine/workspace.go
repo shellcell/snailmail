@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	localhost "github.com/shellcell/snailmail/adapters/host/local"
@@ -685,6 +686,13 @@ func restoreFailedPublication(ctx context.Context, item applyRepository, referen
 	return nil
 }
 
+// maxConcurrentRepositories bounds how many repositories are prepared at once.
+//
+// Preparation is mostly waiting — on a registry, on a container, on a host — so
+// a few in flight keeps the shared container budget full without holding many
+// staged trees on disk at the same time.
+const maxConcurrentRepositories = 4
+
 func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWorkspaceResult, error) {
 	root, err := workspaceRoot(request.Root)
 	if err != nil {
@@ -779,14 +787,44 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			return ApplyWorkspaceResult{}, fmt.Errorf("plan contains duplicate repository %q", planned.Name)
 		}
 		seenRepositories[planned.Name] = true
-		item, err := preparation.prepareRepository(planned)
-		if err != nil {
-			for _, previous := range prepared {
-				_ = os.RemoveAll(previous.stageRoot)
-			}
-			return ApplyWorkspaceResult{}, err
+	}
+	// Repositories are prepared concurrently and committed in order.
+	//
+	// Preparing one reads desired state, builds into a staging directory of its
+	// own, and verifies it with real clients — none of which touches anything a
+	// sibling reads. Committing is where the shared state is: ledgers, receipts
+	// and the host itself, in the order the plan lists them. So the containers
+	// overlap and nothing else does. The container budget is process-wide, so
+	// this widens the pipe rather than asking for more of them at once.
+	prepared = make([]applyRepository, len(plan.Payload.Repositories))
+	failures := make([]error, len(plan.Payload.Repositories))
+	repositorySlots := make(chan struct{}, maxConcurrentRepositories)
+	var preparing sync.WaitGroup
+	for index, planned := range plan.Payload.Repositories {
+		preparing.Add(1)
+		go func(index int, planned state.PlanRepository) {
+			defer preparing.Done()
+			repositorySlots <- struct{}{}
+			defer func() { <-repositorySlots }()
+			prepared[index], failures[index] = preparation.prepareRepository(planned)
+		}(index, planned)
+	}
+	preparing.Wait()
+	for _, err := range failures {
+		if err == nil {
+			continue
 		}
-		prepared = append(prepared, item)
+		// Every stage is removed, including those of repositories that prepared
+		// successfully alongside the one that did not: nothing is published
+		// from this apply, so nothing it built should be left behind.
+		for _, item := range prepared {
+			if item.stageRoot != "" {
+				_ = os.RemoveAll(item.stageRoot)
+			}
+		}
+		// The first failure in plan order, so a repeated apply names the same
+		// repository however the goroutines were scheduled.
+		return ApplyWorkspaceResult{}, err
 	}
 	defer func() {
 		for _, item := range prepared {

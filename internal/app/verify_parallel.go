@@ -18,6 +18,15 @@ import (
 // emulated containers spends more time context-switching than it saves.
 const maxConcurrentVerifications = 4
 
+// containerSlots is the whole process's budget, not one call's.
+//
+// Repositories are verified concurrently too, and a budget held per call would
+// multiply: five repositories each running four containers is twenty on a
+// runner with four cores, which is slower than doing them in order. One shared
+// budget means adding repository concurrency overlaps everything around the
+// containers without ever asking for more of them at once.
+var containerSlots = make(chan struct{}, maxConcurrentVerifications)
+
 // verifyCases runs one verification per case and reports the earliest failing
 // case in the order the manifest lists them.
 //
@@ -33,21 +42,18 @@ func verifyCases(ctx context.Context, cases []domain.VerificationCase, verify fu
 		return nil
 	}
 	if len(cases) == 1 {
+		containerSlots <- struct{}{}
+		defer func() { <-containerSlots }()
 		return verify(ctx, cases[0])
 	}
-	limit := maxConcurrentVerifications
-	if len(cases) < limit {
-		limit = len(cases)
-	}
-	slots := make(chan struct{}, limit)
 	failures := make([]error, len(cases))
 	var wait sync.WaitGroup
 	for index, verification := range cases {
 		wait.Add(1)
 		go func(index int, verification domain.VerificationCase) {
 			defer wait.Done()
-			slots <- struct{}{}
-			defer func() { <-slots }()
+			containerSlots <- struct{}{}
+			defer func() { <-containerSlots }()
 			// A cancelled parent still stops the run; that cancellation is the
 			// caller giving up, not a verdict about any case.
 			if err := ctx.Err(); err != nil {
