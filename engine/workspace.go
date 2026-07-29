@@ -29,6 +29,8 @@ import (
 	statusrenderer "github.com/shellcell/snailmail/internal/status"
 	"github.com/shellcell/snailmail/signer"
 	"github.com/shellcell/snailmail/source"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 const phase1EngineVersion = "phase3-v1"
@@ -1820,13 +1822,13 @@ func formatRepositoryWithKeys(repository state.Repository, name string, keys map
 }
 
 func validateApplyPlan(plan state.Plan) error {
-	if !validSHA256(plan.Payload.ManifestSHA256) {
+	if !hexdigest.ValidSHA256(plan.Payload.ManifestSHA256) {
 		return errors.New("plan has an invalid manifest digest")
 	}
 	if plan.Payload.KnowledgeSHA256 != knowledge.SigningDigest() {
 		return errors.New("plan signing compatibility knowledge is incompatible")
 	}
-	if !validSHA256(plan.Payload.WorkspaceID) || !validSHA256(plan.Payload.BlobStoreIdentitySHA256) || state.ValidateBlobStore(plan.Payload.BlobStore) != nil {
+	if !hexdigest.ValidSHA256(plan.Payload.WorkspaceID) || !hexdigest.ValidSHA256(plan.Payload.BlobStoreIdentitySHA256) || state.ValidateBlobStore(plan.Payload.BlobStore) != nil {
 		return errors.New("plan has an invalid blob store binding")
 	}
 	plannedBlobIdentity, err := blobIdentity(plan.Payload.WorkspaceID, plan.Payload.BlobStore)
@@ -1877,7 +1879,7 @@ func validateApplyPlan(plan state.Plan) error {
 			previousBinding = identity
 			previous := ""
 			for _, digest := range binding.BlobSHA256 {
-				if !validSHA256(digest) || digest <= previous {
+				if !hexdigest.ValidSHA256(digest) || digest <= previous {
 					return fmt.Errorf("plan repository %q has invalid publication binding digests", repository.Name)
 				}
 				previous = digest
@@ -1886,7 +1888,7 @@ func validateApplyPlan(plan state.Plan) error {
 		previousAcquisition := ""
 		for _, acquisition := range repository.Acquisitions {
 			identity := acquisition.Package + "\x00" + acquisition.Version + "\x00" + acquisition.Filename + "\x00" + acquisition.SHA256
-			if acquisition.Package == "" || acquisition.Version == "" || acquisition.Filename == "" || !validSHA256(acquisition.SHA256) || identity <= previousAcquisition ||
+			if acquisition.Package == "" || acquisition.Version == "" || acquisition.Filename == "" || !hexdigest.ValidSHA256(acquisition.SHA256) || identity <= previousAcquisition ||
 				state.ValidateArtifactOrigin(state.ArtifactOrigin{Kind: "https", URL: acquisition.OriginURL}) != nil {
 				return fmt.Errorf("plan repository %q has invalid adopted acquisition", repository.Name)
 			}
@@ -1898,17 +1900,17 @@ func validateApplyPlan(plan state.Plan) error {
 		if err := state.ValidateDeploymentRecord(repository.ObservedDeployment, repository.Name); err != nil {
 			return fmt.Errorf("plan repository %q has invalid deployment observation", repository.Name)
 		}
-		if !validSHA256(repository.LockSHA256) || !validSHA256(repository.DesiredTreeSHA256) ||
-			!validSHA256(repository.HostIdentitySHA256) ||
-			(repository.ObservedTreeSHA256 != "" && !validSHA256(repository.ObservedTreeSHA256)) {
+		if !hexdigest.ValidSHA256(repository.LockSHA256) || !hexdigest.ValidSHA256(repository.DesiredTreeSHA256) ||
+			!hexdigest.ValidSHA256(repository.HostIdentitySHA256) ||
+			(repository.ObservedTreeSHA256 != "" && !hexdigest.ValidSHA256(repository.ObservedTreeSHA256)) {
 			return fmt.Errorf("plan repository %q has an invalid digest", repository.Name)
 		}
 		if len(repository.Signing) > 1 {
 			return fmt.Errorf("plan repository %q has unsupported dual signing", repository.Name)
 		}
 		for _, signing := range repository.Signing {
-			if !formatSupportsSigning(repository.Format) || signing.KeyName == "" || (signing.Algorithm != signer.AlgorithmOpenPGPRSA4096 && signing.Algorithm != signer.AlgorithmAPKRSA4096) || !validFingerprint(signing.Fingerprint) ||
-				!validSHA256(signing.PublicKeySHA256) || !validSHA256(signing.PublicArmorSHA256) || !validSHA256(signing.RecipeSHA256) || signing.PublicKeyPath == "" || signing.PublicArmorPath == "" ||
+			if !formatSupportsSigning(repository.Format) || signing.KeyName == "" || (signing.Algorithm != signer.AlgorithmOpenPGPRSA4096 && signing.Algorithm != signer.AlgorithmAPKRSA4096) || !hexdigest.ValidFingerprint(signing.Fingerprint) ||
+				!hexdigest.ValidSHA256(signing.PublicKeySHA256) || !hexdigest.ValidSHA256(signing.PublicArmorSHA256) || !hexdigest.ValidSHA256(signing.RecipeSHA256) || signing.PublicKeyPath == "" || signing.PublicArmorPath == "" ||
 				// A format decides how many signatures it makes, and the count
 				// follows from the repository rather than from the format alone,
 				// so without the repository only the bound is checkable here.
@@ -1925,7 +1927,7 @@ func validateApplyPlan(plan state.Plan) error {
 				return fmt.Errorf("plan repository %q: %w", repository.Name, err)
 			}
 			for _, node := range signing.Nodes {
-				if !validSHA256(node.PayloadSHA256) || !validSHA256(node.ContentSHA256) || len(node.Content) == 0 || len(node.Content) > 8<<20 {
+				if !hexdigest.ValidSHA256(node.PayloadSHA256) || !hexdigest.ValidSHA256(node.ContentSHA256) || len(node.Content) == 0 || len(node.Content) > 8<<20 {
 					return fmt.Errorf("plan repository %q has invalid signing response", repository.Name)
 				}
 			}
@@ -1936,20 +1938,20 @@ func validateApplyPlan(plan state.Plan) error {
 		if repository.CanonicalEndpoint == "" {
 			return fmt.Errorf("plan repository %q has no canonical endpoint", repository.Name)
 		}
-		if (repository.Host.Type == "s3" || repository.Host.Type == "github-pages") && !validSHA256(repository.InstallDocSHA256) {
+		if (repository.Host.Type == "s3" || repository.Host.Type == "github-pages") && !hexdigest.ValidSHA256(repository.InstallDocSHA256) {
 			return fmt.Errorf("plan repository %q has an invalid install document digest", repository.Name)
 		}
-		if (repository.Host.Type == "s3" || repository.Host.Type == "github-pages") && !validSHA256(repository.DesiredManifestSHA256) {
+		if (repository.Host.Type == "s3" || repository.Host.Type == "github-pages") && !hexdigest.ValidSHA256(repository.DesiredManifestSHA256) {
 			return fmt.Errorf("plan repository %q has an invalid desired manifest digest", repository.Name)
 		}
 		if repository.Visibility == "private" && !repository.PrivateRead {
 			return fmt.Errorf("plan repository %q lacks private read capability", repository.Name)
 		}
-		if repository.Visibility == "private" && !validSHA256(repository.CredentialBrokerIdentity) {
+		if repository.Visibility == "private" && !hexdigest.ValidSHA256(repository.CredentialBrokerIdentity) {
 			return fmt.Errorf("plan repository %q has an invalid credential broker identity", repository.Name)
 		}
 		for _, digest := range []string{repository.ObservedReleaseSHA256, repository.ObservedManifestSHA256, repository.ObservedRestoreSHA256, repository.ObservedRestoreRootSHA256} {
-			if digest != "" && !validSHA256(digest) {
+			if digest != "" && !hexdigest.ValidSHA256(digest) {
 				return fmt.Errorf("plan repository %q has an invalid observed publication digest", repository.Name)
 			}
 		}
@@ -1959,9 +1961,9 @@ func validateApplyPlan(plan state.Plan) error {
 					repository.ObservedManifestSHA256 != "" || repository.ObservedRestoreID != "" || repository.ObservedRestoreSHA256 != "" || repository.ObservedRestoreRootSHA256 != "" {
 					return fmt.Errorf("plan repository %q has an incomplete observed publication", repository.Name)
 				}
-			} else if repository.ObservedRevision == "" || !validSHA256(repository.ObservedPlanID) || repository.ObservedChangeID != repository.Name+":"+repository.ObservedTreeSHA256[:12] ||
-				!validSHA256(repository.ObservedReleaseSHA256) || !validSHA256(repository.ObservedManifestSHA256) ||
-				!validSHA256(repository.ObservedRestoreID) || !validSHA256(repository.ObservedRestoreSHA256) {
+			} else if repository.ObservedRevision == "" || !hexdigest.ValidSHA256(repository.ObservedPlanID) || repository.ObservedChangeID != repository.Name+":"+repository.ObservedTreeSHA256[:12] ||
+				!hexdigest.ValidSHA256(repository.ObservedReleaseSHA256) || !hexdigest.ValidSHA256(repository.ObservedManifestSHA256) ||
+				!hexdigest.ValidSHA256(repository.ObservedRestoreID) || !hexdigest.ValidSHA256(repository.ObservedRestoreSHA256) {
 				return fmt.Errorf("plan repository %q has an invalid observed publication", repository.Name)
 			}
 		}
@@ -1970,16 +1972,6 @@ func validateApplyPlan(plan state.Plan) error {
 		}
 	}
 	return nil
-}
-
-func validSHA256(value string) bool {
-	decoded, err := hex.DecodeString(value)
-	return err == nil && len(decoded) == 32 && value == strings.ToLower(value)
-}
-
-func validFingerprint(value string) bool {
-	decoded, err := hex.DecodeString(value)
-	return err == nil && len(decoded) == 20 && value == strings.ToLower(value)
 }
 
 func resolveBlobStore(ctx context.Context, manifest state.Manifest, resolver blob.Resolver) (blob.Store, error) {
@@ -2021,7 +2013,7 @@ func blobref(locked state.LockedBlob) blob.Ref {
 }
 
 func deploymentMatchesDesired(deployment state.DeploymentRecord, observed host.PublishedRevision, treeSHA256, manifestSHA256 string, signing deploymentSigningState) bool {
-	if !validSHA256(treeSHA256) || deployment.TreeSHA256 != treeSHA256 || deployment.ManifestSHA256 != manifestSHA256 ||
+	if !hexdigest.ValidSHA256(treeSHA256) || deployment.TreeSHA256 != treeSHA256 || deployment.ManifestSHA256 != manifestSHA256 ||
 		deployment.NativeRevision == "" || deployment.NativeRevision != observed.NativeRevision ||
 		deployment.ChangeID != deployment.Repository+":"+treeSHA256[:12] || !deploymentSigningMatches(deployment, signing) {
 		return false

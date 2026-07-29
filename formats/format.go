@@ -137,6 +137,14 @@ type Format interface {
 	Inspect(filename string, reader io.ReaderAt, size int64, supplied Identity) (domain.PackageFacts, error)
 	// CompareVersions orders two native version strings.
 	CompareVersions(left, right string) (int, error)
+	// RequiresLegacyDigests reports whether this format's index publishes MD5
+	// and SHA-1 beside SHA-256.
+	//
+	// apt reads MD5sum and SHA1 out of a Packages file, so a Debian repository
+	// has to carry them. No other format here does, and computing them anyway
+	// costs about five times what SHA-256 alone does over the same bytes —
+	// which is paid on every plan and every apply, for every artifact.
+	RequiresLegacyDigests() bool
 
 	// ArtifactCoordinate is the key that must be unique among the artifacts of
 	// one package version: a Debian package version holds one artifact per
@@ -233,6 +241,8 @@ func (pypiFormat) SupportsDistros() bool                       { return false }
 // PyPI dropped GPG signatures in 2023, so there is no repository signature to
 // carry.
 // PyPI dropped repository signing in 2023.
+func (pypiFormat) RequiresLegacyDigests() bool { return false }
+
 func (pypiFormat) SigningAlgorithm() string { return "" }
 
 func (pypiFormat) ImplementsSigning() bool         { return false }
@@ -270,6 +280,10 @@ func (debFormat) ArtifactCoordinate(artifact Artifact) string { return artifact.
 func (debFormat) SupportsDistros() bool                       { return true }
 
 // apt verifies OpenPGP over the Release document.
+// apt reads MD5sum and SHA1 from a Packages file, so a Debian repository is
+// the one place these still have to be computed.
+func (debFormat) RequiresLegacyDigests() bool { return true }
+
 func (debFormat) SigningAlgorithm() string { return signer.AlgorithmOpenPGPRSA4096 }
 
 func (debFormat) ImplementsSigning() bool { return true }
@@ -328,6 +342,8 @@ func (helmFormat) SupportsDistros() bool              { return false }
 
 // Helm signs with a per-chart .prov file, which is not yet implemented.
 // Helm defines .prov signing, which is not produced here.
+func (helmFormat) RequiresLegacyDigests() bool { return false }
+
 func (helmFormat) SigningAlgorithm() string { return signer.AlgorithmOpenPGPRSA4096 }
 
 func (helmFormat) ImplementsSigning() bool { return true }
@@ -385,6 +401,8 @@ func (rawFormat) SupportsDistros() bool                       { return false }
 // Detached signatures over the listing are the documented raw scheme; they are
 // not implemented yet.
 // Loose files are not an ecosystem and define no signing.
+func (rawFormat) RequiresLegacyDigests() bool { return false }
+
 func (rawFormat) SigningAlgorithm() string { return "" }
 
 func (rawFormat) ImplementsSigning() bool         { return false }
@@ -431,6 +449,8 @@ func (rpmFormat) SupportsDistros() bool { return false }
 // produced. Per-package signing is not: that signature lives in the package
 // header and is made by whoever built the package, not by the repository.
 // repo_gpgcheck verifies OpenPGP over repomd.xml.
+func (rpmFormat) RequiresLegacyDigests() bool { return false }
+
 func (rpmFormat) SigningAlgorithm() string { return signer.AlgorithmOpenPGPRSA4096 }
 
 func (rpmFormat) ImplementsSigning() bool         { return true }
@@ -476,6 +496,8 @@ func (apkFormat) SupportsDistros() bool { return false }
 // apk signs an index by prepending a signature stream to it, with the signing
 // key's filename identifying which key to check. That is not produced yet.
 // apk verifies a bare RSA signature against a key held by filename.
+func (apkFormat) RequiresLegacyDigests() bool { return false }
+
 func (apkFormat) SigningAlgorithm() string { return signer.AlgorithmAPKRSA4096 }
 
 func (apkFormat) ImplementsSigning() bool { return true }

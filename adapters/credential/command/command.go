@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/shellcell/snailmail/host"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 const HelperEnvironment = "SNAILMAIL_CREDENTIAL_BROKER"
@@ -134,8 +136,8 @@ func (broker *Broker) Close() error {
 }
 
 func (broker *Broker) Issue(ctx context.Context, scope host.ReadScope) (host.BasicCredential, error) {
-	if !validSHA256(scope.WorkspaceID) || scope.Repository == "" || !validSHA256(scope.HostIdentity) || scope.Bucket == "" || scope.Endpoint == "" ||
-		!validSHA256(scope.PlanID) || scope.ChangeID == "" || !validSHA256(scope.TreeSHA256) || len(scope.Prefixes) == 0 {
+	if !hexdigest.ValidSHA256(scope.WorkspaceID) || scope.Repository == "" || !hexdigest.ValidSHA256(scope.HostIdentity) || scope.Bucket == "" || scope.Endpoint == "" ||
+		!hexdigest.ValidSHA256(scope.PlanID) || scope.ChangeID == "" || !hexdigest.ValidSHA256(scope.TreeSHA256) || len(scope.Prefixes) == 0 {
 		return nil, errors.New("credential scope is incomplete")
 	}
 	for _, prefix := range scope.Prefixes {
@@ -201,14 +203,6 @@ func brokerEnvironment() []string {
 		}
 	}
 	return environment
-}
-
-func validSHA256(value string) bool {
-	if len(value) != sha256.Size*2 {
-		return false
-	}
-	_, err := hex.DecodeString(value)
-	return err == nil
 }
 
 func supportedExecutable(magic [4]byte) bool {

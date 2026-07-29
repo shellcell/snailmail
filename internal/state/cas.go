@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -21,6 +22,60 @@ import (
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/factscache"
 )
+
+// legacyDigests decides whether MD5 and SHA-1 have to be computed over an
+// artifact's bytes.
+//
+// Only a Debian repository publishes them, and computing all three digests runs
+// at about a fifth the speed of SHA-256 alone — a cost paid on every plan and
+// every apply, over every artifact. So they are computed where the format needs
+// them, and also wherever a lock already records them: every lock written
+// before this distinction existed carries both for every format, and
+// validateLockedBlobOpenContext compares whichever the lock has. Skipping a
+// digest the lock records would report every existing workspace as corrupt.
+type legacyDigests struct {
+	md5Hash  hash.Hash
+	sha1Hash hash.Hash
+}
+
+func newLegacyDigests(format string, locked LockedBlob) legacyDigests {
+	needed := locked.MD5 != "" || locked.SHA1 != ""
+	if !needed {
+		if selected, err := formats.For(format); err == nil {
+			needed = selected.RequiresLegacyDigests()
+		} else {
+			// An unknown format is not a reason to compute less than before.
+			needed = true
+		}
+	}
+	if !needed {
+		return legacyDigests{}
+	}
+	return legacyDigests{md5Hash: md5.New(), sha1Hash: sha1.New()}
+}
+
+// writers returns the hashers to tee the artifact through, SHA-256 always
+// included because everything is pinned by it.
+func (digests legacyDigests) writers(sha256Hash hash.Hash) io.Writer {
+	if digests.md5Hash == nil {
+		return sha256Hash
+	}
+	return io.MultiWriter(digests.md5Hash, digests.sha1Hash, sha256Hash)
+}
+
+func (digests legacyDigests) md5Hex() string {
+	if digests.md5Hash == nil {
+		return ""
+	}
+	return hex.EncodeToString(digests.md5Hash.Sum(nil))
+}
+
+func (digests legacyDigests) sha1Hex() string {
+	if digests.sha1Hash == nil {
+		return ""
+	}
+	return hex.EncodeToString(digests.sha1Hash.Sum(nil))
+}
 
 // PutArtifact stores an artifact and derives its facts. Supplied identity is
 // used only by formats whose artifacts carry none; the rest reject it.
@@ -59,8 +114,9 @@ func PutArtifact(root, format, sourceName string, supplied formats.Identity) (do
 	if err != nil {
 		return domain.Blob{}, err
 	}
-	md5Hash, sha1Hash, sha256Hash := md5.New(), sha1.New(), sha256.New()
-	size, copyErr := io.Copy(io.MultiWriter(temporary, md5Hash, sha1Hash, sha256Hash), io.LimitReader(source, maximum+1))
+	sha256Hash := sha256.New()
+	legacy := newLegacyDigests(format, LockedBlob{})
+	size, copyErr := io.Copy(io.MultiWriter(temporary, legacy.writers(sha256Hash)), io.LimitReader(source, maximum+1))
 	closeSourceErr := source.Close()
 	if copyErr != nil {
 		return domain.Blob{}, copyErr
@@ -116,8 +172,8 @@ func PutArtifact(root, format, sourceName string, supplied formats.Identity) (do
 	return domain.Blob{
 		Filename: filename,
 		Size:     size,
-		MD5:      hex.EncodeToString(md5Hash.Sum(nil)),
-		SHA1:     hex.EncodeToString(sha1Hash.Sum(nil)),
+		MD5:      legacy.md5Hex(),
+		SHA1:     legacy.sha1Hex(),
 		SHA256:   digest,
 		Facts:    facts,
 	}, nil
@@ -382,8 +438,9 @@ func validateLockedBlobOpenContext(ctx context.Context, file *os.File, pathInfo 
 	if !os.SameFile(pathInfo, info) {
 		return domain.Blob{}, fmt.Errorf("%w: blob sha256:%s changed while opening", blob.ErrCorrupt, locked.SHA256)
 	}
-	md5Hash, sha1Hash, sha256Hash := md5.New(), sha1.New(), sha256.New()
-	size, err := io.Copy(io.MultiWriter(md5Hash, sha1Hash, sha256Hash), io.LimitReader(contextReader{ctx: ctx, reader: file}, locked.Size+1))
+	sha256Hash := sha256.New()
+	legacy := newLegacyDigests(format, locked)
+	size, err := io.Copy(legacy.writers(sha256Hash), io.LimitReader(contextReader{ctx: ctx, reader: file}, locked.Size+1))
 	if err != nil {
 		return domain.Blob{}, fmt.Errorf("%w: read blob sha256:%s: %w", blob.ErrUnavailable, locked.SHA256, err)
 	}
@@ -391,8 +448,8 @@ func validateLockedBlobOpenContext(ctx context.Context, file *os.File, pathInfo 
 		Filename: locked.Filename,
 		Added:    parseLockTime(locked.Added),
 		Size:     size,
-		MD5:      hex.EncodeToString(md5Hash.Sum(nil)),
-		SHA1:     hex.EncodeToString(sha1Hash.Sum(nil)),
+		MD5:      legacy.md5Hex(),
+		SHA1:     legacy.sha1Hex(),
 		SHA256:   hex.EncodeToString(sha256Hash.Sum(nil)),
 	}
 	// Establish that these bytes are exactly the locked content before consulting

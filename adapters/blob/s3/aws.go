@@ -18,6 +18,8 @@ import (
 	"github.com/aws/smithy-go"
 	transport "github.com/aws/smithy-go/transport/http"
 	"github.com/shellcell/snailmail/blob"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 type AWSClient struct {
@@ -69,7 +71,7 @@ func (client *AWSClient) Head(ctx context.Context, key string) (ObjectInfo, erro
 	if err != nil {
 		return ObjectInfo{}, normalizeAWSError(err)
 	}
-	return ObjectInfo{Size: aws.ToInt64(result.ContentLength), SHA256: decodeChecksum(aws.ToString(result.ChecksumSHA256)), Metadata: result.Metadata}, nil
+	return ObjectInfo{Size: aws.ToInt64(result.ContentLength), SHA256: hexdigest.FromBase64(aws.ToString(result.ChecksumSHA256)), Metadata: result.Metadata}, nil
 }
 
 func (client *AWSClient) PutCreate(ctx context.Context, key string, body io.Reader, size int64, sha256Value string, metadata map[string]string) (ObjectInfo, error) {
@@ -85,7 +87,7 @@ func (client *AWSClient) PutCreate(ctx context.Context, key string, body io.Read
 	if err != nil {
 		return ObjectInfo{}, normalizeAWSError(err)
 	}
-	return ObjectInfo{Size: size, SHA256: decodeChecksum(aws.ToString(result.ChecksumSHA256)), Metadata: metadata}, nil
+	return ObjectInfo{Size: size, SHA256: hexdigest.FromBase64(aws.ToString(result.ChecksumSHA256)), Metadata: metadata}, nil
 }
 
 func (client *AWSClient) Get(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
@@ -93,7 +95,7 @@ func (client *AWSClient) Get(ctx context.Context, key string) (io.ReadCloser, Ob
 	if err != nil {
 		return nil, ObjectInfo{}, normalizeAWSError(err)
 	}
-	return result.Body, ObjectInfo{Size: aws.ToInt64(result.ContentLength), SHA256: decodeChecksum(aws.ToString(result.ChecksumSHA256)), Metadata: result.Metadata}, nil
+	return result.Body, ObjectInfo{Size: aws.ToInt64(result.ContentLength), SHA256: hexdigest.FromBase64(aws.ToString(result.ChecksumSHA256)), Metadata: result.Metadata}, nil
 }
 
 func normalizeAWSError(err error) error {
@@ -119,12 +121,4 @@ func normalizeAWSError(err error) error {
 		}
 	}
 	return err
-}
-
-func decodeChecksum(value string) string {
-	decoded, err := base64.StdEncoding.DecodeString(value)
-	if err != nil {
-		return ""
-	}
-	return hex.EncodeToString(decoded)
 }

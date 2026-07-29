@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/shellcell/snailmail/internal/jsonstrict"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 func LoadLedger(root, repository string) ([]PublicationRecord, error) {
@@ -237,14 +239,14 @@ func validatePublicationRecord(record PublicationRecord, repository string) erro
 		return errors.New("unsupported publication ledger schema")
 	}
 	if record.Repository == "" || (repository != "" && record.Repository != repository) ||
-		!validSHA256(record.PlanID) || !validSHA256(record.TreeSHA256) ||
+		!hexdigest.ValidSHA256(record.PlanID) || !hexdigest.ValidSHA256(record.TreeSHA256) ||
 		record.ChangeID != record.Repository+":"+record.TreeSHA256[:12] ||
 		record.Package == "" || record.Version == "" || len(record.BlobSHA256) == 0 {
 		return errors.New("invalid publication ledger record")
 	}
 	previous := ""
 	for _, digest := range record.BlobSHA256 {
-		if !validSHA256(digest) || (previous != "" && digest <= previous) {
+		if !hexdigest.ValidSHA256(digest) || (previous != "" && digest <= previous) {
 			return errors.New("invalid publication ledger blob binding")
 		}
 		previous = digest

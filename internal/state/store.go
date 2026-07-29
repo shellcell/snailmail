@@ -26,6 +26,8 @@ import (
 	"github.com/shellcell/snailmail/formats"
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/source"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 const ManifestFilename = "snailmail.toml"
@@ -338,7 +340,7 @@ func LoadManifest(root string) (Manifest, error) {
 			}
 		}
 	}
-	if manifest.SchemaVersion != ManifestSchema || !identifierPattern.MatchString(manifest.Workspace.Name) || !validSHA256(manifest.Workspace.ID) {
+	if manifest.SchemaVersion != ManifestSchema || !identifierPattern.MatchString(manifest.Workspace.Name) || !hexdigest.ValidSHA256(manifest.Workspace.ID) {
 		return Manifest{}, errors.New("invalid workspace manifest schema or name")
 	}
 	if manifest.Workspace.ForgeRepository != "" && !validGitHubRepository(manifest.Workspace.ForgeRepository) {
@@ -652,7 +654,7 @@ func validateSigningKeys(manifest Manifest) error {
 		}
 		if !identifierPattern.MatchString(name) || (key.Algorithm != "openpgp-rsa4096" && key.Algorithm != "apk-rsa4096") ||
 			key.Usage != "sign" || !fingerprintPattern.MatchString(key.Fingerprint) ||
-			!validSHA256(key.PublicKeySHA256) || !validSHA256(key.PublicArmorSHA256) || key.PublicKeyPath != binaryPath ||
+			!hexdigest.ValidSHA256(key.PublicKeySHA256) || !hexdigest.ValidSHA256(key.PublicArmorSHA256) || key.PublicKeyPath != binaryPath ||
 			key.PublicArmorPath != armorPath || key.Ref.Backend != "file" || key.Ref.ID != manifest.Workspace.ID+"/"+name {
 			return fmt.Errorf("signing key %q has invalid identity or public forms", name)
 		}
@@ -790,7 +792,7 @@ func WriteManifest(root string, manifest Manifest) error {
 	if manifest.BlobStore.Type == "" {
 		manifest.BlobStore.Type = "local"
 	}
-	if !identifierPattern.MatchString(manifest.Workspace.Name) || !validSHA256(manifest.Workspace.ID) {
+	if !identifierPattern.MatchString(manifest.Workspace.Name) || !hexdigest.ValidSHA256(manifest.Workspace.ID) {
 		return errors.New("invalid workspace name or identity")
 	}
 	if manifest.Workspace.ForgeRepository != "" && !validGitHubRepository(manifest.Workspace.ForgeRepository) {
@@ -900,11 +902,6 @@ func IsLegacyWorkspaceID(name, identifier string) bool {
 func legacyWorkspaceID(name string) string {
 	digest := sha256.Sum256([]byte("snailmail-workspace\x00" + name))
 	return hex.EncodeToString(digest[:])
-}
-
-func validSHA256(value string) bool {
-	decoded, err := hex.DecodeString(value)
-	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 }
 
 func LoadLock(root string, repository Repository) (RepositoryLock, error) {

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 func TestLoadManifestMigratesSchemaOneLocalOutput(t *testing.T) {
@@ -47,7 +49,7 @@ name = "legacy-workspace"
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manifest.SchemaVersion != ManifestSchema || manifest.BlobStore.Type != "local" || !validSHA256(manifest.Workspace.ID) {
+	if manifest.SchemaVersion != ManifestSchema || manifest.BlobStore.Type != "local" || !hexdigest.ValidSHA256(manifest.Workspace.ID) {
 		t.Fatalf("unexpected schema-two migration %#v", manifest)
 	}
 }

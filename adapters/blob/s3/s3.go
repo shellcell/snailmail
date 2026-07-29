@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/shellcell/snailmail/blob"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 type ObjectInfo struct {
@@ -32,7 +34,7 @@ type Store struct {
 }
 
 func New(client ObjectClient, configuration blob.Configuration) (*Store, error) {
-	if client == nil || configuration.Type != "s3" || !validSHA256(configuration.WorkspaceID) {
+	if client == nil || configuration.Type != "s3" || !hexdigest.ValidSHA256(configuration.WorkspaceID) {
 		return nil, errors.New("invalid S3 blob store configuration")
 	}
 	prefix := strings.Trim(configuration.Prefix, "/")
@@ -114,15 +116,10 @@ func (store *Store) key(ref blob.Ref) string {
 }
 
 func validateRef(ref blob.Ref) error {
-	if ref.Size < 0 || !validSHA256(ref.SHA256) {
+	if ref.Size < 0 || !hexdigest.ValidSHA256(ref.SHA256) {
 		return errors.New("invalid blob reference")
 	}
 	return nil
-}
-
-func validSHA256(value string) bool {
-	decoded, err := hex.DecodeString(value)
-	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 }
 
 func matches(info ObjectInfo, ref blob.Ref) bool {

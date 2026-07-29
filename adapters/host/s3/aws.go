@@ -20,6 +20,8 @@ import (
 	"github.com/aws/smithy-go"
 	transport "github.com/aws/smithy-go/transport/http"
 	"github.com/shellcell/snailmail/host"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 type AWSClient struct {
@@ -57,7 +59,7 @@ func (client *AWSClient) Head(ctx context.Context, key string) (ObjectInfo, erro
 	}
 	return ObjectInfo{
 		ETag: aws.ToString(result.ETag), Size: aws.ToInt64(result.ContentLength),
-		SHA256: decodeChecksum(aws.ToString(result.ChecksumSHA256)), Metadata: result.Metadata,
+		SHA256: hexdigest.FromBase64(aws.ToString(result.ChecksumSHA256)), Metadata: result.Metadata,
 	}, nil
 }
 
@@ -109,7 +111,7 @@ func (client *AWSClient) Put(ctx context.Context, request PutRequest) (ObjectInf
 	}
 	return ObjectInfo{
 		ETag: aws.ToString(result.ETag), Size: request.Size,
-		SHA256: decodeChecksum(aws.ToString(result.ChecksumSHA256)), Metadata: request.Metadata,
+		SHA256: hexdigest.FromBase64(aws.ToString(result.ChecksumSHA256)), Metadata: request.Metadata,
 	}, nil
 }
 
@@ -182,12 +184,4 @@ func stringPointer(value string) *string {
 		return nil
 	}
 	return &value
-}
-
-func decodeChecksum(value string) string {
-	decoded, err := base64.StdEncoding.DecodeString(value)
-	if err != nil {
-		return ""
-	}
-	return hex.EncodeToString(decoded)
 }

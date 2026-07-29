@@ -25,6 +25,8 @@ import (
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/buildgraph"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 var changeIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*:[a-f0-9]{12}$`)
@@ -88,9 +90,9 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 		}
 		return host.PublishedRevision{NativeRevision: root.ETag}, nil
 	}
-	if !validSHA256(revision.TreeSHA256) || !validSHA256(revision.PlanID) || !changeIDPattern.MatchString(revision.ChangeID) || !validIdentifier(revision.RestoreID) ||
-		!validSHA256(revision.RestoreSHA256) || (revision.RestoreRootSHA256 != "" && !validSHA256(revision.RestoreRootSHA256)) ||
-		root.Metadata["release-id"] != revision.TreeSHA256 || !validSHA256(revision.ReleaseSHA256) || !validSHA256(revision.ManifestSHA256) {
+	if !hexdigest.ValidSHA256(revision.TreeSHA256) || !hexdigest.ValidSHA256(revision.PlanID) || !changeIDPattern.MatchString(revision.ChangeID) || !validIdentifier(revision.RestoreID) ||
+		!hexdigest.ValidSHA256(revision.RestoreSHA256) || (revision.RestoreRootSHA256 != "" && !hexdigest.ValidSHA256(revision.RestoreRootSHA256)) ||
+		root.Metadata["release-id"] != revision.TreeSHA256 || !hexdigest.ValidSHA256(revision.ReleaseSHA256) || !hexdigest.ValidSHA256(revision.ManifestSHA256) {
 		return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 repository", Err: errors.New("root metadata has no valid publication identity")}
 	}
 	descriptor, descriptorDigest, err := adapter.loadRelease(ctx, repository, revision.TreeSHA256)
@@ -496,8 +498,8 @@ func (adapter *Adapter) Restore(ctx context.Context, repository host.Repository,
 	if err := adapter.validateRepository(repository); err != nil {
 		return host.PublishedRevision{}, err
 	}
-	if !validIdentifier(restore.ID) || restore.PlanID == "" || restore.ChangeID == "" || !validSHA256(restore.FailedTree) ||
-		!validSHA256(restore.DescriptorSHA256) || (restore.RootSHA256 != "" && !validSHA256(restore.RootSHA256)) {
+	if !validIdentifier(restore.ID) || restore.PlanID == "" || restore.ChangeID == "" || !hexdigest.ValidSHA256(restore.FailedTree) ||
+		!hexdigest.ValidSHA256(restore.DescriptorSHA256) || (restore.RootSHA256 != "" && !hexdigest.ValidSHA256(restore.RootSHA256)) {
 		return host.PublishedRevision{}, &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "restore S3 repository", Err: errors.New("invalid restore reference")}
 	}
 	unlock, err := adapter.acquireCommitLock(ctx, repository, "restore-"+restore.ID)
@@ -659,7 +661,7 @@ type restoreDescriptor struct {
 }
 
 func descriptorFromRequest(request host.StageRequest) (publicationDescriptor, string, error) {
-	if !validSHA256(request.TreeSHA256) || !validSHA256(request.PlanID) || !changeIDPattern.MatchString(request.ChangeID) {
+	if !hexdigest.ValidSHA256(request.TreeSHA256) || !hexdigest.ValidSHA256(request.PlanID) || !changeIDPattern.MatchString(request.ChangeID) {
 		return publicationDescriptor{}, "", &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "stage S3 repository", Err: errors.New("stage identity or tree digest is invalid")}
 	}
 	if len(request.CommitPaths) != 1 || request.CommitPaths[0] != pypiRootPath {
@@ -877,7 +879,7 @@ func (adapter *Adapter) loadStagePointer(ctx context.Context, repository host.Re
 		return stagePointer{}, err
 	}
 	var pointer stagePointer
-	if err := json.Unmarshal(content, &pointer); err != nil || !validIdentifier(pointer.ID) || !validSHA256(pointer.DescriptorSHA256) {
+	if err := json.Unmarshal(content, &pointer); err != nil || !validIdentifier(pointer.ID) || !hexdigest.ValidSHA256(pointer.DescriptorSHA256) {
 		return stagePointer{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "decode S3 stage pointer", Err: errors.New("stage pointer is invalid")}
 	}
 	return pointer, nil
@@ -936,11 +938,11 @@ func (adapter *Adapter) loadRestore(ctx context.Context, repository host.Reposit
 	if err := json.Unmarshal(content, &descriptor); err != nil {
 		return restoreDescriptor{}, "", &host.Error{Kind: host.ErrorIndeterminate, Operation: "decode S3 restore descriptor", Err: err}
 	}
-	managedBeforeInvalid := descriptor.BeforeTreeSHA256 != "" && (!validSHA256(descriptor.BeforeTreeSHA256) || !validSHA256(descriptor.BeforePlanID) || !changeIDPattern.MatchString(descriptor.BeforeChangeID))
+	managedBeforeInvalid := descriptor.BeforeTreeSHA256 != "" && (!hexdigest.ValidSHA256(descriptor.BeforeTreeSHA256) || !hexdigest.ValidSHA256(descriptor.BeforePlanID) || !changeIDPattern.MatchString(descriptor.BeforeChangeID))
 	unmanagedBeforeInvalid := descriptor.BeforeTreeSHA256 == "" && (descriptor.BeforePlanID != "" || descriptor.BeforeChangeID != "")
 	legacyBeforeInvalid := descriptor.RootExisted && descriptor.BeforeTreeSHA256 == "" && hasReservedMetadata(descriptor.BeforeMetadata) && !validManagedMetadata(descriptor.BeforeMetadata)
 	missingRootInvalid := !descriptor.RootExisted && (descriptor.BeforeTreeSHA256 != "" || descriptor.BeforePlanID != "" || descriptor.BeforeChangeID != "" || len(descriptor.BeforeMetadata) != 0)
-	if !validSHA256(descriptor.PlanID) || !changeIDPattern.MatchString(descriptor.ChangeID) || !validSHA256(descriptor.AfterTreeSHA256) || managedBeforeInvalid || unmanagedBeforeInvalid || legacyBeforeInvalid || missingRootInvalid {
+	if !hexdigest.ValidSHA256(descriptor.PlanID) || !changeIDPattern.MatchString(descriptor.ChangeID) || !hexdigest.ValidSHA256(descriptor.AfterTreeSHA256) || managedBeforeInvalid || unmanagedBeforeInvalid || legacyBeforeInvalid || missingRootInvalid {
 		return restoreDescriptor{}, "", &host.Error{Kind: host.ErrorIndeterminate, Operation: "decode S3 restore descriptor", Err: errors.New("restore descriptor is invalid")}
 	}
 	if descriptor.BeforeTreeSHA256 != "" && !metadataMatchesRevision(descriptor.BeforeMetadata, revisionFromRestore("", descriptor)) {
@@ -997,7 +999,7 @@ func validateRepository(repository host.Repository) error {
 	if repository.Visibility == "private" && (repository.ReadAuth != "basic" || repository.CredentialBroker == "") {
 		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("private S3 reads require a Basic credential broker")}
 	}
-	if repository.Visibility == "private" && (!validSHA256(repository.WorkspaceID) || !validSHA256(repository.HostIdentity)) {
+	if repository.Visibility == "private" && (!hexdigest.ValidSHA256(repository.WorkspaceID) || !hexdigest.ValidSHA256(repository.HostIdentity)) {
 		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "configure S3 host", Err: errors.New("private S3 reads require workspace and host identities")}
 	}
 	if repository.Path != "" || repository.Bucket == "" || repository.CanonicalEndpoint == "" {
@@ -1056,7 +1058,7 @@ func isLoopbackHost(value string) bool {
 
 func validateFile(file host.File) error {
 	if file.Path == "" || file.Path == "." || len(file.Path) > 1024 || path.IsAbs(file.Path) || path.Clean(file.Path) != file.Path ||
-		strings.HasPrefix(file.Path, "../") || strings.ContainsRune(file.Path, '\\') || file.Size < 0 || !validSHA256(file.SHA256) {
+		strings.HasPrefix(file.Path, "../") || strings.ContainsRune(file.Path, '\\') || file.Size < 0 || !hexdigest.ValidSHA256(file.SHA256) {
 		return &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "stage S3 repository", Err: fmt.Errorf("invalid file descriptor %q", file.Path)}
 	}
 	return nil
@@ -1188,9 +1190,9 @@ func validManagedMetadata(metadata map[string]string) bool {
 		ReleaseSHA256: metadata["release-sha256"], ManifestSHA256: metadata["manifest-sha256"], RestoreID: metadata["restore-id"],
 		RestoreSHA256: metadata["restore-sha256"], RestoreRootSHA256: metadata["restore-root-sha256"],
 	}
-	return validSHA256(revision.TreeSHA256) && validSHA256(revision.PlanID) && changeIDPattern.MatchString(revision.ChangeID) &&
-		validSHA256(revision.ReleaseSHA256) && validSHA256(revision.ManifestSHA256) && validIdentifier(revision.RestoreID) &&
-		validSHA256(revision.RestoreSHA256) && (revision.RestoreRootSHA256 == "" || validSHA256(revision.RestoreRootSHA256)) &&
+	return hexdigest.ValidSHA256(revision.TreeSHA256) && hexdigest.ValidSHA256(revision.PlanID) && changeIDPattern.MatchString(revision.ChangeID) &&
+		hexdigest.ValidSHA256(revision.ReleaseSHA256) && hexdigest.ValidSHA256(revision.ManifestSHA256) && validIdentifier(revision.RestoreID) &&
+		hexdigest.ValidSHA256(revision.RestoreSHA256) && (revision.RestoreRootSHA256 == "" || hexdigest.ValidSHA256(revision.RestoreRootSHA256)) &&
 		metadataMatchesRevision(metadata, revision)
 }
 
@@ -1474,13 +1476,8 @@ func restoreRootKey(repository host.Repository, identifier string) string {
 	return objectKey(repository, path.Join(".snailmail", "restores", identifier, "root.html"))
 }
 
-func validSHA256(value string) bool {
-	decoded, err := hex.DecodeString(value)
-	return err == nil && len(decoded) == sha256.Size && strings.ToLower(value) == value
-}
-
 func validIdentifier(value string) bool {
-	return len(value) == sha256.Size*2 && validSHA256(value)
+	return len(value) == sha256.Size*2 && hexdigest.ValidSHA256(value)
 }
 
 func contentType(name string) string {

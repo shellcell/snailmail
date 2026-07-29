@@ -17,6 +17,8 @@ import (
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/signer"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 type deploymentSigningState struct {
@@ -285,7 +287,7 @@ const maxSigningNodes = 1024
 // plan is read before its repository is rebuilt — only the format-independent
 // invariants can be enforced.
 func validateSigningRecipeMetadata(signing state.PlanSigning, recipe *signingRecipe) error {
-	if len(signing.Nodes) == 0 || len(signing.Nodes) > maxSigningNodes || signing.RecipeSHA256 != signingRecipeDigest(signing) || !validSHA256(signing.KeyringSHA256) ||
+	if len(signing.Nodes) == 0 || len(signing.Nodes) > maxSigningNodes || signing.RecipeSHA256 != signingRecipeDigest(signing) || !hexdigest.ValidSHA256(signing.KeyringSHA256) ||
 		path.IsAbs(signing.KeyringPath) || path.Clean(signing.KeyringPath) != signing.KeyringPath || !strings.HasPrefix(signing.KeyringPath, "keys/") || !strings.HasSuffix(signing.KeyringPath, ".gpg") || len(signing.TrustedKeys) == 0 {
 		return errors.New("signing recipe digest does not match its nodes")
 	}
@@ -297,7 +299,7 @@ func validateSigningRecipeMetadata(signing state.PlanSigning, recipe *signingRec
 	foundActive := false
 	seenKeys := make(map[string]bool)
 	for _, trusted := range signing.TrustedKeys {
-		if trusted.KeyName == "" || seenKeys[trusted.KeyName] || !validFingerprint(trusted.Fingerprint) || !validSHA256(trusted.PublicKeySHA256) ||
+		if trusted.KeyName == "" || seenKeys[trusted.KeyName] || !hexdigest.ValidFingerprint(trusted.Fingerprint) || !hexdigest.ValidSHA256(trusted.PublicKeySHA256) ||
 			trusted.PublicKeyPath == "" {
 			return errors.New("signing recipe has invalid trusted key")
 		}

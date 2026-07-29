@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/shellcell/snailmail/internal/jsonstrict"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 func LoadDeployment(root, repository string) (DeploymentRecord, error) {
@@ -111,8 +113,8 @@ func CommitDeployments(root, planID, baseRevision string, records []DeploymentRe
 }
 
 func validDeploymentIdentity(record DeploymentRecord) bool {
-	return validSHA256(record.PlanID) && validSHA256(record.TreeSHA256) &&
-		(record.ManifestSHA256 == "" || validSHA256(record.ManifestSHA256)) && record.NativeRevision != "" &&
+	return hexdigest.ValidSHA256(record.PlanID) && hexdigest.ValidSHA256(record.TreeSHA256) &&
+		(record.ManifestSHA256 == "" || hexdigest.ValidSHA256(record.ManifestSHA256)) && record.NativeRevision != "" &&
 		record.ChangeID == record.Repository+":"+record.TreeSHA256[:12]
 }
 

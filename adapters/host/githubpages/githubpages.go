@@ -20,6 +20,8 @@ import (
 
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 const publicationHeader = "snailmail-pages/v1"
@@ -167,7 +169,7 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 	if err := validateRepository(repository); err != nil {
 		return host.CommitResult{}, err
 	}
-	if !validIdentifier(staged.ID) || !validSHA256(staged.PlanID) || staged.ChangeID == "" || !validSHA256(staged.TreeSHA256) {
+	if !validIdentifier(staged.ID) || !hexdigest.ValidSHA256(staged.PlanID) || staged.ChangeID == "" || !hexdigest.ValidSHA256(staged.TreeSHA256) {
 		return host.CommitResult{}, invalid("commit GitHub Pages publication", "invalid stage handle")
 	}
 	workspace, err := newGitWorkspace(ctx)
@@ -399,7 +401,7 @@ func sameEndpoint(left, right string) bool {
 }
 
 func validateStageRequest(request host.StageRequest) error {
-	if !validSHA256(request.PlanID) || request.ChangeID == "" || !validSHA256(request.TreeSHA256) || (request.PreviousRevision != "" && !validGitObject(request.PreviousRevision)) || request.Directory == "" || len(request.Files) == 0 {
+	if !hexdigest.ValidSHA256(request.PlanID) || request.ChangeID == "" || !hexdigest.ValidSHA256(request.TreeSHA256) || (request.PreviousRevision != "" && !validGitObject(request.PreviousRevision)) || request.Directory == "" || len(request.Files) == 0 {
 		return invalid("stage GitHub Pages publication", "invalid stage request")
 	}
 	manifest, err := app.VerifyRepository(request.Directory)
@@ -407,7 +409,7 @@ func validateStageRequest(request host.StageRequest) error {
 		return invalid("stage GitHub Pages publication", "staged directory does not match reviewed tree")
 	}
 	for index, file := range request.Files {
-		if file.Path == "" || path.IsAbs(file.Path) || path.Clean(file.Path) != file.Path || strings.HasPrefix(file.Path, "../") || strings.ContainsRune(file.Path, '\\') || file.Size < 0 || !validSHA256(file.SHA256) || (index > 0 && request.Files[index-1].Path >= file.Path) {
+		if file.Path == "" || path.IsAbs(file.Path) || path.Clean(file.Path) != file.Path || strings.HasPrefix(file.Path, "../") || strings.ContainsRune(file.Path, '\\') || file.Size < 0 || !hexdigest.ValidSHA256(file.SHA256) || (index > 0 && request.Files[index-1].Path >= file.Path) {
 			return invalid("stage GitHub Pages publication", "invalid staged file descriptor")
 		}
 	}
@@ -499,15 +501,7 @@ func validBranch(value string) bool {
 	return true
 }
 
-func validSHA256(value string) bool {
-	if len(value) != sha256.Size*2 {
-		return false
-	}
-	_, err := hex.DecodeString(value)
-	return err == nil
-}
-
-func validIdentifier(value string) bool { return validSHA256(value) }
+func validIdentifier(value string) bool { return hexdigest.ValidSHA256(value) }
 
 func effectIdentifier(planID, changeID string) string {
 	digest := sha256.Sum256([]byte(planID + "\x00" + changeID))
@@ -849,7 +843,7 @@ func parseBoundMessage(message, header string) (publicationMetadata, error) {
 		PlanID: strings.TrimPrefix(lines[1], "plan-id="), ChangeID: strings.TrimPrefix(lines[2], "change-id="), TreeSHA256: strings.TrimPrefix(lines[3], "tree-sha256="),
 		ManifestSHA256: strings.TrimPrefix(lines[4], "manifest-sha256="), PreviousRevision: strings.TrimPrefix(lines[5], "previous-revision="),
 	}
-	if !validSHA256(metadata.PlanID) || metadata.ChangeID == "" || !validSHA256(metadata.TreeSHA256) || !validSHA256(metadata.ManifestSHA256) || (metadata.PreviousRevision != "" && !validGitObject(metadata.PreviousRevision)) || strings.ContainsAny(metadata.ChangeID, "\r\n") {
+	if !hexdigest.ValidSHA256(metadata.PlanID) || metadata.ChangeID == "" || !hexdigest.ValidSHA256(metadata.TreeSHA256) || !hexdigest.ValidSHA256(metadata.ManifestSHA256) || (metadata.PreviousRevision != "" && !validGitObject(metadata.PreviousRevision)) || strings.ContainsAny(metadata.ChangeID, "\r\n") {
 		return publicationMetadata{}, errors.New("invalid Pages publication binding")
 	}
 	return metadata, nil

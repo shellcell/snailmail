@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/shellcell/snailmail/host"
+
+	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
 const helperModeEnvironment = "SNAILMAIL_BROKER_TEST_MODE"
@@ -26,7 +28,7 @@ func TestMain(m *testing.M) {
 
 func TestBrokerIssuesAndDestroysBoundCredential(t *testing.T) {
 	broker := newTestBroker(t, "valid")
-	if !validSHA256(broker.Identity()) {
+	if !hexdigest.ValidSHA256(broker.Identity()) {
 		t.Fatalf("invalid broker identity %q", broker.Identity())
 	}
 	credential, err := broker.Issue(context.Background(), validScope())
