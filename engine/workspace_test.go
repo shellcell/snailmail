@@ -115,7 +115,7 @@ func TestSignedDebianPlanEmbedsResponsesAndApplyNeedsNoSigner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Generate(context.Background(), signer.Ref{Backend: "file", ID: initialManifest.Workspace.ID + "/archive"}, "archive", createdAt, 365*24*time.Hour); err != nil {
+	if _, err := store.Generate(context.Background(), signer.Ref{Backend: "file", ID: initialManifest.Workspace.ID + "/archive"}, signer.AlgorithmOpenPGPRSA4096, "archive", createdAt, 365*24*time.Hour); err != nil {
 		t.Fatalf("create interrupted key fixture: %v", err)
 	}
 	key, err := NewKey(context.Background(), NewKeyRequest{
@@ -364,7 +364,7 @@ func TestDebianSigningKeyRotationLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	orphanRef := signer.Ref{Backend: "file", ID: stableManifest.Workspace.ID + "/archive-2027"}
-	orphan, err := store.Generate(context.Background(), orphanRef, "archive-2027", rotationTime, 365*24*time.Hour)
+	orphan, err := store.Generate(context.Background(), orphanRef, signer.AlgorithmOpenPGPRSA4096, "archive-2027", rotationTime, 365*24*time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

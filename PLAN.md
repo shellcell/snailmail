@@ -496,7 +496,7 @@ This table is the tool's core competence and belongs in code, not documentation.
 | **helm** | ✅ | `index.yaml` + `.tgz` | `.prov` (GPG) | 1 |
 | **raw** | ✅ | generated listing + `SHA256SUMS` | none — not an ecosystem, no client checks a signature | 1 |
 | **rpm** | ✅ | `repodata/repomd.xml` | `repomd.xml.asc` implemented; per-RPM `--addsign` belongs to the package builder | 1 |
-| **apk** | ✅ | `<arch>/APKINDEX.tar.gz` | RSA only, filename is load-bearing — not implemented | 1 |
+| **apk** | ✅ | `<arch>/APKINDEX.tar.gz` | RSA only, filename is load-bearing — implemented | 1 |
 | **cargo** | ✅ | sparse index | none | 2 |
 | **go** | ✅ | GOPROXY `@v/` layout | checksum db | 2 |
 | **maven** | ✅ | `maven-metadata.xml` | `.asc` per artifact | 2 |

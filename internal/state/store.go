@@ -631,9 +631,19 @@ func ValidateGateConfiguration(policy string, approvalKeys []string, forgeReposi
 func validateSigningKeys(manifest Manifest) error {
 	fingerprints := make(map[string]string)
 	for name, key := range manifest.Keys {
-		if !identifierPattern.MatchString(name) || key.Algorithm != "openpgp-rsa4096" || key.Usage != "sign" || !fingerprintPattern.MatchString(key.Fingerprint) ||
-			!validSHA256(key.PublicKeySHA256) || !validSHA256(key.PublicArmorSHA256) || key.PublicKeyPath != filepath.ToSlash(filepath.Join("keys", name+".gpg")) ||
-			key.PublicArmorPath != filepath.ToSlash(filepath.Join("keys", name+".asc")) || key.Ref.Backend != "file" || key.Ref.ID != manifest.Workspace.ID+"/"+name {
+		// An apk key publishes one file, under the name a client will hold it by
+		// in /etc/apk/keys; an OpenPGP key publishes a binary keyring and an
+		// armored form. The paths are checked against whichever the key is.
+		binaryPath := filepath.ToSlash(filepath.Join("keys", name+".gpg"))
+		armorPath := filepath.ToSlash(filepath.Join("keys", name+".asc"))
+		if key.Algorithm == "apk-rsa4096" {
+			binaryPath = filepath.ToSlash(filepath.Join("keys", name+".rsa.pub"))
+			armorPath = binaryPath
+		}
+		if !identifierPattern.MatchString(name) || (key.Algorithm != "openpgp-rsa4096" && key.Algorithm != "apk-rsa4096") ||
+			key.Usage != "sign" || !fingerprintPattern.MatchString(key.Fingerprint) ||
+			!validSHA256(key.PublicKeySHA256) || !validSHA256(key.PublicArmorSHA256) || key.PublicKeyPath != binaryPath ||
+			key.PublicArmorPath != armorPath || key.Ref.Backend != "file" || key.Ref.ID != manifest.Workspace.ID+"/"+name {
 			return fmt.Errorf("signing key %q has invalid identity or public forms", name)
 		}
 		createdAt, createdErr := time.Parse(time.RFC3339, key.CreatedAt)
@@ -661,7 +671,7 @@ func validateRepositorySigning(name string, repository Repository, keys map[stri
 		return fmt.Errorf("repository %q: %w", name, err)
 	}
 	if !selected.ImplementsSigning() {
-		return fmt.Errorf("repository %q: repository signing is currently implemented for Debian only", name)
+		return fmt.Errorf("repository %q: snailmail does not produce repository signatures for format %q", name, repository.Format)
 	}
 	if len(repository.SigningKeys) != 1 {
 		return fmt.Errorf("repository %q must have exactly one active signing key", name)
@@ -703,10 +713,17 @@ func LoadSigningPublic(root string, key SigningKey) ([]byte, []byte, error) {
 }
 
 func WriteSigningPublic(root string, key SigningKey, binary, armored []byte) error {
-	for _, file := range []struct {
+	forms := []struct {
 		path, digest string
 		content      []byte
-	}{{key.PublicKeyPath, key.PublicKeySHA256, binary}, {key.PublicArmorPath, key.PublicArmorSHA256, armored}} {
+	}{{key.PublicKeyPath, key.PublicKeySHA256, binary}, {key.PublicArmorPath, key.PublicArmorSHA256, armored}}
+	// A key with one published form names it twice. Writing the second over the
+	// first would look like an overwrite with different bytes, so the armored
+	// form — the one a client installs — is the one kept.
+	if key.PublicKeyPath == key.PublicArmorPath {
+		forms = forms[1:]
+	}
+	for _, file := range forms {
 		digest := sha256.Sum256(file.content)
 		if hex.EncodeToString(digest[:]) != file.digest {
 			return errors.New("public signing key bytes do not match configured digest")

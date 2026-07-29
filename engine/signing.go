@@ -17,7 +17,6 @@ import (
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/signer"
-	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
 type deploymentSigningState struct {
@@ -61,9 +60,8 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 		if err != nil {
 			return domain.RepositoryArtifact{}, nil, err
 		}
-		inspectedBinary, binaryErr := openpgpsigner.InspectPublic(binary)
-		inspectedArmor, armorErr := openpgpsigner.InspectArmoredPublic(armored)
-		if binaryErr != nil || armorErr != nil || inspectedBinary != inspectedArmor || !identityMatchesState(inspectedBinary, trustedKey) {
+		inspectedBinary, inspectErr := inspectPublicForms(trustedKey, binary, armored)
+		if inspectErr != nil || !identityMatchesState(inspectedBinary, trustedKey) {
 			return domain.RepositoryArtifact{}, nil, errors.New("committed public forms do not match the configured signing identity")
 		}
 		publicKeyring = append(publicKeyring, binary...)
@@ -89,8 +87,7 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 	if err != nil {
 		return domain.RepositoryArtifact{}, nil, err
 	}
-	release := recipe.payload
-	payloadDigest := sha256.Sum256(release)
+	release := recipe.outputs[0].payload
 	var resolved *state.PlanSigning
 	if len(planned) == 1 {
 		copyPlanned := planned[0]
@@ -105,7 +102,7 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 		}
 		defer selected.Close()
 		identity, err := selected.Identity(ctx)
-		if err != nil || identity != binaryIdentity {
+		if err != nil || !signerMatchesPublic(key.Algorithm, identity, binaryIdentity) {
 			return domain.RepositoryArtifact{}, nil, errors.New("private signer identity differs from committed public key")
 		}
 		resolved = &state.PlanSigning{
@@ -117,7 +114,7 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 			RotationPhase: rotationPhase, MinimumRefreshSeconds: minimumRefresh,
 		}
 		for _, output := range recipe.outputs {
-			request := signer.Request{Scheme: output.scheme, Payload: release, CreatedAt: signatureTime}
+			request := signer.Request{Scheme: output.scheme, Payload: output.payload, CreatedAt: signatureTime}
 			response, err := selected.Sign(ctx, request)
 			if err != nil {
 				return domain.RepositoryArtifact{}, nil, err
@@ -126,10 +123,11 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 			if err != nil || !reflect.DeepEqual(response, repeated) {
 				return domain.RepositoryArtifact{}, nil, errors.New("signer does not produce deterministic responses")
 			}
-			if err := openpgpsigner.VerifyResponse(request, response, publicBinary, key.Fingerprint); err != nil {
+			if err := verifySignature(key.Algorithm, request, response, publicBinary, key.Fingerprint); err != nil {
 				return domain.RepositoryArtifact{}, nil, err
 			}
 			contentDigest := sha256.Sum256(response.Content)
+			payloadDigest := sha256.Sum256(output.payload)
 			resolved.Nodes = append(resolved.Nodes, state.SigningNode{
 				ID: output.id, Kind: "sign", DependsOn: []string{recipe.payloadID}, Scheme: output.scheme,
 				OutputPath: output.path, PayloadSHA256: hex.EncodeToString(payloadDigest[:]),
@@ -142,12 +140,14 @@ func applyRepositorySigning(ctx context.Context, root string, repository state.R
 		return domain.RepositoryArtifact{}, nil, err
 	}
 	contents := make([][]byte, 0, len(resolved.Nodes))
+	outputPaths := make([]string, 0, len(resolved.Nodes))
 	for _, node := range resolved.Nodes {
 		contents = append(contents, node.Content)
+		outputPaths = append(outputPaths, node.OutputPath)
 	}
 	signed, err := applyFormatSigning(repository, artifact, key, signingInputs{
 		publicBinary: publicBinary, publicArmor: publicArmorKeyring, publicKeyring: publicKeyring,
-		trustedFingerprints: trustedFingerprints, signatureTime: signatureTime, contents: contents,
+		trustedFingerprints: trustedFingerprints, signatureTime: signatureTime, contents: contents, outputPaths: outputPaths,
 	})
 	if err != nil {
 		return domain.RepositoryArtifact{}, nil, err
@@ -174,17 +174,18 @@ func validatePlannedSigning(planned state.PlanSigning, keyName string, key state
 	if err := validateSigningRecipeMetadata(planned, &recipe); err != nil {
 		return err
 	}
-	payloadDigest := sha256.Sum256(release)
 	// Every signature the recipe calls for, whatever their number: Debian makes
-	// two over one Release, a yum repository one over repomd.xml.
+	// two over one Release, a yum repository one over repomd.xml, an Alpine
+	// repository one per architecture index.
 	for index, output := range recipe.outputs {
 		node := planned.Nodes[index]
 		contentDigest := sha256.Sum256(node.Content)
+		payloadDigest := sha256.Sum256(output.payload)
 		if node.Scheme != output.scheme || node.PayloadSHA256 != hex.EncodeToString(payloadDigest[:]) || node.ContentSHA256 != hex.EncodeToString(contentDigest[:]) {
 			return errors.New("planned signing response digest does not match its content")
 		}
-		if err := openpgpsigner.VerifyResponse(
-			signer.Request{Scheme: output.scheme, Payload: release, CreatedAt: generatedAt},
+		if err := verifySignature(key.Algorithm,
+			signer.Request{Scheme: output.scheme, Payload: output.payload, CreatedAt: generatedAt},
 			signer.Response{Scheme: output.scheme, Fingerprint: key.Fingerprint, Content: node.Content}, publicBinary, key.Fingerprint,
 		); err != nil {
 			return fmt.Errorf("planned signing response: %w", err)
@@ -293,7 +294,7 @@ func validateSigningRecipeMetadata(signing state.PlanSigning, recipe *signingRec
 	// path, which is what stops a plan smuggling one somewhere else.
 	for _, node := range signing.Nodes {
 		if node.Kind != "sign" || len(node.DependsOn) != 1 || !knownPayloadIDs[node.DependsOn[0]] ||
-			(node.Scheme != signer.SchemeOpenPGPCleartext && node.Scheme != signer.SchemeOpenPGPDetached) ||
+			!knownSchemes[node.Scheme] ||
 			node.OutputPath == "" || path.IsAbs(node.OutputPath) || path.Clean(node.OutputPath) != node.OutputPath ||
 			strings.HasPrefix(node.OutputPath, "../") {
 			return errors.New("signing recipe has invalid node identity or dependencies")

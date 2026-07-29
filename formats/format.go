@@ -403,7 +403,7 @@ func (apkFormat) SupportsDistros() bool { return false }
 
 // apk signs an index by prepending a signature stream to it, with the signing
 // key's filename identifying which key to check. That is not produced yet.
-func (apkFormat) ImplementsSigning() bool { return false }
+func (apkFormat) ImplementsSigning() bool { return true }
 func (apkFormat) CommitPaths(repository Repository) []string {
 	paths := make([]string, 0, len(repository.Architectures))
 	for _, architecture := range repository.Architectures {

@@ -1820,7 +1820,7 @@ func validateApplyPlan(plan state.Plan) error {
 			return fmt.Errorf("plan repository %q has unsupported dual signing", repository.Name)
 		}
 		for _, signing := range repository.Signing {
-			if !formatSupportsSigning(repository.Format) || signing.KeyName == "" || signing.Algorithm != signer.AlgorithmOpenPGPRSA4096 || !validFingerprint(signing.Fingerprint) ||
+			if !formatSupportsSigning(repository.Format) || signing.KeyName == "" || (signing.Algorithm != signer.AlgorithmOpenPGPRSA4096 && signing.Algorithm != signer.AlgorithmAPKRSA4096) || !validFingerprint(signing.Fingerprint) ||
 				!validSHA256(signing.PublicKeySHA256) || !validSHA256(signing.PublicArmorSHA256) || !validSHA256(signing.RecipeSHA256) || signing.PublicKeyPath == "" || signing.PublicArmorPath == "" ||
 				// A format decides how many signatures it makes; only that there
 				// is at least one, and not more than any format calls for, is

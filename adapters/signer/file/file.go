@@ -1,6 +1,7 @@
 package filesigner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/shellcell/snailmail/signer"
+	apkrsa "github.com/shellcell/snailmail/signer/apkrsa"
 	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
@@ -43,7 +45,7 @@ func New(root string, passphrase func() ([]byte, error)) (*Store, error) {
 	return &Store{root: resolved, passphrase: passphrase}, nil
 }
 
-func (store *Store) Generate(ctx context.Context, ref signer.Ref, name string, createdAt time.Time, expiresIn time.Duration) (signer.Generated, error) {
+func (store *Store) Generate(ctx context.Context, ref signer.Ref, algorithm signer.Algorithm, name string, createdAt time.Time, expiresIn time.Duration) (signer.Generated, error) {
 	if err := validateRef(ref); err != nil {
 		return signer.Generated{}, err
 	}
@@ -55,9 +57,25 @@ func (store *Store) Generate(ctx context.Context, ref signer.Ref, name string, c
 		return signer.Generated{}, err
 	}
 	defer wipe(passphrase)
-	generated, err := openpgpsigner.Generate(name, createdAt, expiresIn, passphrase)
-	if err != nil {
-		return signer.Generated{}, err
+	var identity signer.Identity
+	var publicBinary, publicArmor, privateArmor []byte
+	switch algorithm {
+	case signer.AlgorithmOpenPGPRSA4096, "":
+		generated, err := openpgpsigner.Generate(name, createdAt, expiresIn, passphrase)
+		if err != nil {
+			return signer.Generated{}, err
+		}
+		identity, publicBinary, publicArmor, privateArmor =
+			generated.Identity, generated.PublicBinary, generated.PublicArmor, generated.PrivateArmor
+	case signer.AlgorithmAPKRSA4096:
+		generated, err := apkrsa.Generate(createdAt, expiresIn, passphrase)
+		if err != nil {
+			return signer.Generated{}, err
+		}
+		identity, publicBinary, publicArmor, privateArmor =
+			generated.Identity, generated.PublicBinary, generated.PublicArmor, generated.PrivateArmor
+	default:
+		return signer.Generated{}, fmt.Errorf("unsupported signing algorithm %q", algorithm)
 	}
 	root, err := os.OpenRoot(store.root)
 	if err != nil {
@@ -85,7 +103,7 @@ func (store *Store) Generate(ctx context.Context, ref signer.Ref, name string, c
 		}
 		return signer.Generated{}, err
 	}
-	_, writeErr := output.Write(generated.PrivateArmor)
+	_, writeErr := output.Write(privateArmor)
 	syncErr := output.Sync()
 	closeErr := output.Close()
 	if writeErr != nil || syncErr != nil || closeErr != nil {
@@ -101,16 +119,25 @@ func (store *Store) Generate(ctx context.Context, ref signer.Ref, name string, c
 	if directorySyncErr != nil || directoryCloseErr != nil {
 		return signer.Generated{}, errors.Join(directorySyncErr, directoryCloseErr)
 	}
-	return signer.Generated{Identity: generated.Identity, PublicBinary: generated.PublicBinary, PublicArmor: generated.PublicArmor}, nil
+	return signer.Generated{Identity: identity, PublicBinary: publicBinary, PublicArmor: publicArmor}, nil
 }
 
 func (store *Store) Public(ctx context.Context, ref signer.Ref) (signer.Generated, error) {
-	local, err := store.load(ctx, ref)
+	loaded, err := store.load(ctx, ref)
 	if err != nil {
 		return signer.Generated{}, err
 	}
-	defer local.Close()
-	return local.Public()
+	defer loaded.Close()
+	// Both signers expose their public forms; the interface carries only what
+	// signing needs, so this asks for the rest.
+	type publisher interface {
+		Public() (signer.Generated, error)
+	}
+	public, ok := loaded.(publisher)
+	if !ok {
+		return signer.Generated{}, errors.New("signing key cannot produce public forms")
+	}
+	return public.Public()
 }
 
 func (store *Store) Delete(_ context.Context, ref signer.Ref) error {
@@ -132,7 +159,7 @@ func (store *Store) Resolve(ctx context.Context, ref signer.Ref) (signer.Signer,
 	return store.load(ctx, ref)
 }
 
-func (store *Store) load(ctx context.Context, ref signer.Ref) (*openpgpsigner.Local, error) {
+func (store *Store) load(ctx context.Context, ref signer.Ref) (signer.Signer, error) {
 	if err := validateRef(ref); err != nil {
 		return nil, err
 	}
@@ -177,6 +204,11 @@ func (store *Store) load(ctx context.Context, ref signer.Ref) (*openpgpsigner.Lo
 		return nil, err
 	}
 	defer wipe(passphrase)
+	// The stored form says which kind of key it is, so a workspace holding both
+	// resolves each correctly without recording the algorithm twice.
+	if bytes.Contains(content, []byte("SNAILMAIL ENCRYPTED APK PRIVATE KEY")) {
+		return apkrsa.Open(content, passphrase, signer.Identity{})
+	}
 	return openpgpsigner.Load(content, passphrase)
 }
 

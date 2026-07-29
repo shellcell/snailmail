@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,6 +17,7 @@ import (
 	"github.com/shellcell/snailmail/internal/knowledge"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/signer"
+	apkrsa "github.com/shellcell/snailmail/signer/apkrsa"
 	openpgpsigner "github.com/shellcell/snailmail/signer/openpgp"
 )
 
@@ -80,7 +82,7 @@ func NewKey(ctx context.Context, request NewKeyRequest) (NewKeyResult, error) {
 	if request.Algorithm == "" {
 		request.Algorithm = signer.AlgorithmOpenPGPRSA4096
 	}
-	if request.Algorithm != signer.AlgorithmOpenPGPRSA4096 {
+	if request.Algorithm != signer.AlgorithmOpenPGPRSA4096 && request.Algorithm != signer.AlgorithmAPKRSA4096 {
 		return NewKeyResult{}, fmt.Errorf("unsupported signing algorithm %q", request.Algorithm)
 	}
 	if request.Keys == nil {
@@ -107,7 +109,7 @@ func NewKey(ctx context.Context, request NewKeyRequest) (NewKeyResult, error) {
 	if _, exists := manifest.Keys[request.Name]; exists {
 		return NewKeyResult{}, fmt.Errorf("signing key %q already exists", request.Name)
 	}
-	prepared, err := prepareSigningKey(ctx, manifest, request.Name, request.CreatedAt, request.ExpiresIn, request.Keys)
+	prepared, err := prepareSigningKey(ctx, manifest, request.Name, signer.Algorithm(request.Algorithm), request.CreatedAt, request.ExpiresIn, request.Keys)
 	if err != nil {
 		return NewKeyResult{}, err
 	}
@@ -288,34 +290,65 @@ func AuditKeys(request PublishKeyRequest, now time.Time) (KeyAuditResult, error)
 }
 
 func signingKeyFromGenerated(name string, ref signer.Ref, generated signer.Generated) (state.SigningKey, error) {
-	if generated.Identity.Algorithm != signer.AlgorithmOpenPGPRSA4096 || generated.Identity.Bits != 4096 || generated.Identity.Fingerprint == "" || generated.Identity.CreatedAt.IsZero() || !generated.Identity.ExpiresAt.After(generated.Identity.CreatedAt) {
+	if (generated.Identity.Algorithm != signer.AlgorithmOpenPGPRSA4096 && generated.Identity.Algorithm != signer.AlgorithmAPKRSA4096) || generated.Identity.Bits != 4096 || generated.Identity.Fingerprint == "" || generated.Identity.CreatedAt.IsZero() || !generated.Identity.ExpiresAt.After(generated.Identity.CreatedAt) {
 		return state.SigningKey{}, errors.New("generated signing identity is invalid")
 	}
-	binaryIdentity, err := openpgpsigner.InspectPublic(generated.PublicBinary)
-	if err != nil || binaryIdentity != generated.Identity {
-		return state.SigningKey{}, errors.New("generated binary public key does not match its identity")
-	}
-	armorIdentity, err := openpgpsigner.InspectArmoredPublic(generated.PublicArmor)
-	if err != nil || armorIdentity != generated.Identity {
-		return state.SigningKey{}, errors.New("generated armored public key does not match its identity")
+	if generated.Identity.Algorithm == signer.AlgorithmAPKRSA4096 {
+		// An apk key has one published form and it carries no dates, so only
+		// what the file actually attests to is compared.
+		armorIdentity, err := apkrsa.InspectPublic(generated.PublicArmor)
+		if err != nil || armorIdentity.Fingerprint != generated.Identity.Fingerprint ||
+			armorIdentity.Algorithm != generated.Identity.Algorithm || armorIdentity.Bits != generated.Identity.Bits {
+			return state.SigningKey{}, errors.New("generated apk public key does not match its identity")
+		}
+		// One published form, so the two recorded forms must be the same bytes.
+		if !bytes.Equal(generated.PublicBinary, generated.PublicArmor) {
+			return state.SigningKey{}, errors.New("apk public forms differ")
+		}
+	} else {
+		binaryIdentity, err := openpgpsigner.InspectPublic(generated.PublicBinary)
+		if err != nil || binaryIdentity != generated.Identity {
+			return state.SigningKey{}, errors.New("generated binary public key does not match its identity")
+		}
+		armorIdentity, err := openpgpsigner.InspectArmoredPublic(generated.PublicArmor)
+		if err != nil || armorIdentity != generated.Identity {
+			return state.SigningKey{}, errors.New("generated armored public key does not match its identity")
+		}
 	}
 	binaryDigest := sha256.Sum256(generated.PublicBinary)
 	armorDigest := sha256.Sum256(generated.PublicArmor)
 	return state.SigningKey{
 		Algorithm: generated.Identity.Algorithm, Usage: "sign", Fingerprint: generated.Identity.Fingerprint,
 		CreatedAt: generated.Identity.CreatedAt.UTC().Format(time.RFC3339), ExpiresAt: generated.Identity.ExpiresAt.UTC().Format(time.RFC3339),
-		PublicKeyPath: "keys/" + name + ".gpg", PublicKeySHA256: hex.EncodeToString(binaryDigest[:]),
-		PublicArmorPath: "keys/" + name + ".asc", PublicArmorSHA256: hex.EncodeToString(armorDigest[:]),
+		PublicKeyPath: publicKeyPath(name, generated.Identity.Algorithm), PublicKeySHA256: hex.EncodeToString(binaryDigest[:]),
+		PublicArmorPath: publicArmorPath(name, generated.Identity.Algorithm), PublicArmorSHA256: hex.EncodeToString(armorDigest[:]),
 		Ref: state.KeyRef{Backend: ref.Backend, ID: ref.ID},
 	}, nil
 }
 
-func prepareSigningKey(ctx context.Context, manifest state.Manifest, name string, createdAt time.Time, expiresIn time.Duration, keys signer.Generator) (preparedSigningKey, error) {
+// publicKeyPath and publicArmorPath name the committed public forms. An apk key
+// has one form rather than two, and the name it is published under is what a
+// client will hold in /etc/apk/keys, so it carries apk's own convention.
+func publicKeyPath(name, algorithm string) string {
+	if algorithm == signer.AlgorithmAPKRSA4096 {
+		return "keys/" + name + ".rsa.pub"
+	}
+	return "keys/" + name + ".gpg"
+}
+
+func publicArmorPath(name, algorithm string) string {
+	if algorithm == signer.AlgorithmAPKRSA4096 {
+		return "keys/" + name + ".rsa.pub"
+	}
+	return "keys/" + name + ".asc"
+}
+
+func prepareSigningKey(ctx context.Context, manifest state.Manifest, name string, algorithm signer.Algorithm, createdAt time.Time, expiresIn time.Duration, keys signer.Generator) (preparedSigningKey, error) {
 	ref := signer.Ref{Backend: "file", ID: manifest.Workspace.ID + "/" + name}
 	generated, err := keys.Public(ctx, ref)
 	createdPrivate := false
 	if errors.Is(err, signer.ErrNotFound) {
-		generated, err = keys.Generate(ctx, ref, name, createdAt, expiresIn)
+		generated, err = keys.Generate(ctx, ref, algorithm, name, createdAt, expiresIn)
 		createdPrivate = err == nil
 	}
 	if err != nil {

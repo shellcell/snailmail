@@ -150,7 +150,9 @@ func RotateKey(ctx context.Context, request RotateKeyRequest) (RotateKeyResult, 
 		if expiresIn < 2*minimumRefresh+2*time.Hour {
 			return RotateKeyResult{}, errors.New("new successor validity is shorter than introduction and overlap")
 		}
-		candidate, err := prepareSigningKey(ctx, manifest, request.Successor, now, expiresIn, request.Keys)
+		// A rotation keeps the algorithm the repository already uses; a client
+		// that trusts one kind of key cannot verify another.
+		candidate, err := prepareSigningKey(ctx, manifest, request.Successor, signer.Algorithm(baseKey.Algorithm), now, expiresIn, request.Keys)
 		if err != nil {
 			return RotateKeyResult{}, err
 		}
