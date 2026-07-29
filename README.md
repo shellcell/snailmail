@@ -183,6 +183,17 @@ repositories remain readable but `keys audit` reports them as errors. New
 unsigned Debian setup requires the explicit `--allow-unsigned` compatibility
 opt-out.
 
+Every format the knowledge bundle records as signable is signed, each in the
+form its own clients read: Debian publishes `InRelease` and `Release.gpg`, yum an
+armored key beside a detached `repomd.xml.asc`, Alpine one signature per
+architecture index under the key filename its index names, and Helm a `.prov`
+per chart beside the archive it covers. The published key differs with the
+client — apt installs a binary keyring, dnf imports an armored export, apk holds
+a bare RSA key by filename — so `keys attach` refuses a key whose algorithm the
+format's clients cannot check. Every signature is verified before it is
+published, because a repository carrying one that does not check out is worse
+than an unsigned one: a client reports it as tampering.
+
 Debian rotation keeps one active `InRelease` signer and a stable binary keyring.
 Introduction publishes both identities while the old key continues signing;
 activation switches to the successor only after the introducing deployment

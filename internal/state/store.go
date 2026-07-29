@@ -197,17 +197,17 @@ func Setup(root string, options SetupOptions) error {
 	if err := WriteLock(root, repository, RepositoryLock{SchemaVersion: LockSchema, Repository: options.Name}); err != nil {
 		return err
 	}
-	if err := writeInstallDocument(root, options.Name, repository); err != nil {
+	if err := writeInstallDocument(root, options.Name, repository, manifest.Keys); err != nil {
 		return err
 	}
 	return WriteManifest(root, manifest)
 }
 
-func writeInstallDocument(root, name string, repository Repository) error {
+func writeInstallDocument(root, name string, repository Repository, keys map[string]SigningKey) error {
 	if !host.Supports(repository.Host.Type, repository.Format).InstallDocument {
 		return nil
 	}
-	content := installDocumentContent(name, repository)
+	content := installDocumentContent(name, repository, keys)
 	filename, err := WorkspacePath(root, filepath.ToSlash(filepath.Join("docs", "install-"+name+".md")))
 	if err != nil {
 		return err
@@ -215,7 +215,7 @@ func writeInstallDocument(root, name string, repository Repository) error {
 	return atomicWrite(filename, content, 0o644)
 }
 
-func ValidateInstallDocument(root, name string, repository Repository) error {
+func ValidateInstallDocument(root, name string, repository Repository, keys map[string]SigningKey) error {
 	if !host.Supports(repository.Host.Type, repository.Format).InstallDocument {
 		return nil
 	}
@@ -227,7 +227,7 @@ func ValidateInstallDocument(root, name string, repository Repository) error {
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(content, installDocumentContent(name, repository)) {
+	if !bytes.Equal(content, installDocumentContent(name, repository, keys)) {
 		return fmt.Errorf("install document for repository %q does not match its canonical endpoint", name)
 	}
 	return nil
@@ -236,18 +236,63 @@ func ValidateInstallDocument(root, name string, repository Repository) error {
 // installDocumentContent renders the consumer instructions for a repository.
 // ARCHITECTURE §6.5 requires these to be generated rather than hand-written,
 // so they cannot advertise a layout the repository does not serve.
-func installDocumentContent(name string, repository Repository) []byte {
+// installDocumentContent writes the commands a consumer runs, for whichever
+// format this repository serves.
+//
+// The steps come from formats.InstallSteps, which is what the browsable listing
+// publishes too: two generators would drift, and this one had drifted already —
+// every format but Debian was handed PyPI's `pip install --index-url`, including
+// the rpm, apk and raw repositories the support matrix already declares.
+func installDocumentContent(name string, repository Repository, keys map[string]SigningKey) []byte {
 	if repository.Format == "deb" {
+		// Debian keeps its own generator: a deb822 .sources stanza is a file to
+		// write rather than commands to run, and it carries Signed-By.
 		return debInstallDocument(name, repository)
 	}
-	endpoint := strings.TrimSuffix(repository.Host.CanonicalEndpoint, "/") + "/simple/"
-	credentialNote := ""
+	steps := formats.InstallSteps(repository.Format, installRepositoryView(name, repository, keys))
+	if len(steps) == 0 {
+		return []byte("# Install from " + name + "\n\nThis repository publishes no install instructions.\n")
+	}
+	var document strings.Builder
+	document.WriteString("# Install from " + name + "\n\n")
 	if repository.Visibility == "private" {
 		parsed, _ := url.Parse(repository.Host.CanonicalEndpoint)
-		credentialNote = "Configure a short-lived Basic credential for `" + parsed.Hostname() + "` in your netrc before installing.\n\n"
+		document.WriteString("Configure a short-lived Basic credential for `" + parsed.Hostname() +
+			"` in your netrc before installing.\n\n")
 	}
-	return []byte("# Install from " + name + "\n\n" + credentialNote +
-		"```sh\npython -m pip install --index-url " + shellQuote(endpoint) + " PACKAGE\n```\n")
+	document.WriteString("```sh\n")
+	for _, step := range steps {
+		document.WriteString(step + "\n")
+	}
+	document.WriteString("```\n")
+	return []byte(document.String())
+}
+
+// installRepositoryView is what a format needs to write instructions against.
+//
+// The published key is not always the keyring the manifest records: a yum client
+// imports an armored export of it, and an apk client holds a bare key under the
+// filename its index names. The format is asked which, rather than this guessing.
+func installRepositoryView(name string, repository Repository, keys map[string]SigningKey) formats.Repository {
+	view := formats.Repository{
+		Name: name, Suite: repository.Suite, Component: repository.Component,
+		Architectures: repository.Architectures, Signed: len(repository.SigningKeys) != 0,
+		Endpoint: repository.Host.CanonicalEndpoint,
+	}
+	if len(repository.SigningKeys) == 0 {
+		return view
+	}
+	key := keys[repository.SigningKeys[0]]
+	keyPath := repository.SigningKeyring
+	if signing, err := formats.SignerFor(repository.Format); err == nil {
+		keyPath = signing.ClientKeyPath(view, formats.SigningMaterial{
+			KeyringPath: repository.SigningKeyring, PublicArmorPath: key.PublicArmorPath,
+		})
+	}
+	view.Signing = &formats.RepositorySigning{
+		Fingerprint: key.Fingerprint, Algorithm: key.Algorithm, KeyPath: keyPath,
+	}
+	return view
 }
 
 // debInstallDocument emits a deb822 .sources stanza. The keyring is fetched

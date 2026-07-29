@@ -557,7 +557,7 @@ func (preparation *planPreparation) planRepository(name string) (state.PlanRepos
 			action = "create"
 		}
 	}
-	installDocDigest, err := repositoryInstallDocDigest(root, name, repository)
+	installDocDigest, err := repositoryInstallDocDigest(root, name, repository, manifest.Keys)
 	if err != nil {
 		return state.PlanRepository{}, nil, err
 	}
@@ -1167,6 +1167,16 @@ func verifyEndpointClient(ctx context.Context, repository state.Repository, stag
 		return fmt.Errorf("client verification is not implemented for format %q on host %q",
 			repository.Format, repository.Host.Type)
 	}
+	// A format with no endpoint probe is verified against the staged tree
+	// instead, which is what happens anyway when no preview site is configured.
+	// The trade is stated there and is the same here: a real client still
+	// installs from the exact bytes, but nothing checks that the host serves
+	// them correctly until they are live. Refusing outright was worse — it made
+	// configuring a preview site turn a working repository into a failing one.
+	if !endpointProbeExists(repository.Format) {
+		_, err := verifyStaged(ctx, repository.Format, staged, request)
+		return err
+	}
 	switch repository.Format {
 	case "pypi":
 		_, _, err := app.VerifyPyPIClientEndpointAccess(ctx, staged, access, request.Python)
@@ -1515,11 +1525,11 @@ func repositoryHostIdentity(repository state.Repository) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func repositoryInstallDocDigest(root, name string, repository state.Repository) (string, error) {
+func repositoryInstallDocDigest(root, name string, repository state.Repository, keys map[string]state.SigningKey) (string, error) {
 	if !host.Supports(repository.Host.Type, repository.Format).InstallDocument {
 		return "", nil
 	}
-	if err := state.ValidateInstallDocument(root, name, repository); err != nil {
+	if err := state.ValidateInstallDocument(root, name, repository, keys); err != nil {
 		return "", err
 	}
 	filename, err := state.WorkspacePath(root, filepath.ToSlash(filepath.Join("docs", "install-"+name+".md")))
@@ -2322,7 +2332,7 @@ func (preparation *applyPreparation) prepareRepository(planned state.PlanReposit
 	if hostRepository.CanonicalEndpoint != planned.CanonicalEndpoint {
 		return applyRepository{}, fmt.Errorf("stale plan: repository %q canonical endpoint changed", planned.Name)
 	}
-	installDocDigest, err := repositoryInstallDocDigest(preparation.root, planned.Name, repository)
+	installDocDigest, err := repositoryInstallDocDigest(preparation.root, planned.Name, repository, preparation.manifest.Keys)
 	if err != nil || installDocDigest != planned.InstallDocSHA256 {
 		return applyRepository{}, fmt.Errorf("stale plan: repository %q install document changed", planned.Name)
 	}
@@ -2453,4 +2463,18 @@ func (preparation *applyPreparation) prepareRepository(planned state.PlanReposit
 	}
 	item.stageRoot, item.stage, item.stagedManifest = stage, stageOutput, stagedManifest
 	return item, nil
+}
+
+// endpointProbeExists reports whether a format can be verified through a served
+// endpoint rather than only against the tree that was staged.
+//
+// Kept beside the switch it describes, so the two are edited together. The
+// support matrix declares which pairs a host publishes; this is the narrower
+// question of whether a preview site can be exercised for one.
+func endpointProbeExists(format string) bool {
+	switch format {
+	case "pypi", "deb", "raw":
+		return true
+	}
+	return false
 }

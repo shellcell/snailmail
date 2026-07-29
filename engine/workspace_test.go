@@ -666,7 +666,7 @@ func TestWorkspacePlanApplyRemoteHost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(document), "python -m pip install --index-url 'https://packages.example/python/simple/' PACKAGE") {
+	if !strings.Contains(string(document), "python -m pip install --index-url 'https://packages.example/python/simple' <package>") {
 		t.Fatalf("unexpected install document %q", document)
 	}
 	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{

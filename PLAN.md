@@ -1161,7 +1161,7 @@ records the exact surface.
 key backends, the compatibility table, and `keys new|publish|audit|rotate`;
 then `promote`, `yank`, `prune`, `check`, `status`, `doctor`, `import`/`adopt`,
 the TUI, and the versioned knowledge bundle. Expand Tier 1 deliberately: rpm
-and apk first, followed by nix cache, cargo, go, and maven. Name mapping and
+and apk, then nix cache, cargo, go, and maven. Name mapping and
 dependency translation arrive only with formats that prove those abstractions
 are needed.
 
@@ -1172,12 +1172,19 @@ rotation, plan-resolved deterministic signatures verified through apt
 `signed-by`, and `promote`/`yank`/`prune`/`check`/`status`/`doctor`/`adopt`.
 `README.md` records the exact surface.
 
-The format-and-host coupling that this phase owed is now closed for its first
-cases: GitHub Pages serves signed Debian and raw alongside PyPI, and `raw`
-publishes artifacts that carry no ecosystem metadata. The matrix itself is
-declared in `host/support.go` rather than inferred, so the gaps that remain are
-readable rather than discovered. Remaining: S3 beyond PyPI, additional key
-backends, `import`, and the TUI.
+Tier 1 is complete: rpm and apk landed, and every format the knowledge bundle
+marks signable is now signed — Debian's `InRelease` and `Release.gpg`, a yum
+`repomd.xml.asc`, an Alpine index per architecture, and a Helm `.prov` per
+chart, each verified by running the real client. Signing lives behind a
+`formats.Signer` interface rather than a switch in the engine, so a format
+either satisfies it or does not.
+
+The format-and-host coupling that this phase owed is closed for its first
+cases: GitHub Pages serves signed Debian, rpm, apk and raw alongside PyPI. The
+matrix itself is declared in `host/support.go` rather than inferred, so the gaps
+that remain are readable rather than discovered. Remaining: Helm on Pages, S3
+beyond PyPI, additional key backends, `import`, and the TUI. The next formats
+are nix cache, cargo, go, and maven, in that order.
 
 A Pages repository needs a companion preview site only where a gate waits for a
 human to review one. Under an `auto` gate the preview is optional, and its
@@ -1235,28 +1242,60 @@ pain is visibility, policy, and setup, not mechanics.
 
 Resolved since the first draft: the capability table is vendored as a versioned
 knowledge bundle, digest-pinned in every plan; and the tool is a library
-(`engine`) with a thin CLI, as the server will require. Still open:
+(`engine`) with a thin CLI, as the server will require.
 
-- **Does the lock shard?** 10k placements is a 40k-line TOML and a miserable
-  diff. Per-track files? Per-package? A `.jsonl` that diffs well?
-- **Is `raw` too good?** If the escape hatch is comfortable enough, nobody uses
-  the typed formats and the model stops earning its keep.
-- **Does `setup` write CI or print it?** Writing is friendlier; printing doesn't
-  fight whatever the repository already does. Leaning: write, but only into a
-  file the tool owns entirely.
-- **Rollout: real object or derived view?** Deriving it from Placements is
-  cheaper and can't go stale; storing it allows "0.1.2 was released on ‹date›,
-  approved by ‹person›" as a fact rather than an inference.
-- **Is `adopt` at scale just mirroring?** Adopting a handful of upstream
-  artifacts and running a pull-through cache of all of PyPI differ in degree,
-  not in kind. The model already supports the first. Deciding where the line
-  falls determines whether §16's mirroring question is a feature or a product.
-- **Does `repack` belong here at all?** It is the one place snailmail would
-  *build* rather than *arrange*, which is a different job with a different
-  failure surface. `nfpm` does it well; the question is whether snailmail drives
-  it or merely consumes its output.
-- **Full upstream mirroring** (a pull-through cache of PyPI or Debian) is large,
-  adjacent, and commonly wanted. Is it a separate product rather than a phase?
-- **Where does snailmail's own manifest live?** Its own repo with a published
-  action, or vendored into the packages repo? Leaning own repo: the manifest
-  sits above any one repository.
+Answered by what was built:
+
+- **Is `raw` too good?** No. It is the only format that cannot sign and the only
+  one that cannot derive identity from bytes, so an operator must supply a name
+  and version — and an archive not written as `<name>_<version>_<os>_<arch>` has
+  to be renamed on adoption as well. In practice the two uses do not compete:
+  the raw repository holds archives that have no ecosystem, and a `.deb` put
+  there would lose apt, signing, and its dependency metadata. The escape hatch
+  is deliberately least comfortable in the ways that matter.
+- **Is `adopt` at scale just mirroring?** They differ in what is named. `adopt`
+  pins what an operator names and records where it came from, which already is a
+  pull-through cache for those artifacts; a mirror takes whatever upstream has.
+  The line sits there because that is what keeps desired state reviewable.
+- **Full upstream mirroring** is therefore a separate product, not a phase.
+- **Does `repack` belong here?** No. The packaging is driven outside snailmail —
+  `nfpm` builds, snailmail arranges what it produced. Driving the build would
+  mean owning a failure surface that has nothing to do with publishing.
+- **Where does snailmail's own manifest live?** The producing repository holds
+  its release workflow and dispatches; the workspace holds desired state. The
+  manifest sits above any one repository, as leaned.
+- **Does the lock shard?** Yes, eventually: one file per package under a prefix
+  directory, with the plan's lock digest becoming a digest over shard digests.
+  Measured, a lock costs about 385 bytes per package-version, so 10k packages at
+  100 versions is a 385 MB file taking 2.3s to parse and 590 MB of heap — and
+  ten formats is ~3.9 GB of desired state in Git. Sharding is what stops Git
+  rewriting that blob per adoption and makes a diff reviewable; it does not
+  reduce the parse, because an index lists everything. It also has costs: a
+  package name is not a safe filename (two rpm names can collide on a
+  case-insensitive filesystem), the lock digest becomes a migration, and one
+  atomic write becomes many. Not yet — a rendered index is the wall that arrives
+  first, and the lock format should be chosen knowing that.
+- **Does `setup` write CI or print it?** Print. The leaning was to write a file
+  the tool owns, but a real workflow carries decisions the tool cannot make —
+  which registry to mirror through, which secrets, how several repositories are
+  assembled into one published site — and a tool-owned file would be regenerated
+  over them. A command that emits a starting point to stdout, which the operator
+  commits and owns, gets the friendliness without the fight.
+- **Rollout: real object or derived view?** Derived. The publication ledger
+  already records one append-only entry per publication with its plan, change,
+  tree digest and time, so the date is a recorded fact and a second object would
+  be a second source of truth. Attribution is the one part not derivable; if it
+  is wanted, the ledger record grows rather than a new object appearing.
+
+Still open:
+
+- **How does a repository serve an index too large to hold in memory?** A
+  `Packages` file for a million package-versions is ~400 MB, and a format
+  returns its generated files as bytes. Streaming them changes `domain.File`,
+  the build graph, and materialisation — and it gates the scale at which any of
+  the sharding above matters.
+- **Can an object store publish Debian atomically?** A suite's `Release` must
+  become live with its `Packages` and pool. Pages does it by moving one ref;
+  S3 has no ordered multi-object commit. Either a two-phase switch through a
+  pointer object, or an admitted window where a client sees a `Release` that
+  disagrees with its indexes.

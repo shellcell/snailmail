@@ -104,7 +104,10 @@ func InstallSteps(format string, repository Repository) []string {
 			"helm install <release> " + name + "/<chart> --verify --keyring " + keyring,
 		}
 	case "pypi":
-		return []string{"pip install --index-url " + endpoint + "/simple <package>"}
+		// `python -m pip` rather than `pip`, which resolves to whichever
+		// interpreter's pip happens to be first on PATH; and the URL is quoted
+		// because it is pasted into a shell.
+		return []string{"python -m pip install --index-url '" + endpoint + "/simple' <package>"}
 	case "raw":
 		return []string{
 			"curl -LO " + endpoint + "/<name>/<version>/<file>",

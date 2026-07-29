@@ -164,14 +164,14 @@ func TestValidateInstallDocumentRejectsEndpointDrift(t *testing.T) {
 		Format: "pypi", Visibility: "public",
 		Host: HostConfig{Type: "s3", Bucket: "packages", CanonicalEndpoint: "https://packages.example/python"},
 	}
-	if err := writeInstallDocument(root, "python", repository); err != nil {
+	if err := writeInstallDocument(root, "python", repository, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateInstallDocument(root, "python", repository); err != nil {
+	if err := ValidateInstallDocument(root, "python", repository, nil); err != nil {
 		t.Fatal(err)
 	}
 	repository.Host.CanonicalEndpoint = "https://other.example/python"
-	if err := ValidateInstallDocument(root, "python", repository); err == nil {
+	if err := ValidateInstallDocument(root, "python", repository, nil); err == nil {
 		t.Fatal("expected changed endpoint to invalidate generated install document")
 	}
 }
@@ -241,10 +241,10 @@ func TestGitHubPagesRequiresDistinctPublicPreviewSite(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := t.TempDir()
-	if err := writeInstallDocument(root, "python", repository); err != nil {
+	if err := writeInstallDocument(root, "python", repository, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := ValidateInstallDocument(root, "python", repository); err != nil {
+	if err := ValidateInstallDocument(root, "python", repository, nil); err != nil {
 		t.Fatal(err)
 	}
 	repository.Host.PreviewRepository = repository.Host.Repository

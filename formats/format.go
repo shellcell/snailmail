@@ -152,9 +152,12 @@ type Format interface {
 	// attaching the wrong kind produces a repository nothing can read.
 	SigningAlgorithm() string
 	// ImplementsSigning reports whether snailmail can produce repository
-	// signatures for this format. This is narrower than what the ecosystem
-	// permits: the knowledge bundle records that Helm defines .prov signing,
-	// while this implementation does not yet produce it.
+	// signatures for this format. It may be narrower than what the ecosystem
+	// permits — a format the knowledge bundle records as signable is not
+	// necessarily one this tool signs yet — but never wider: claiming to sign
+	// what the ecosystem cannot would configure a repository for a signature no
+	// client would ever check. TestImplementedSigningIsPermittedByKnowledgeBundle
+	// holds that direction.
 	ImplementsSigning() bool
 	// CommitPaths are the files whose switch makes a new revision live, which
 	// a host must publish last and together.
@@ -332,8 +335,6 @@ func (helmFormat) Inspect(filename string, reader io.ReaderAt, size int64, suppl
 func (helmFormat) ArtifactCoordinate(Artifact) string { return "chart" }
 func (helmFormat) SupportsDistros() bool              { return false }
 
-// Helm signs with a per-chart .prov file, which is not yet implemented.
-// Helm defines .prov signing, which is not produced here.
 func (helmFormat) RequiresLegacyDigests() bool { return false }
 
 func (helmFormat) SigningAlgorithm() string { return signer.AlgorithmOpenPGPRSA4096 }

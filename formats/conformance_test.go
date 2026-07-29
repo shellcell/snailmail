@@ -180,11 +180,14 @@ func TestDistroFormatsSeparateSuitesInCommitPaths(t *testing.T) {
 	}
 }
 
-// An implementation may lag the ecosystem — Helm defines .prov signing that
-// this tool does not yet produce — but it must never claim to sign a format the
-// ecosystem cannot sign, because that would let a repository be configured for
-// a signature no client would ever check. Implementing signing therefore
+// An implementation may lag the ecosystem, but it must never claim to sign a
+// format the ecosystem cannot sign: that would let a repository be configured
+// for a signature no client would ever check. Implementing signing therefore
 // implies the knowledge bundle permits it, and not the reverse.
+//
+// Every format the bundle marks signable is now signed, so the lag is currently
+// zero — which is why this asserts the implication rather than the equality it
+// happens to hold today.
 func TestImplementedSigningIsPermittedByKnowledgeBundle(t *testing.T) {
 	permitted := make(map[string]bool)
 	known := make(map[string]bool)

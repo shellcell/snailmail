@@ -57,6 +57,10 @@ var formatSupport = map[string]map[string]FormatSupport{
 	"github-pages": {
 		"pypi": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 		"deb":  {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		// A chart repository switches one file, index.yaml; a provenance file
+		// sits at a content-addressed path nothing ever replaces. So the atomic
+		// commit Pages offers is more than Helm needs.
+		"helm": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 		// Raw has no client to run: a consumer fetches a URL and checks it
 		// against SHA256SUMS, which host-served byte verification already does.
 		"raw": {Publish: true, RemoteClientVerification: true, InstallDocument: true},

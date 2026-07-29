@@ -14,8 +14,9 @@ func TestSupportsDeniesUnknownPairs(t *testing.T) {
 		{"rsync", "pypi"},
 		// cargo has no format implementation, so no host can serve it.
 		{"local", "cargo"},
-		// Helm publishes to a directory only; Pages has no support for it.
-		{"github-pages", "helm"},
+		// Helm on S3: an object store cannot switch index.yaml and the charts
+		// it names in one commit.
+		{"s3", "helm"},
 	} {
 		support := Supports(pair[0], pair[1])
 		if support.Publish || support.RemoteClientVerification || support.InstallDocument {
