@@ -751,10 +751,21 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	// an unresolvable image rather than as the quota it is.
 	rpmImage := flags.String("rpm-image", engine.DefaultRPMVerificationImage, "digest-pinned RPM image")
 	apkImage := flags.String("apk-image", engine.DefaultAPKVerificationImage, "digest-pinned Alpine image")
+	imageRegistry := flags.String("image-registry", "", "fetch every verification image from this registry instead")
 	maxWorkspaceMiB := flags.Int64("max-workspace-mib", 4096, "maximum Debian verification workspace in MiB")
 	approvalFile := flags.String("approvals", "", "approval evidence file (defaults beside plan)")
 	if err := flags.parse(args); err != nil {
 		return err
+	}
+	// Applied to every image, including any given explicitly: a workspace
+	// choosing a mirror means all of them, and one format still reaching for
+	// Docker Hub would keep the failure it was meant to avoid.
+	for _, image := range []*string{debianImage, helmImage, rpmImage, apkImage} {
+		moved, err := engine.ImageWithRegistry(*image, *imageRegistry)
+		if err != nil {
+			return err
+		}
+		*image = moved
 	}
 	hosts := wire.NewHostResolver()
 	defer hosts.Close()
