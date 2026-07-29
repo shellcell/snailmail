@@ -21,6 +21,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/shellcell/snailmail/formats/apk"
 	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
@@ -137,6 +138,7 @@ var registry = map[string]Format{
 	"helm": helmFormat{},
 	"raw":  rawFormat{},
 	"rpm":  rpmFormat{},
+	"apk":  apkFormat{},
 }
 
 // For returns the format registered under name.
@@ -288,6 +290,7 @@ func (helmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.Repos
 var (
 	_ Format = rawFormat{}
 	_ Format = rpmFormat{}
+	_ Format = apkFormat{}
 	_ Format = pypiFormat{}
 	_ Format = debFormat{}
 	_ Format = helmFormat{}
@@ -365,4 +368,50 @@ func (rpmFormat) ImplementsSigning() bool         { return false }
 func (rpmFormat) CommitPaths(Repository) []string { return []string{"repodata/repomd.xml"} }
 func (rpmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
 	return rpm.Build(blobs, rpm.BuildOptions{GeneratedAt: options.GeneratedAt})
+}
+
+// apkFormat serves Alpine packages through an APKINDEX repository.
+type apkFormat struct{}
+
+func (apkFormat) Name() string                     { return "apk" }
+func (apkFormat) ID() string                       { return apk.FormatID }
+func (apkFormat) MaxArtifactSize() int64           { return apk.MaxArtifactSize }
+func (apkFormat) IsArtifactFilename(n string) bool { return apk.IsArtifactFilename(n) }
+
+// Alpine package names are used verbatim by apk.
+func (apkFormat) NormalizeName(n string) string { return n }
+func (apkFormat) CompareVersions(l, r string) (int, error) {
+	return apk.CompareVersions(l, r)
+}
+
+// An .apk names itself in .PKGINFO; the filename is only a convention.
+func (apkFormat) DerivesIdentityFromBytes() bool { return true }
+func (apkFormat) Inspect(filename string, reader io.ReaderAt, size int64, supplied Identity) (domain.PackageFacts, error) {
+	if supplied.Supplied() {
+		return domain.PackageFacts{}, errors.New("Alpine identity comes from .PKGINFO and cannot be supplied")
+	}
+	return apk.Inspect(filename, reader, size)
+}
+
+// One Alpine version holds one package per architecture.
+func (apkFormat) ArtifactCoordinate(artifact Artifact) string { return artifact.Architecture }
+
+// An Alpine repository is addressed by its own URL, and the architecture
+// directory is part of that URL rather than a coordinate inside the index.
+func (apkFormat) SupportsDistros() bool { return false }
+
+// apk signs an index by prepending a signature stream to it, with the signing
+// key's filename identifying which key to check. That is not produced yet.
+func (apkFormat) ImplementsSigning() bool { return false }
+func (apkFormat) CommitPaths(repository Repository) []string {
+	paths := make([]string, 0, len(repository.Architectures))
+	for _, architecture := range repository.Architectures {
+		paths = append(paths, path.Join(architecture, apk.IndexFilename))
+	}
+	return paths
+}
+func (apkFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
+	return apk.Build(blobs, apk.BuildOptions{
+		GeneratedAt: options.GeneratedAt, Architectures: options.Repository.Architectures,
+	})
 }

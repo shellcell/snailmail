@@ -9,8 +9,10 @@ don't own** — AUR, Homebrew, nixpkgs, npmjs, PyPI, ghcr.
 
 **Status: Phase 2 complete; Phase 3 signing foundation implemented.** The current implementation
 builds, structurally verifies, serves, and client-tests deterministic static
-PyPI, Debian, and Helm repositories, and publishes `raw` repositories of
-artifacts that carry no ecosystem metadata. Git-backed workspaces also support local
+PyPI, Debian, Helm, RPM and Alpine repositories, and publishes `raw`
+repositories of artifacts that carry no ecosystem metadata. Each format's
+client-test is the real client: pip, apt, helm, dnf and apk installing from the
+built tree in a container. Git-backed workspaces also support local
 `init`, `setup`, `add`, `plan`, and `apply` workflows with immutable blobs,
 reviewable plans, publication ledgers, and per-repository managed release
 switching. Replacement of an existing managed release needs an atomic

@@ -140,7 +140,13 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	githubPreviewEndpoint := flags.String("preview-url", "", "companion preview Pages base URL")
 	suite := flags.String("suite", "stable", "Debian suite")
 	component := flags.String("component", "main", "Debian component")
-	architectures := flags.String("architectures", "amd64", "comma-separated Debian architectures")
+	defaultArchitectures := "amd64"
+	if format == "apk" {
+		// Alpine names the same machine x86_64, and an index under the wrong
+		// name is one no client looks for.
+		defaultArchitectures = "x86_64"
+	}
+	architectures := flags.String("architectures", defaultArchitectures, "comma-separated architectures the repository serves")
 	if err := flags.parse(args[1:]); err != nil {
 		return err
 	}
@@ -948,7 +954,7 @@ func runBuildHelm(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail verify <pypi|deb|helm|raw|rpm> [options]")
+		return errors.New("usage: snailmail verify <pypi|deb|helm|raw|rpm|apk> [options]")
 	}
 	switch args[0] {
 	case "pypi":
@@ -961,6 +967,8 @@ func runVerify(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return runVerifyRaw(args[1:], stdout, stderr)
 	case "rpm":
 		return runVerifyRPM(ctx, args[1:], stdout, stderr)
+	case "apk":
+		return runVerifyAPK(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown verify format %q", args[0])
 	}
@@ -1130,6 +1138,35 @@ func runVerifyRPM(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	return nil
 }
 
+func runVerifyAPK(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := newCommandFlags("verify apk", stderr).withJSON()
+	repository := flags.String("repo", "", "generated repository directory")
+	runner := flags.String("runner", "podman", "OCI runner executable")
+	image := flags.String("image", engine.DefaultAPKVerificationImage, "digest-pinned Alpine client image")
+	structuralOnly := flags.Bool("structural-only", false, "verify the index without invoking apk")
+	if err := flags.parse(args); err != nil {
+		return err
+	}
+	result, err := engine.VerifyAPK(ctx, engine.VerifyAPKRequest{
+		Repository: *repository, Runner: *runner, Image: *image, StructuralOnly: *structuralOnly,
+	})
+	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  verified %d repository %s\n", result.FileCount, plural(result.FileCount, "file", "files"))
+	if *structuralOnly {
+		fmt.Fprintln(stdout, "✉️   structural verification passed")
+	} else {
+		fmt.Fprintf(stdout, "✉️   apk installed %d %s\n", result.InstalledCases, plural(result.InstalledCases, "package", "packages"))
+	}
+	fmt.Fprintf(stdout, "    tree sha256:%s\n", result.TreeSHA256)
+	return nil
+}
+
 func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("serve", stderr)
 	repository := flags.String("repo", "", "generated repository directory")
@@ -1217,6 +1254,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail verify helm --repo DIR [--runner podman]")
 	fmt.Fprintln(output, "  snailmail verify raw --repo DIR")
 	fmt.Fprintln(output, "  snailmail verify rpm --repo DIR [--runner podman]")
+	fmt.Fprintln(output, "  snailmail verify apk --repo DIR [--runner podman]")
 	fmt.Fprintln(output, "  snailmail serve --repo DIR [--listen 127.0.0.1:8080]")
 	fmt.Fprintln(output, "  snailmail version [--json]")
 	fmt.Fprintln(output)

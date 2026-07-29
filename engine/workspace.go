@@ -171,6 +171,7 @@ type ApplyWorkspaceRequest struct {
 	DebianImage            string
 	HelmImage              string
 	RPMImage               string
+	APKImage               string
 	MaxWorkspaceBytes      int64
 	Hosts                  host.Resolver
 	Blobs                  blob.Resolver
@@ -1374,7 +1375,7 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		return result, err
 	case "helm":
 		return BuildHelm(ctx, BuildHelmRequest{Input: input, Output: output, GeneratedAt: generatedAt})
-	case "raw", "rpm":
+	case "raw", "rpm", "apk":
 		return renderFromBlobs(lockedBlobs, lockedSources)
 	default:
 		return BuildResult{}, fmt.Errorf("unsupported repository format %q", repository.Format)
@@ -1546,6 +1547,12 @@ func verifyStaged(ctx context.Context, format, repository string, request ApplyW
 	case "rpm":
 		result, err := VerifyRPM(ctx, VerifyRPMRequest{
 			Repository: repository, Runner: request.Runner, Image: request.RPMImage,
+			StructuralOnly: request.StructuralOnly,
+		})
+		return result.Manifest, err
+	case "apk":
+		result, err := VerifyAPK(ctx, VerifyAPKRequest{
+			Repository: repository, Runner: request.Runner, Image: request.APKImage,
 			StructuralOnly: request.StructuralOnly,
 		})
 		return result.Manifest, err

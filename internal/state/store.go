@@ -147,6 +147,12 @@ func Setup(root string, options SetupOptions) error {
 	if err := validateGateConfiguration(options.Name, repository, manifest.Workspace.ForgeRepository); err != nil {
 		return err
 	}
+	// An Alpine repository is partitioned by client architecture, and a client
+	// fetches only its own index, so which architectures are served is part of
+	// the configuration rather than something the packages imply.
+	if options.Format == "apk" {
+		repository.Architectures = append([]string(nil), options.Architectures...)
+	}
 	if options.Format == "deb" {
 		repository.Suite = options.Suite
 		repository.Component = options.Component

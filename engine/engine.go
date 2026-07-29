@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shellcell/snailmail/formats/apk"
 	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
@@ -432,6 +433,47 @@ func VerifyRPM(ctx context.Context, request VerifyRPMRequest) (VerifyResult, err
 	}
 	if manifest.Format != rpm.FormatID {
 		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, rpm.FormatID)
+	}
+	return VerifyResult{
+		Format:         manifest.Format,
+		TreeSHA256:     manifest.TreeSHA256,
+		FileCount:      len(manifest.Files),
+		InstalledCases: installed,
+		Manifest:       manifest,
+	}, nil
+}
+
+// DefaultAPKVerificationImage is the client that proves an Alpine repository is
+// installable.
+const DefaultAPKVerificationImage = "docker.io/library/alpine@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d"
+
+type VerifyAPKRequest struct {
+	Repository     string
+	Runner         string
+	Image          string
+	StructuralOnly bool
+}
+
+// VerifyAPK checks an Alpine repository's index, and unless asked for structure
+// alone, has a real apk install from it.
+func VerifyAPK(ctx context.Context, request VerifyAPKRequest) (VerifyResult, error) {
+	var manifest buildgraph.RepositoryManifest
+	var err error
+	installed := 0
+	if request.StructuralOnly {
+		manifest, err = app.VerifyRepository(request.Repository)
+	} else {
+		image := request.Image
+		if image == "" {
+			image = DefaultAPKVerificationImage
+		}
+		manifest, installed, err = app.VerifyAPKClient(ctx, request.Repository, request.Runner, image)
+	}
+	if err != nil {
+		return VerifyResult{}, err
+	}
+	if manifest.Format != apk.FormatID {
+		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, apk.FormatID)
 	}
 	return VerifyResult{
 		Format:         manifest.Format,

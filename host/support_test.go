@@ -12,7 +12,10 @@ func TestSupportsDeniesUnknownPairs(t *testing.T) {
 		{"", ""},
 		{"s3", "rpm"},
 		{"rsync", "pypi"},
-		{"local", "apk"},
+		// cargo has no format implementation, so no host can serve it.
+		{"local", "cargo"},
+		// Helm publishes to a directory only; Pages has no support for it.
+		{"github-pages", "helm"},
 	} {
 		support := Supports(pair[0], pair[1])
 		if support.Publish || support.RemoteClientVerification || support.InstallDocument {

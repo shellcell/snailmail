@@ -495,8 +495,8 @@ This table is the tool's core competence and belongs in code, not documentation.
 | **deb** | ✅ | `dists/*/Packages`, `pool/` | `InRelease` + `Release.gpg`, binary keyring | 1 |
 | **helm** | ✅ | `index.yaml` + `.tgz` | `.prov` (GPG) | 1 |
 | **raw** | ✅ | generated listing + `SHA256SUMS` | none — not an ecosystem, no client checks a signature | 1 |
-| **rpm** | ✅ | `repodata/repomd.xml` | `repomd.xml.asc` + per-RPM `--addsign` | 1 |
-| **apk** | ✅ | `APKINDEX.tar.gz` | RSA only, filename is load-bearing | 1 |
+| **rpm** | ✅ | `repodata/repomd.xml` | `repomd.xml.asc` + per-RPM `--addsign` — not implemented | 1 |
+| **apk** | ✅ | `<arch>/APKINDEX.tar.gz` | RSA only, filename is load-bearing — not implemented | 1 |
 | **cargo** | ✅ | sparse index | none | 2 |
 | **go** | ✅ | GOPROXY `@v/` layout | checksum db | 2 |
 | **maven** | ✅ | `maven-metadata.xml` | `.asc` per artifact | 2 |
@@ -802,7 +802,7 @@ thing talk to":
 
 | Driver | Responsibility | Today / representative targets |
 |---|---|---|
-| **Format** | index generation, versions, names, deps | pypi, deb, helm, raw; then rpm, apk (§5 tiers) |
+| **Format** | index generation, versions, names, deps | pypi, deb, helm, raw, rpm, apk (§5 tiers) |
 | **Source** | watch releases, fetch bytes | pinned HTTPS fetch; watch awaits the Release model |
 | **BlobStore** | content-addressed bytes | local CAS, S3-compatible; ORAS/registry later |
 | **Host** | where a built tree lands | local dir, S3-compatible, GitHub Pages; rsync/registry later |
@@ -1177,7 +1177,7 @@ cases: GitHub Pages serves signed Debian and raw alongside PyPI, and `raw`
 publishes artifacts that carry no ecosystem metadata. The matrix itself is
 declared in `host/support.go` rather than inferred, so the gaps that remain are
 readable rather than discovered. Remaining: S3 beyond PyPI, additional key
-backends, rpm/apk, `import`, and the TUI.
+backends, `import`, and the TUI.
 
 A Pages repository needs a companion preview site only where a gate waits for a
 human to review one. Under an `auto` gate the preview is optional, and its

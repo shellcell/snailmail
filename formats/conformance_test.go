@@ -162,8 +162,11 @@ func TestEveryFormatGivesEveryArtifactACoordinate(t *testing.T) {
 // suite, otherwise two suites would publish over each other.
 func TestDistroFormatsSeparateSuitesInCommitPaths(t *testing.T) {
 	for _, format := range All() {
-		stable := format.CommitPaths(Repository{Suite: "stable"})
-		testing := format.CommitPaths(Repository{Suite: "testing"})
+		// Architectures are part of a usable repository for every format that
+		// partitions by them, so the fixture carries them rather than asking
+		// each format to invent a default it does not have.
+		stable := format.CommitPaths(Repository{Suite: "stable", Architectures: []string{"x86_64"}})
+		testing := format.CommitPaths(Repository{Suite: "testing", Architectures: []string{"x86_64"}})
 		if len(stable) == 0 {
 			t.Errorf("format %q declares no commit paths", format.Name())
 			continue
