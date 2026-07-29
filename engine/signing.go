@@ -260,12 +260,24 @@ func signingRecipeDigest(signing state.PlanSigning) string {
 	return hex.EncodeToString(digest[:])
 }
 
+// maxSigningNodes bounds the signatures a plan may carry when its repository has
+// not been rebuilt.
+//
+// How many a format makes is a property of the repository, not a constant:
+// Debian signs one document twice, Alpine signs one index per architecture, and
+// Helm signs one provenance file per chart. A fixed limit of two was written
+// when Debian was the only signed format, and it refused any Alpine repository
+// serving a third architecture — reporting it as a digest mismatch, which it
+// was not. The exact count is checked by validateRecipeNodes wherever the shape
+// is known; this is only the bound that keeps an unreasonable plan out.
+const maxSigningNodes = 1024
+
 // validateSigningRecipeMetadata checks what a plan can be checked against on
 // its own. A recipe pins the exact shape a format signs; without one — when a
 // plan is read before its repository is rebuilt — only the format-independent
 // invariants can be enforced.
 func validateSigningRecipeMetadata(signing state.PlanSigning, recipe *signingRecipe) error {
-	if len(signing.Nodes) == 0 || len(signing.Nodes) > 2 || signing.RecipeSHA256 != signingRecipeDigest(signing) || !validSHA256(signing.KeyringSHA256) ||
+	if len(signing.Nodes) == 0 || len(signing.Nodes) > maxSigningNodes || signing.RecipeSHA256 != signingRecipeDigest(signing) || !validSHA256(signing.KeyringSHA256) ||
 		path.IsAbs(signing.KeyringPath) || path.Clean(signing.KeyringPath) != signing.KeyringPath || !strings.HasPrefix(signing.KeyringPath, "keys/") || !strings.HasSuffix(signing.KeyringPath, ".gpg") || len(signing.TrustedKeys) == 0 {
 		return errors.New("signing recipe digest does not match its nodes")
 	}

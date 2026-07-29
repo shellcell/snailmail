@@ -1859,10 +1859,10 @@ func validateApplyPlan(plan state.Plan) error {
 		for _, signing := range repository.Signing {
 			if !formatSupportsSigning(repository.Format) || signing.KeyName == "" || (signing.Algorithm != signer.AlgorithmOpenPGPRSA4096 && signing.Algorithm != signer.AlgorithmAPKRSA4096) || !validFingerprint(signing.Fingerprint) ||
 				!validSHA256(signing.PublicKeySHA256) || !validSHA256(signing.PublicArmorSHA256) || !validSHA256(signing.RecipeSHA256) || signing.PublicKeyPath == "" || signing.PublicArmorPath == "" ||
-				// A format decides how many signatures it makes; only that there
-				// is at least one, and not more than any format calls for, is
-				// checkable without the repository.
-				len(signing.Nodes) == 0 || len(signing.Nodes) > 2 {
+				// A format decides how many signatures it makes, and the count
+				// follows from the repository rather than from the format alone,
+				// so without the repository only the bound is checkable here.
+				len(signing.Nodes) == 0 || len(signing.Nodes) > maxSigningNodes {
 				return fmt.Errorf("plan repository %q has invalid signing metadata", repository.Name)
 			}
 			if _, err := time.Parse(time.RFC3339, signing.SignatureTime); err != nil {
