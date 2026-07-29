@@ -112,7 +112,7 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 
 func runSetup(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail setup <pypi|deb|helm|raw> --name NAME --host <local|s3|github-pages> [host options]")
+		return errors.New("usage: snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --host <local|s3|github-pages> [host options]")
 	}
 	format := args[0]
 	flags := newCommandFlags("setup "+format, stderr).withWorkspace().withJSON()
@@ -1224,7 +1224,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output)
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
-	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw> --name NAME --output DIR")
+	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR")
 	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]")
 	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")

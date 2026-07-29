@@ -49,12 +49,12 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-user-static binfmt-support
           test -e /proc/sys/fs/binfmt_misc/qemu-aarch64
-      - run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
-      - run: go vet ./...
-      - run: go test -race -count=1 ./...
+      - run: make fmt
+      - run: make vet
+      - run: make test-race
       # The S3 adapters are build-tagged out for smaller binaries; that
       # configuration has to keep compiling and passing.
-      - run: go vet -tags nos3 ./... && go test -tags nos3 -count=1 ./...
+      - run: make test-nos3
       # A stamped build must report the tag as its version, and an ordinary one
       # must refuse to claim a release. Both directions matter: the second is
       # what stops a development build being published as a release.

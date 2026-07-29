@@ -1,0 +1,23 @@
+# Package metadata for deb, rpm and apk. nfpm renders all three from this one
+# description, in pure Go, so a package can be built anywhere a binary can —
+# no dpkg-deb, rpmbuild or abuild, and no container to hold them.
+#
+# ARCH and VERSION come from the Makefile. ARCH is written Go-style here; nfpm
+# translates it into each ecosystem's own spelling, which is why the same value
+# produces amd64 for Debian and x86_64 for RPM and Alpine.
+name: snailmail
+arch: ${ARCH}
+version: ${VERSION}
+release: "1"
+maintainer: ${MAINTAINER}
+description: |
+  Relaxed package delivery.
+  snailmail builds and publishes deterministic static package repositories
+  from a Git-backed workspace.
+homepage: https://github.com/shellcell/snailmail
+license: MIT
+contents:
+  - src: ./build/package/snailmail
+    dst: /usr/bin/snailmail
+    file_info:
+      mode: 0755
