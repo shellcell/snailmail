@@ -19,18 +19,47 @@ func TestLegacyDigestsFollowTheFormat(t *testing.T) {
 	}
 }
 
-// Every lock written before this distinction existed records MD5 and SHA-1 for
-// every format, and validation compares whichever the lock has. Skipping a
-// digest the lock records would report every existing workspace as corrupt.
-func TestLegacyDigestsHonourAnExistingLock(t *testing.T) {
+// A lock written before these were computed by need records MD5 and SHA-1 for
+// every format. Those values are not recomputed to be checked against: the
+// content is pinned by SHA-256, so bytes matching it match every other digest
+// of them too, and an hour of hashing per publication bought nothing.
+func TestRecordedLegacyDigestsDoNotForceTheWork(t *testing.T) {
 	for _, locked := range []LockedBlob{
 		{MD5: "d41d8cd98f00b204e9800998ecf8427e"},
 		{SHA1: "da39a3ee5e6b4b0d3255bfef95601890afd80709"},
 		{MD5: "d41d8cd98f00b204e9800998ecf8427e", SHA1: "da39a3ee5e6b4b0d3255bfef95601890afd80709"},
 	} {
-		if got := newLegacyDigests("raw", locked); got.md5Hash == nil {
-			t.Errorf("a lock recording %+v must still have its digests computed", locked)
+		if got := newLegacyDigests("raw", locked); got.md5Hash != nil {
+			t.Errorf("a lock recording %+v made a format that publishes neither compute them", locked)
 		}
+	}
+	// Debian still does, whatever the lock says, because apt reads them.
+	if got := newLegacyDigests("deb", LockedBlob{}); got.md5Hash == nil {
+		t.Error("a Debian repository stopped computing digests apt reads")
+	}
+}
+
+// An artifact already in a lock that records digests this format no longer
+// derives must still be accepted. Treating an absent value as a disagreement
+// refused to re-add or re-adopt anything already published — which is every
+// artifact in a workspace that has published before.
+func TestReAddingAgainstAnOlderLock(t *testing.T) {
+	existing := LockedBlob{
+		Filename: "demo.tar.gz", Size: 10, SHA256: "abc",
+		MD5: "d41d8cd98f00b204e9800998ecf8427e", SHA1: "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+	}
+	derived := LockedBlob{Filename: "demo.tar.gz", Size: 10, SHA256: "abc"}
+	if legacyDigestConflict(existing, derived) {
+		t.Error("an absent digest was read as contradicting a recorded one")
+	}
+	if legacyDigestConflict(derived, existing) {
+		t.Error("a recorded digest was read as contradicting an absent one")
+	}
+	// A genuine contradiction is still one.
+	wrong := existing
+	wrong.MD5 = "00000000000000000000000000000000"
+	if !legacyDigestConflict(existing, wrong) {
+		t.Error("two different MD5s for the same bytes were accepted")
 	}
 }
 

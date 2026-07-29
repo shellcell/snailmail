@@ -973,7 +973,13 @@ func AddBlob(lock *RepositoryLock, format, track, distro string, blob LockedBlob
 	blobExists := false
 	for _, existing := range packageVersion.Blobs {
 		if existing.SHA256 == blob.SHA256 && existing.Filename == blob.Filename {
-			if existing.Size != blob.Size || (existing.MD5 != "" && existing.MD5 != blob.MD5) || (existing.SHA1 != "" && existing.SHA1 != blob.SHA1) || existing.Architecture != blob.Architecture {
+			// A digest is compared only where both sides have one. A lock
+			// written before these were computed by need records MD5 and SHA-1
+			// for every format; an artifact re-added to such a lock now derives
+			// neither, and an absent value is not a disagreement — it is a
+			// question that was not asked. Treating it as one refused to
+			// re-adopt anything already published.
+			if existing.Size != blob.Size || legacyDigestConflict(existing, blob) || existing.Architecture != blob.Architecture {
 				return false, fmt.Errorf("package %s@%s has inconsistent metadata for existing bytes", packageName, version)
 			}
 			blobExists = true
@@ -1496,4 +1502,13 @@ func sortedRepositoryNames(repositories map[string]Repository) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// legacyDigestConflict reports whether a recorded MD5 or SHA-1 contradicts a
+// freshly derived one. Either being absent means there is nothing to contradict.
+func legacyDigestConflict(existing, derived LockedBlob) bool {
+	if existing.MD5 != "" && derived.MD5 != "" && existing.MD5 != derived.MD5 {
+		return true
+	}
+	return existing.SHA1 != "" && derived.SHA1 != "" && existing.SHA1 != derived.SHA1
 }

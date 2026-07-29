@@ -28,27 +28,26 @@ import (
 //
 // Only a Debian repository publishes them, and computing all three digests runs
 // at about a fifth the speed of SHA-256 alone — a cost paid on every plan and
-// every apply, over every artifact. So they are computed where the format needs
-// them, and also wherever a lock already records them: every lock written
-// before this distinction existed carries both for every format, and
-// validateLockedBlobOpenContext compares whichever the lock has. Skipping a
-// digest the lock records would report every existing workspace as corrupt.
+// every apply, over every artifact.
+//
+// Locks written before this distinction existed record both for every format.
+// Those recorded values are no longer checked, and that costs nothing: the
+// content is pinned by SHA-256, so bytes that match it match every other digest
+// of them too. An MD5 could only disagree if a lock had been hand-edited into
+// contradicting itself, which the SHA-256 it also records already catches. They
+// stop being written the next time a lock is rewritten.
 type legacyDigests struct {
 	md5Hash  hash.Hash
 	sha1Hash hash.Hash
 }
 
-func newLegacyDigests(format string, locked LockedBlob) legacyDigests {
-	needed := locked.MD5 != "" || locked.SHA1 != ""
-	if !needed {
-		if selected, err := formats.For(format); err == nil {
-			needed = selected.RequiresLegacyDigests()
-		} else {
-			// An unknown format is not a reason to compute less than before.
-			needed = true
-		}
+func newLegacyDigests(format string, _ LockedBlob) legacyDigests {
+	selected, err := formats.For(format)
+	if err != nil {
+		// An unknown format is not a reason to compute less than before.
+		return legacyDigests{md5Hash: md5.New(), sha1Hash: sha1.New()}
 	}
-	if !needed {
+	if !selected.RequiresLegacyDigests() {
 		return legacyDigests{}
 	}
 	return legacyDigests{md5Hash: md5.New(), sha1Hash: sha1.New()}
@@ -195,12 +194,16 @@ func InspectArtifactBytes(format, filename string, content []byte, supplied form
 	if err != nil {
 		return domain.Blob{}, err
 	}
-	md5Digest := md5.Sum(content)
-	sha1Digest := sha1.Sum(content)
-	sha256Digest := sha256.Sum256(content)
+	// The same rule the import path uses, so an artifact adopted and the same
+	// artifact added agree about what the lock records for it.
+	legacy := newLegacyDigests(format, LockedBlob{})
+	sha256Hash := sha256.New()
+	if _, err := legacy.writers(sha256Hash).Write(content); err != nil {
+		return domain.Blob{}, err
+	}
 	return domain.Blob{
-		Filename: filename, Size: int64(len(content)), MD5: hex.EncodeToString(md5Digest[:]),
-		SHA1: hex.EncodeToString(sha1Digest[:]), SHA256: hex.EncodeToString(sha256Digest[:]), Facts: facts,
+		Filename: filename, Size: int64(len(content)), MD5: legacy.md5Hex(),
+		SHA1: legacy.sha1Hex(), SHA256: hex.EncodeToString(sha256Hash.Sum(nil)), Facts: facts,
 	}, nil
 }
 

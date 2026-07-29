@@ -2,3 +2,5 @@ dist
 snailmail
 /build/
 /dist/
+*.test
+
