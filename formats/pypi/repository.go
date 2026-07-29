@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"path"
@@ -207,14 +208,39 @@ func validSimpleName(value string) bool {
 }
 
 func validateSimpleProjectURL(rawURL, projectName string) error {
+	if rawURL == "" {
+		return errors.New("PyPI project index has an empty project URL")
+	}
+	if len(rawURL) > 4096 {
+		return fmt.Errorf("PyPI project URL is %d characters, over the 4096 limit", len(rawURL))
+	}
 	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("PyPI project URL %q is unparseable: %w", rawURL, err)
+	}
 	lower := strings.ToLower(rawURL)
-	if err != nil || rawURL == "" || len(rawURL) > 4096 || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || strings.ContainsAny(rawURL, "\x00\r\n\\") || strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c") || parsed.Scheme != "" && parsed.Scheme != "https" || parsed.Scheme == "https" && parsed.Host == "" {
-		return errors.New("PyPI project index has an unsafe project URL")
+	// Percent-encoded separators are rejected before the path is examined,
+	// because url.Parse decodes them: one that reached the segment check below
+	// would already have become a separator, and one that did not would hide
+	// one. An encoded dot needs no separate rule for the same reason — it
+	// decodes into the path this walks.
+	switch {
+	case parsed.User != nil:
+		return fmt.Errorf("PyPI project URL %q carries credentials", rawURL)
+	case parsed.RawQuery != "" || parsed.Fragment != "":
+		return fmt.Errorf("PyPI project URL %q has a query or fragment", rawURL)
+	case strings.ContainsAny(rawURL, "\x00\r\n\\"):
+		return fmt.Errorf("PyPI project URL %q contains a control character or backslash", rawURL)
+	case strings.Contains(lower, "%2f"), strings.Contains(lower, "%5c"):
+		return fmt.Errorf("PyPI project URL %q percent-encodes a path separator", rawURL)
+	case parsed.Scheme != "" && parsed.Scheme != "https":
+		return fmt.Errorf("PyPI project URL %q uses scheme %q, not https", rawURL, parsed.Scheme)
+	case parsed.Scheme == "https" && parsed.Host == "":
+		return fmt.Errorf("PyPI project URL %q is https with no host", rawURL)
 	}
 	for _, segment := range strings.Split(parsed.Path, "/") {
 		if segment == "." || segment == ".." {
-			return errors.New("PyPI project index has an unsafe project URL")
+			return fmt.Errorf("PyPI project URL %q traverses its own path", rawURL)
 		}
 	}
 	linkedName := path.Base(strings.TrimSuffix(parsed.Path, "/"))

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/url"
 	"path"
@@ -102,8 +103,8 @@ func ParseRepositoryPackages(content []byte) ([]RepositoryPackage, error) {
 			Package: fields["package"], Version: fields["version"], Architecture: fields["architecture"],
 			Filename: fields["filename"], Size: size, SHA256: fields["sha256"],
 		}
-		if entry.Package == "" || len(entry.Package) > 255 || entry.Version == "" || len(entry.Version) > 255 || entry.Architecture == "" || len(entry.Architecture) > 255 || len(entry.Filename) > 4096 || sizeErr != nil || size < 0 || !validRepositoryDigest(entry.SHA256) || !safeRepositoryPath(entry.Filename) {
-			return nil, errors.New("invalid Debian Packages entry")
+		if err := validatePackagesEntry(entry, sizeErr); err != nil {
+			return nil, err
 		}
 		identity := entry.Package + "\x00" + entry.Version + "\x00" + entry.Architecture
 		if existing := identities[identity]; existing != "" {
@@ -242,4 +243,36 @@ func safeRepositoryPath(value string) bool {
 		}
 	}
 	return true
+}
+
+// validatePackagesEntry checks one stanza of a published Packages file.
+//
+// Written as separate checks because each is a different thing being wrong, and
+// an operator reading a rejected index needs to know which one. The single
+// condition this replaced tested eleven things and reported "invalid Debian
+// Packages entry" for every one of them.
+func validatePackagesEntry(entry RepositoryPackage, sizeErr error) error {
+	for _, field := range []struct{ name, value string }{
+		{"Package", entry.Package}, {"Version", entry.Version}, {"Architecture", entry.Architecture},
+	} {
+		if field.value == "" {
+			return fmt.Errorf("Debian Packages entry has no %s field", field.name)
+		}
+		if len(field.value) > 255 {
+			return fmt.Errorf("Debian Packages %s field is %d characters, over the 255 limit", field.name, len(field.value))
+		}
+	}
+	switch {
+	case len(entry.Filename) > 4096:
+		return fmt.Errorf("Debian Packages entry for %s has a filename of %d characters, over the 4096 limit", entry.Package, len(entry.Filename))
+	case sizeErr != nil:
+		return fmt.Errorf("Debian Packages entry for %s has an unreadable Size: %w", entry.Package, sizeErr)
+	case entry.Size < 0:
+		return fmt.Errorf("Debian Packages entry for %s has a negative Size", entry.Package)
+	case !validRepositoryDigest(entry.SHA256):
+		return fmt.Errorf("Debian Packages entry for %s has a SHA256 that is not a lowercase hex digest", entry.Package)
+	case !safeRepositoryPath(entry.Filename):
+		return fmt.Errorf("Debian Packages entry for %s has an unsafe Filename %q", entry.Package, entry.Filename)
+	}
+	return nil
 }

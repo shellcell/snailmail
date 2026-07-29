@@ -1260,7 +1260,16 @@ func legacyChecksums(name string) (string, string, error) {
 }
 
 func snapshotRepository(ctx context.Context, source string, manifest buildgraph.RepositoryManifest) (string, error) {
-	snapshot, err := os.MkdirTemp("", ".snailmail-repository-*")
+	// Beside the repository rather than in the system temp directory, so the
+	// hard links below always have a filesystem to be made on. A snapshot on
+	// another device silently falls back to copying every byte, which for a
+	// repository that can reach the 4 GiB verification limit is the difference
+	// between linking and rewriting it — and since repositories are now
+	// verified concurrently, several of those copies would run at once.
+	//
+	// The name is dot-prefixed like every other directory snailmail leaves in a
+	// publication root, so the site assembly's glob passes over it.
+	snapshot, err := os.MkdirTemp(filepath.Dir(source), ".snailmail-verify-*")
 	if err != nil {
 		return "", fmt.Errorf("create repository snapshot: %w", err)
 	}
