@@ -5,7 +5,6 @@ import (
 	"path"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/shellcell/snailmail/internal/domain"
 	"github.com/shellcell/snailmail/internal/listing"
@@ -167,7 +166,7 @@ func AppendListing(artifact domain.RepositoryArtifact, format string, options Bu
 		seen[path] = true
 		artifacts = append(artifacts, listing.Artifact{
 			Name: blob.Facts.Name, Version: blob.Facts.Version, Architecture: blob.Facts.Architecture,
-			Path: path, Size: blob.Size, SHA256: blob.SHA256, Published: publicationTime(options, blob),
+			Path: path, Size: blob.Size, SHA256: blob.SHA256, Published: blob.Added,
 		})
 	}
 	page := listing.Page{
@@ -185,15 +184,4 @@ func AppendListing(artifact domain.RepositoryArtifact, format string, options Bu
 	sort.Slice(files, func(left, right int) bool { return files[left].Path < files[right].Path })
 	artifact.Files = files
 	return artifact, nil
-}
-
-// publicationTime is when an artifact was locked, from whichever of the two
-// carriers has it: the blob itself where the build read the lock, and the
-// options where it rescanned materialized files and lost everything the bytes
-// do not themselves record.
-func publicationTime(options BuildOptions, blob domain.Blob) time.Time {
-	if !blob.Added.IsZero() {
-		return blob.Added
-	}
-	return options.Published[blob.SHA256]
 }

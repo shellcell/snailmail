@@ -96,14 +96,6 @@ type RepositorySigning struct {
 // architecture matrix. Making the set explicit is what keeps a build a pure
 // function of declared inputs rather than of ambient state.
 type BuildOptions struct {
-	// Published maps an artifact digest to when it was locked.
-	//
-	// It exists because three formats are rebuilt by scanning a directory of
-	// materialized files rather than from the lock, and a file on disk cannot
-	// say when it was published. The map carries that one fact past the rescan;
-	// formats built from the locked blobs directly read it off the blob instead.
-	Published map[string]time.Time
-
 	Repository  Repository
 	GeneratedAt time.Time
 }

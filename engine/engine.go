@@ -8,12 +8,6 @@ import (
 	"time"
 
 	"github.com/shellcell/snailmail/formats"
-	"github.com/shellcell/snailmail/formats/apk"
-	"github.com/shellcell/snailmail/formats/deb"
-	"github.com/shellcell/snailmail/formats/helm"
-	"github.com/shellcell/snailmail/formats/pypi"
-	"github.com/shellcell/snailmail/formats/raw"
-	"github.com/shellcell/snailmail/formats/rpm"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/buildgraph"
 	"github.com/shellcell/snailmail/internal/domain"
@@ -137,18 +131,11 @@ func BuildPyPI(ctx context.Context, request BuildPyPIRequest) (BuildResult, erro
 		return BuildResult{}, err
 	}
 	defer snapshot.Close()
-	artifact, err := pypi.Build(snapshot.Blobs)
-	if err != nil {
-		return BuildResult{}, err
-	}
 	generatedAt := request.GeneratedAt
 	if generatedAt.IsZero() {
 		generatedAt = reproducibleEpoch
 	}
-	artifact, err = formats.AppendListing(artifact, "pypi", formats.BuildOptions{
-		Repository: request.Listing, GeneratedAt: generatedAt,
-		Published: request.Published,
-	}, snapshot.Blobs)
+	artifact, err := buildThroughFormat("pypi", snapshot.Blobs, request.Listing, generatedAt)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -201,19 +188,7 @@ func buildDeb(ctx context.Context, request BuildDebRequest, transform func(domai
 	if generatedAt.IsZero() {
 		generatedAt = reproducibleEpoch
 	}
-	artifact, err := deb.Build(snapshot.Blobs, deb.BuildOptions{
-		Suite:         request.Suite,
-		Component:     request.Component,
-		Architectures: request.Architectures,
-		GeneratedAt:   generatedAt,
-	})
-	if err != nil {
-		return BuildResult{}, err
-	}
-	artifact, err = formats.AppendListing(artifact, "deb", formats.BuildOptions{
-		Repository: request.Listing, GeneratedAt: generatedAt,
-		Published: request.Published,
-	}, snapshot.Blobs)
+	artifact, err := buildThroughFormat("deb", snapshot.Blobs, debListing(request), generatedAt)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -275,14 +250,7 @@ func buildHelm(ctx context.Context, request BuildHelmRequest, transform func(dom
 	if generatedAt.IsZero() {
 		generatedAt = reproducibleEpoch
 	}
-	artifact, err := helm.Build(snapshot.Blobs, helm.BuildOptions{GeneratedAt: generatedAt})
-	if err != nil {
-		return BuildResult{}, err
-	}
-	artifact, err = formats.AppendListing(artifact, "helm", formats.BuildOptions{
-		Repository: request.Listing, GeneratedAt: generatedAt,
-		Published: request.Published,
-	}, snapshot.Blobs)
+	artifact, err := buildThroughFormat("helm", snapshot.Blobs, request.Listing, generatedAt)
 	if err != nil {
 		return BuildResult{}, err
 	}
@@ -328,8 +296,8 @@ func VerifyPyPI(ctx context.Context, request VerifyPyPIRequest) (VerifyResult, e
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	if manifest.Format != pypi.FormatID {
-		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, pypi.FormatID)
+	if err := requireFormatID(manifest.Format, "pypi"); err != nil {
+		return VerifyResult{}, err
 	}
 	return VerifyResult{
 		Format:         manifest.Format,
@@ -360,8 +328,8 @@ func VerifyDeb(ctx context.Context, request VerifyDebRequest) (VerifyResult, err
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	if manifest.Format != deb.FormatID {
-		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, deb.FormatID)
+	if err := requireFormatID(manifest.Format, "deb"); err != nil {
+		return VerifyResult{}, err
 	}
 	return VerifyResult{
 		Format:         manifest.Format,
@@ -388,8 +356,8 @@ func VerifyHelm(ctx context.Context, request VerifyHelmRequest) (VerifyResult, e
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	if manifest.Format != helm.FormatID {
-		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, helm.FormatID)
+	if err := requireFormatID(manifest.Format, "helm"); err != nil {
+		return VerifyResult{}, err
 	}
 	return VerifyResult{
 		Format:         manifest.Format,
@@ -448,8 +416,8 @@ func VerifyRaw(request VerifyRawRequest) (VerifyResult, error) {
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	if manifest.Format != raw.FormatID {
-		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, raw.FormatID)
+	if err := requireFormatID(manifest.Format, "raw"); err != nil {
+		return VerifyResult{}, err
 	}
 	return VerifyResult{
 		Format: manifest.Format, TreeSHA256: manifest.TreeSHA256,
@@ -492,8 +460,8 @@ func VerifyRPM(ctx context.Context, request VerifyRPMRequest) (VerifyResult, err
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	if manifest.Format != rpm.FormatID {
-		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, rpm.FormatID)
+	if err := requireFormatID(manifest.Format, "rpm"); err != nil {
+		return VerifyResult{}, err
 	}
 	return VerifyResult{
 		Format:         manifest.Format,
@@ -537,8 +505,8 @@ func VerifyAPK(ctx context.Context, request VerifyAPKRequest) (VerifyResult, err
 	if err != nil {
 		return VerifyResult{}, err
 	}
-	if manifest.Format != apk.FormatID {
-		return VerifyResult{}, fmt.Errorf("repository format is %q, not %q", manifest.Format, apk.FormatID)
+	if err := requireFormatID(manifest.Format, "apk"); err != nil {
+		return VerifyResult{}, err
 	}
 	return VerifyResult{
 		Format:         manifest.Format,
@@ -556,4 +524,41 @@ func versionScope(all bool) app.VersionScope {
 		return app.AllVersions
 	}
 	return app.SampledVersions
+}
+
+// buildThroughFormat renders a repository the way every other path does: the
+// format's own Build, which lays out the index and the browsable page together.
+//
+// These three builders scan a directory rather than read a lock, because that
+// is what `snailmail build` is given. What they produce is otherwise the same,
+// and going through the same door is what keeps it so.
+func buildThroughFormat(name string, blobs []domain.Blob, listing formats.Repository, generatedAt time.Time) (domain.RepositoryArtifact, error) {
+	selected, err := formats.For(name)
+	if err != nil {
+		return domain.RepositoryArtifact{}, err
+	}
+	return selected.Build(blobs, formats.BuildOptions{Repository: listing, GeneratedAt: generatedAt})
+}
+
+// debListing carries the suite a Debian repository is built for, which its
+// index needs and the other two formats have no equivalent of.
+func debListing(request BuildDebRequest) formats.Repository {
+	listing := request.Listing
+	listing.Suite, listing.Component, listing.Architectures = request.Suite, request.Component, request.Architectures
+	return listing
+}
+
+// requireFormatID checks that a directory holds the format it was asked about.
+//
+// The identity comes from the registry rather than from the format's own
+// package, so the engine needs to know only the name the operator typed.
+func requireFormatID(published, name string) error {
+	selected, err := formats.For(name)
+	if err != nil {
+		return err
+	}
+	if published != selected.ID() {
+		return fmt.Errorf("repository format is %q, not %q", published, selected.ID())
+	}
+	return nil
 }

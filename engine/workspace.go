@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1342,19 +1341,11 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 	if err != nil {
 		return BuildResult{}, err
 	}
-	input, err := os.MkdirTemp(staging, ".snailmail-locked-input-*")
-	if err != nil {
-		return BuildResult{}, err
-	}
 	selected, err := formats.For(repository.Format)
 	if err != nil {
 		return BuildResult{}, err
 	}
-	defer os.RemoveAll(input)
 	active := visiblePackageVersions(lock, repository)
-	// Formats that read identity out of the bytes are rebuilt from the input
-	// directory. Raw cannot be: its identity was supplied by an operator and
-	// lives in the lock, so the blobs are carried through directly.
 	var lockedBlobs []domain.Blob
 	lockedSources := make(map[string]string)
 	for _, packageVersion := range active {
@@ -1368,16 +1359,6 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 			lockedSources[blob.SHA256] = source
 			if nativePackageName(repository.Format, blob.Facts.Name) != packageVersion.Package || blob.Facts.Version != packageVersion.Version {
 				return BuildResult{}, fmt.Errorf("blob %s disagrees with package version %s@%s", locked.SHA256, packageVersion.Package, packageVersion.Version)
-			}
-			directory := filepath.Join(input, locked.SHA256)
-			if err := os.MkdirAll(directory, 0o755); err != nil {
-				return BuildResult{}, err
-			}
-			target := filepath.Join(directory, locked.Filename)
-			if _, err := os.Lstat(target); errors.Is(err, os.ErrNotExist) {
-				if err := linkOrCopy(source, target); err != nil {
-					return BuildResult{}, err
-				}
 			}
 		}
 	}
@@ -1410,50 +1391,13 @@ func buildLockedRepository(ctx context.Context, root, name string, repository st
 		result.Signing = signing
 		return result, materializeErr
 	}
-	if len(active) == 0 {
-		return renderFromBlobs(nil, nil)
-	}
-	// Three formats are built by the engine rather than through the format
-	// interface, so the listing inputs are handed to them explicitly.
-	listingView := formatRepositoryWithKeys(repository, name, keys)
-	// These paths rebuild by scanning materialized files, which cannot say when
-	// anything was published; the lock can, so it is carried alongside.
-	published := make(map[string]time.Time, len(lockedBlobs))
-	for _, locked := range lockedBlobs {
-		if !locked.Added.IsZero() {
-			published[locked.SHA256] = locked.Added
-		}
-	}
-	switch repository.Format {
-	case "pypi":
-		return BuildPyPI(ctx, BuildPyPIRequest{Input: input, Output: output, GeneratedAt: generatedAt, Listing: listingView, Published: published})
-	case "deb":
-		var resolved []state.PlanSigning
-		result, err := buildDeb(ctx, BuildDebRequest{Input: input, Output: output, Suite: repository.Suite, Component: repository.Component, Architectures: repository.Architectures, GeneratedAt: generatedAt, Listing: listingView, Published: published}, func(artifact domain.RepositoryArtifact) (domain.RepositoryArtifact, error) {
-			signed, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers, lockedSources)
-			resolved = signing
-			return signed, err
-		})
-		result.Signing = resolved
-		return result, err
-	case "helm":
-		var resolvedHelm []state.PlanSigning
-		helmResult, err := buildHelm(ctx, BuildHelmRequest{Input: input, Output: output, GeneratedAt: generatedAt, Listing: listingView, Published: published},
-			func(artifact domain.RepositoryArtifact) (domain.RepositoryArtifact, error) {
-				if len(repository.SigningKeys) == 0 {
-					return artifact, nil
-				}
-				signed, signing, err := applyRepositorySigning(ctx, root, repository, keys, artifact, signatureTime, plannedSigning, signers, lockedSources)
-				resolvedHelm = signing
-				return signed, err
-			})
-		helmResult.Signing = resolvedHelm
-		return helmResult, err
-	case "raw", "rpm", "apk":
-		return renderFromBlobs(lockedBlobs, lockedSources)
-	default:
-		return BuildResult{}, fmt.Errorf("unsupported repository format %q", repository.Format)
-	}
+	// Every format builds the same way: from the blobs its lock pins, through
+	// the format's own Build. Three of them used to be rebuilt by materializing
+	// every artifact into a temporary directory and scanning it back — copying
+	// the whole repository before every plan and every apply to recover facts
+	// the lock already had, and losing the publication dates on the way, since
+	// a file on disk cannot say when it was published.
+	return renderFromBlobs(lockedBlobs, lockedSources)
 }
 
 // requireSigningSupport rejects signing state a format cannot express, keeping
@@ -1628,31 +1572,6 @@ func verifyStaged(ctx context.Context, format, repository string, request ApplyW
 	default:
 		return buildgraph.RepositoryManifest{}, fmt.Errorf("unsupported repository format %q", format)
 	}
-}
-
-func linkOrCopy(source, target string) error {
-	if err := os.Link(source, target); err == nil {
-		return nil
-	}
-	input, err := os.Open(source)
-	if err != nil {
-		return err
-	}
-	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o444)
-	if err != nil {
-		_ = input.Close()
-		return err
-	}
-	_, copyErr := io.Copy(output, input)
-	closeOutputErr := output.Close()
-	closeInputErr := input.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	if closeOutputErr != nil {
-		return closeOutputErr
-	}
-	return closeInputErr
 }
 
 // StageDirectoryEnvironment overrides where build and stage trees are created.
