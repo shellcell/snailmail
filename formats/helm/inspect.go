@@ -59,77 +59,9 @@ func InspectWithExpandedLimit(filename string, reader io.ReaderAt, size, maximum
 	if maximumExpanded < maxChartYAML || maximumExpanded > maxExpandedSize {
 		return domain.PackageFacts{}, errors.New("Helm expanded-size limit is outside the supported range")
 	}
-	compressed, err := gzip.NewReader(io.NewSectionReader(reader, 0, size))
+	chartYAML, root, expandedSize, err := readChartYAML(filename, reader, size, maximumExpanded)
 	if err != nil {
-		return domain.PackageFacts{}, fmt.Errorf("inspect %q: open gzip: %w", filename, err)
-	}
-	defer compressed.Close()
-	limited := &io.LimitedReader{R: compressed, N: maximumExpanded + 1}
-	archive := tar.NewReader(limited)
-	root := ""
-	var chartYAML []byte
-	var expandedSize int64
-	entries := 0
-	for {
-		header, err := archive.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return domain.PackageFacts{}, fmt.Errorf("inspect %q: read archive: %w", filename, err)
-		}
-		entries++
-		if entries > maxArchiveEntries {
-			return domain.PackageFacts{}, fmt.Errorf("inspect %q: archive has too many entries", filename)
-		}
-		if len(header.Name) > maxArchivePath {
-			return domain.PackageFacts{}, fmt.Errorf("inspect %q: archive path is too long", filename)
-		}
-		// "." is the archive root, not a path within it. `helm package` writes no
-		// such entry, but tar does, and a chart rolled by hand is still a chart.
-		clean := path.Clean(strings.TrimPrefix(header.Name, "./"))
-		if path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
-			return domain.PackageFacts{}, fmt.Errorf("inspect %q: unsafe archive path %q", filename, header.Name)
-		}
-		if clean == "." {
-			// The root entry names no chart directory, so it neither sets nor
-			// contradicts the single root a chart must have.
-			continue
-		}
-		entryRoot := strings.SplitN(clean, "/", 2)[0]
-		if root == "" {
-			root = entryRoot
-		} else if root != entryRoot {
-			return domain.PackageFacts{}, fmt.Errorf("inspect %q: chart has multiple archive roots", filename)
-		}
-		switch header.Typeflag {
-		case tar.TypeDir:
-		case tar.TypeReg, tar.TypeRegA:
-			if header.Size < 0 || header.Size > maximumExpanded-expandedSize {
-				return domain.PackageFacts{}, fmt.Errorf("inspect %q: expanded chart exceeds limit", filename)
-			}
-			expandedSize += header.Size
-			if clean == root+"/Chart.yaml" {
-				if chartYAML != nil {
-					return domain.PackageFacts{}, fmt.Errorf("inspect %q: duplicate Chart.yaml", filename)
-				}
-				if header.Size > maxChartYAML {
-					return domain.PackageFacts{}, fmt.Errorf("inspect %q: Chart.yaml exceeds 1 MiB", filename)
-				}
-				chartYAML, err = io.ReadAll(io.LimitReader(archive, maxChartYAML+1))
-				if err != nil {
-					return domain.PackageFacts{}, fmt.Errorf("inspect %q: read Chart.yaml: %w", filename, err)
-				}
-			}
-		default:
-			return domain.PackageFacts{}, fmt.Errorf("inspect %q: unsupported archive entry %q", filename, header.Name)
-		}
-	}
-	if limited.N <= 0 {
-		return domain.PackageFacts{}, fmt.Errorf("inspect %q: expanded chart exceeds limit", filename)
-	}
-	if chartYAML == nil {
-		return domain.PackageFacts{}, fmt.Errorf("inspect %q: Chart.yaml not found", filename)
+		return domain.PackageFacts{}, err
 	}
 	if err := validateMetadataScalars(chartYAML); err != nil {
 		return domain.PackageFacts{}, fmt.Errorf("inspect %q: %w", filename, err)
@@ -212,4 +144,94 @@ func validateMetadataScalars(content []byte) error {
 		}
 	}
 	return nil
+}
+
+// readChartYAML walks the archive and returns the chart's Chart.yaml.
+//
+// It is separate from Inspect because provenance signs a document built from
+// the same Chart.yaml the facts came from. Two walks would be two readings of
+// one archive, and a signature made over the second while the lock recorded the
+// first is exactly the disagreement signing is supposed to rule out.
+func readChartYAML(filename string, reader io.ReaderAt, size, maximumExpanded int64) (chart []byte, chartRoot string, expanded int64, err error) {
+	compressed, err := gzip.NewReader(io.NewSectionReader(reader, 0, size))
+	if err != nil {
+		return nil, "", 0, fmt.Errorf("inspect %q: open gzip: %w", filename, err)
+	}
+	defer compressed.Close()
+	limited := &io.LimitedReader{R: compressed, N: maximumExpanded + 1}
+	archive := tar.NewReader(limited)
+	root := ""
+	var chartYAML []byte
+	var expandedSize int64
+	entries := 0
+	for {
+		header, err := archive.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, "", 0, fmt.Errorf("inspect %q: read archive: %w", filename, err)
+		}
+		entries++
+		if entries > maxArchiveEntries {
+			return nil, "", 0, fmt.Errorf("inspect %q: archive has too many entries", filename)
+		}
+		if len(header.Name) > maxArchivePath {
+			return nil, "", 0, fmt.Errorf("inspect %q: archive path is too long", filename)
+		}
+		// "." is the archive root, not a path within it. `helm package` writes no
+		// such entry, but tar does, and a chart rolled by hand is still a chart.
+		clean := path.Clean(strings.TrimPrefix(header.Name, "./"))
+		if path.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, "../") {
+			return nil, "", 0, fmt.Errorf("inspect %q: unsafe archive path %q", filename, header.Name)
+		}
+		if clean == "." {
+			// The root entry names no chart directory, so it neither sets nor
+			// contradicts the single root a chart must have.
+			continue
+		}
+		entryRoot := strings.SplitN(clean, "/", 2)[0]
+		if root == "" {
+			root = entryRoot
+		} else if root != entryRoot {
+			return nil, "", 0, fmt.Errorf("inspect %q: chart has multiple archive roots", filename)
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+		case tar.TypeReg, tar.TypeRegA:
+			if header.Size < 0 || header.Size > maximumExpanded-expandedSize {
+				return nil, "", 0, fmt.Errorf("inspect %q: expanded chart exceeds limit", filename)
+			}
+			expandedSize += header.Size
+			if clean == root+"/Chart.yaml" {
+				if chartYAML != nil {
+					return nil, "", 0, fmt.Errorf("inspect %q: duplicate Chart.yaml", filename)
+				}
+				if header.Size > maxChartYAML {
+					return nil, "", 0, fmt.Errorf("inspect %q: Chart.yaml exceeds 1 MiB", filename)
+				}
+				chartYAML, err = io.ReadAll(io.LimitReader(archive, maxChartYAML+1))
+				if err != nil {
+					return nil, "", 0, fmt.Errorf("inspect %q: read Chart.yaml: %w", filename, err)
+				}
+			}
+		default:
+			return nil, "", 0, fmt.Errorf("inspect %q: unsupported archive entry %q", filename, header.Name)
+		}
+	}
+	if limited.N <= 0 {
+		return nil, "", 0, fmt.Errorf("inspect %q: expanded chart exceeds limit", filename)
+	}
+	// The tar walk stops at the end-of-archive marker, which comes before gzip's
+	// CRC and length trailer — so without reading the rest, those are never
+	// checked and an archive missing its last eight bytes parses as a valid
+	// chart. Draining the stream is what makes the compressed bytes have to
+	// agree with what was decompressed from them.
+	if _, err := io.Copy(io.Discard, limited); err != nil {
+		return nil, "", 0, fmt.Errorf("inspect %q: read archive: %w", filename, err)
+	}
+	if chartYAML == nil {
+		return nil, "", 0, fmt.Errorf("inspect %q: Chart.yaml not found", filename)
+	}
+	return chartYAML, root, expandedSize, nil
 }
