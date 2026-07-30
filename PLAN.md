@@ -981,25 +981,35 @@ Docker daemon, its jobs share no filesystem, and Pages serves a job artifact
 rather than a moved ref — so what is shared is the derivation and only the
 rendering differs.
 
-Remaining order: Forgejo/Gitea, then Bitbucket if ever.
+Forgejo and Gitea are in, sharing one adapter because Forgejo is a fork of Gitea
+and the API is the same — the provider name is what differs, in the manifest and
+in an error. Verified against codeberg.org rather than assumed.
 
-Forgejo answers all three questions — checked against codeberg.org rather than
-assumed — but not the way the other two do, and one of the differences is
-architectural. There is no `tea api` passthrough, so the adapter cannot delegate
-authentication to a vendor CLI the way gh and glab do; it has to speak HTTP and
-hold a token, which needs a decided source. That is also required for
-correctness, because the per-commit endpoint returns 404 when a commit has no
-pull request and a CLI wrapper cannot tell that from a network failure — the two
-must not both render as "review state unknown".
+That adapter is the first that does not delegate to a vendor CLI. There is no
+`tea api` passthrough, so it speaks HTTP and presents a token from a broker
+(`SNAILMAIL_FORGE_TOKEN_BROKER`), sharing `internal/brokerexec` with the private
+host's read credentials so the hardening cannot differ between them. Speaking
+HTTP is also required for correctness, not only convenience: the per-commit
+endpoint answers 404 when a commit has no pull request, and a CLI wrapper renders
+every failure alike — one means the revision was not reviewed, the other that
+review state is unknown, and the gate owes an operator the difference. Hence
+`forgeio.ErrNotFound` alongside `forge.ErrUnavailable`. Reading without a token
+is legitimate for a public state repository, so no broker is an ordinary
+configuration.
 
-Two traps recorded so they are not rediscovered: `merged` is a boolean and a
+Two traps, both established live and pinned by tests: `merged` is a boolean and a
 merged pull request has state `"closed"`, so GitLab's `state == "merged"` rule
 would read every merged Forgejo review as unmerged; and there is no merge-base
 endpoint, so containment comes from the *reverse* comparison being empty, which
-is the same proposition as `merge_base(revision, branch) == revision`.
+is the same proposition as `merge_base(revision, branch) == revision` — reported
+as the revision when empty, and left empty otherwise so it cannot satisfy the
+gate's check by accident.
 
-Bitbucket has no merge-base endpoint either and no reverse-comparison
-equivalent, which is the one question the gate cannot do without.
+Remaining: the CLI-absent fallback, so GitHub and GitLab use the same HTTP path
+when gh or glab is not installed — today a runner without one cannot run a gate at
+all, and fails as though the forge were unreachable. Bitbucket has no merge-base
+endpoint and no reverse-comparison equivalent, which is the one question the gate
+cannot do without, so it may stay unsupported.
 
 ### 11.5 Automation: the container image is the integration point
 

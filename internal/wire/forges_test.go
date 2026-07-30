@@ -67,22 +67,49 @@ func TestASelfHostedGitLabReachesTheAdapter(t *testing.T) {
 	}
 }
 
-// Forgejo and Gitea are recognised and not yet implemented, which is a different
-// failure from unreadable and has to be reported as one.
-func TestARecognisedForgeWithNoAdapterSaysSo(t *testing.T) {
+// Forgejo and Gitea resolve to the HTTP adapter. Neither has a hostname of its
+// own, so the instance always has to be named — and a workspace that omits it
+// gets told that rather than a network error later.
+func TestForgejoAndGiteaResolveToTheirAdapter(t *testing.T) {
 	for _, provider := range []string{forge.ProviderForgejo, forge.ProviderGitea} {
-		_, err := NewForgeResolver().Resolve(context.Background(),
+		selected, err := NewForgeResolver().Resolve(context.Background(),
 			forge.Repository{Name: "acme/state", Provider: provider, Host: "git.acme.example"})
-		if err == nil {
-			t.Fatalf("%s resolved to an adapter that does not exist", provider)
+		if err != nil {
+			t.Fatalf("%s was refused: %v", provider, err)
 		}
-		if !strings.Contains(err.Error(), "recognised") || !strings.Contains(err.Error(), provider) {
-			t.Errorf("error = %v, want %s reported as recognised but unimplemented", err, provider)
+		if selected.Name() != provider {
+			t.Errorf("resolved %q, want %q", selected.Name(), provider)
 		}
-		// And it has to say what to do instead, since the workspace is otherwise
-		// stuck with a gate it cannot satisfy.
-		if !strings.Contains(err.Error(), "approval") {
-			t.Errorf("error = %v, want the usable gates suggested", err)
+		_, err = NewForgeResolver().Resolve(context.Background(),
+			forge.Repository{Name: "acme/state", Provider: provider})
+		if err == nil || !strings.Contains(err.Error(), "forge_host") {
+			t.Errorf("%s without a host gave %v, want a request for forge_host", provider, err)
+		}
+	}
+}
+
+// A recognised provider with no adapter at all must still be reported as such,
+// separately from one that cannot be reached. Bitbucket is the case this guards:
+// it is not in the provider list, so it reads as unknown, and nothing silently
+// falls through to an adapter that would answer about something else.
+func TestNoRecognisedProviderFallsThroughToTheWrongAdapter(t *testing.T) {
+	resolver := NewForgeResolver()
+	for _, provider := range forge.Providers() {
+		selected, err := resolver.Resolve(context.Background(),
+			forge.Repository{Name: "acme/state", Provider: provider, Host: "git.acme.example"})
+		if err != nil {
+			t.Errorf("%s is a declared provider but did not resolve: %v", provider, err)
+			continue
+		}
+		// "none" is the provider name for a remote with no review API, and the
+		// adapter that serves it is called "plain". Every other provider names its
+		// own adapter.
+		want := provider
+		if provider == forge.ProviderNone {
+			want = "plain"
+		}
+		if selected.Name() != want {
+			t.Errorf("provider %q resolved to the %q adapter, want %q", provider, selected.Name(), want)
 		}
 	}
 }

@@ -121,8 +121,16 @@ func (client HTTPClient) resolve(endpoint string) (string, error) {
 	}
 	// Joined textually rather than through URL resolution, which would let an
 	// endpoint beginning with / or // escape the base path or the host entirely.
-	if strings.HasPrefix(endpoint, "/") || strings.Contains(endpoint, "..") {
+	if strings.HasPrefix(endpoint, "/") {
 		return "", fmt.Errorf("%w: endpoint %q must be relative to the API base", forge.ErrUnavailable, endpoint)
+	}
+	// A traversal is a ".." path segment, not the characters appearing anywhere:
+	// a Forgejo comparison is addressed as "compare/main...<revision>", and
+	// refusing every ".." would refuse the endpoint that answers ancestry.
+	for _, segment := range strings.Split(endpoint, "/") {
+		if segment == "." || segment == ".." {
+			return "", fmt.Errorf("%w: endpoint %q must be relative to the API base", forge.ErrUnavailable, endpoint)
+		}
 	}
 	return strings.TrimSuffix(client.BaseURL, "/") + "/" + endpoint, nil
 }

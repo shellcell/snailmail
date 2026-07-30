@@ -3,10 +3,13 @@ package wire
 import (
 	"context"
 	"fmt"
+	"sync"
 
+	forgejoforge "github.com/shellcell/snailmail/adapters/forge/forgejo"
 	githubforge "github.com/shellcell/snailmail/adapters/forge/github"
 	gitlabforge "github.com/shellcell/snailmail/adapters/forge/gitlab"
 	plainforge "github.com/shellcell/snailmail/adapters/forge/plain"
+	tokenbroker "github.com/shellcell/snailmail/adapters/forge/token"
 	"github.com/shellcell/snailmail/forge"
 )
 
@@ -23,6 +26,11 @@ type ForgeResolver struct {
 	github *githubforge.Adapter
 	gitlab *gitlabforge.Adapter
 	plain  *plainforge.Adapter
+	// The token broker snapshots a helper program, so it is opened once and
+	// shared rather than per resolution.
+	once      sync.Once
+	tokens    *tokenbroker.Broker
+	tokensErr error
 }
 
 func NewForgeResolver() *ForgeResolver {
@@ -58,6 +66,18 @@ func (resolver *ForgeResolver) Resolve(_ context.Context, repository forge.Repos
 			return adapter, nil
 		}
 		return resolver.gitlab, nil
+	case forge.ProviderForgejo, forge.ProviderGitea:
+		// No vendor CLI to delegate to, so this speaks HTTP and needs a token —
+		// except against a public repository, where reading without one is
+		// legitimate and the broker stays absent.
+		if repository.Host == "" {
+			return nil, fmt.Errorf("forge %q is self-hosted and needs forge_host", provider)
+		}
+		broker, err := resolver.forgeToken()
+		if err != nil {
+			return nil, err
+		}
+		return forgejoforge.NewForHost(provider, repository.Host, broker)
 	case forge.ProviderNone:
 		return resolver.plain, nil
 	}
@@ -71,4 +91,23 @@ func (resolver *ForgeResolver) Resolve(_ context.Context, repository forge.Repos
 			"use gate = \"approval\" or gate = \"auto\" until an adapter exists", provider)
 	}
 	return nil, fmt.Errorf("forge %q is unknown", provider)
+}
+
+// forgeToken opens the token broker, or reports that none is configured as an
+// absence rather than a failure.
+//
+// A public state repository is read without authenticating, so no broker is an
+// ordinary configuration and not an error. One that is configured and refuses is
+// a different matter, and says so.
+func (resolver *ForgeResolver) forgeToken() (forge.TokenBroker, error) {
+	if !tokenbroker.Configured() {
+		return nil, nil
+	}
+	resolver.once.Do(func() {
+		resolver.tokens, resolver.tokensErr = tokenbroker.NewFromEnvironment()
+	})
+	if resolver.tokensErr != nil {
+		return nil, resolver.tokensErr
+	}
+	return resolver.tokens, nil
 }

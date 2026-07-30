@@ -187,6 +187,15 @@ func TestAnEndpointCannotEscapeTheAPIBase(t *testing.T) {
 	if reached != "/api/v1/repos/a/b" {
 		t.Errorf("a plain endpoint reached %q", reached)
 	}
+	// A traversal is a ".." segment, not those characters anywhere. Forgejo
+	// addresses a comparison as compare/main...<revision>, so refusing every
+	// occurrence would refuse the endpoint that answers ancestry.
+	if err := client.Get(context.Background(), "repos/a/b/compare/main...abc123", &target); err != nil {
+		t.Fatalf("a comparison endpoint was refused: %v", err)
+	}
+	if reached != "/api/v1/repos/a/b/compare/main...abc123" {
+		t.Errorf("a comparison endpoint reached %q", reached)
+	}
 }
 
 // A response the client cannot fully account for is unknown, the same as for the
