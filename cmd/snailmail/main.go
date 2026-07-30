@@ -64,6 +64,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runSite(ctx, args[1:], stdout, stderr)
 	case "rollout":
 		return runRollout(ctx, args[1:], stdout, stderr)
+	case "ci":
+		return runCI(ctx, args[1:], stdout, stderr)
 	case "doctor":
 		return runDoctor(ctx, args[1:], stdout, stderr)
 	case "adopt":
@@ -542,6 +544,32 @@ func runSite(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fmt.Fprintf(stdout, "📦  wrote %s: %d packages across %d repositories\n",
 		result.Path, result.Packages, result.Repositories)
 	return nil
+}
+
+func runCI(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		return errors.New("usage: snailmail ci github [--workspace DIR] [--snailmail-version vX.Y.Z]")
+	}
+	provider := args[0]
+	flags := newCommandFlags("ci "+provider, stderr).withWorkspace()
+	version := flags.String("snailmail-version", "", "snailmail release the workflow installs")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: snailmail ci github [--workspace DIR] [--snailmail-version vX.Y.Z]")
+	}
+	if provider != "github" {
+		return fmt.Errorf("no continuous-publication template for %q", provider)
+	}
+	// To stdout, so the operator redirects it, reviews it, and owns it. A file
+	// this wrote would be a file it would later overwrite.
+	workflow, err := engine.CIWorkflow(engine.CIWorkflowRequest{Root: flags.Root(), Version: *version})
+	if err != nil {
+		return err
+	}
+	_, err = stdout.Write(workflow)
+	return err
 }
 
 func runRollout(ctx context.Context, args []string, stdout, stderr io.Writer) error {
@@ -1314,7 +1342,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR")
-	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]")
+	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail ci github [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
 	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
