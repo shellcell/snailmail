@@ -205,7 +205,23 @@ artifacts record `index-chain` where PyPI and Helm record `index-stated`. The
 `Release` signature itself is not verified yet, so the root of trust is still the
 transport, and the lock says exactly that.
 
-yum and Alpine are not read yet.
+And yum, which needs no extra flags because a repository root is one repository:
+
+```sh
+snailmail import --public-origin --dry-run rocky https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os
+```
+
+yum walks the same chain as Debian: `repomd.xml` states the digest of
+`primary.xml.gz`, and a primary whose bytes disagree is refused. So rpm artifacts
+also record `index-chain`. If `repomd.xml` states only a sha1 or md5 for its
+primary, the import stops rather than quietly recording a weaker provenance than
+was asked for — signing `repomd.xml` is what would raise this to `signed-index`.
+
+Multilib is preserved: `i686` and `x86_64` builds of one name-version are two
+artifacts, recorded as two blobs under the same package version rather than one
+overwriting the other.
+
+Alpine is not read yet.
 
 ## Adopting an artifact from a URL
 

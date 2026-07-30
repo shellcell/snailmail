@@ -458,8 +458,8 @@ provenance is a field beside the origin, with the levels ordered:
 | `computed` | snailmail hashed what it downloaded | apk, and a last resort |
 | `operator` | a person supplied it to `adopt` | all |
 
-PyPI, Helm and Debian are read today; Debian walks the chain and so records
-`index-chain`, where the other two record `index-stated`. `import` defaults to the
+PyPI, Helm, Debian and yum are read today. Debian and yum walk a chain and so
+record `index-chain`, where PyPI and Helm record `index-stated`. `import` defaults to the
 strongest level a format supports without extra
 configuration — `index-chain` for deb and rpm, `index-stated` for pypi and helm —
 and takes a key to reach `signed-index`. A minimum acceptable level is a flag, so a

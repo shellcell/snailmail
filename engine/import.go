@@ -11,6 +11,7 @@ import (
 	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
+	"github.com/shellcell/snailmail/formats/rpm"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/source"
 )
@@ -99,6 +100,7 @@ var importEnumerators = map[string]importEnumerator{
 	"pypi": importPyPIFiles,
 	"helm": importHelmFiles,
 	"deb":  importDebFiles,
+	"rpm":  importRPMFiles,
 }
 
 // ImportSkipped is one artifact the index named that was not imported, with the
@@ -456,6 +458,87 @@ func importDebFiles(ctx context.Context, request ImportRepositoryRequest) ([]imp
 	}
 	sort.Slice(importable, func(left, right int) bool { return importable[left].Filename < importable[right].Filename })
 	return importable, packagesURL.String(), nil
+}
+
+// importRPMFiles reads a yum repository: repomd.xml names primary.xml.gz, and
+// primary.xml names every package with its digest and location.
+//
+// The same chain as Debian, so the same provenance. repomd states the digest of
+// primary, and checking it is what makes index-chain an accurate claim rather than
+// a label. Unlike Debian there is no suite to choose: a yum repository root is one
+// repository, which is why this takes no extra flags.
+func importRPMFiles(ctx context.Context, request ImportRepositoryRequest) ([]importableFile, string, error) {
+	base, err := parseDoctorURL(request.URL)
+	if err != nil {
+		return nil, "", err
+	}
+	if !strings.HasSuffix(base.Path, "/") {
+		base.Path += "/"
+	}
+	repomdURL, err := resolveDoctorReference(base.String(), rpm.RepomdPath)
+	if err != nil {
+		return nil, "", err
+	}
+	repomdResponse, err := request.Fetcher.Fetch(ctx, repomdURL.String(), rpm.MaximumRepomdBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", repomdURL, err)
+	}
+	metadata, err := rpm.ParseRepomd(repomdResponse.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", repomdURL, err)
+	}
+	primary, found := rpm.FindMetadata(metadata, "primary")
+	if !found {
+		return nil, "", fmt.Errorf("%s declares no primary index, so nothing names the packages", repomdURL)
+	}
+	if primary.SHA256 == "" {
+		// repomd may state sha1 or md5 for its indexes. Following one would mean
+		// claiming a chain snailmail did not actually check.
+		return nil, "", fmt.Errorf("%s states no SHA-256 for the primary index, so the chain to it cannot be checked", repomdURL)
+	}
+	primaryURL, err := resolveDoctorReference(base.String(), primary.Location)
+	if err != nil {
+		return nil, "", err
+	}
+	primaryResponse, err := request.Fetcher.Fetch(ctx, primaryURL.String(), maximumPackagesBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", primaryURL, err)
+	}
+	// The chain. What repomd says about primary has to hold before anything primary
+	// says about a package is worth recording.
+	if primary.Size != 0 && int64(len(primaryResponse.Body)) != primary.Size {
+		return nil, "", fmt.Errorf("%s is %d bytes, but %s states %d",
+			primaryURL, len(primaryResponse.Body), repomdURL, primary.Size)
+	}
+	if digest(primaryResponse.Body) != primary.SHA256 {
+		return nil, "", fmt.Errorf("%s does not match the SHA-256 that %s states for it", primaryURL, repomdURL)
+	}
+	content, err := rpm.DecompressPrimary(primary.Location, primaryResponse.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", primaryURL, err)
+	}
+	packages, err := rpm.ParsePrimary(content)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", primaryURL, err)
+	}
+	importable := make([]importableFile, 0, len(packages))
+	for _, entry := range packages {
+		// Locations in primary.xml are relative to the repository root rather than
+		// to repodata, which is why this resolves against base and not primaryURL.
+		artifactURL, err := resolveDoctorReference(base.String(), entry.Location)
+		if err != nil {
+			continue
+		}
+		importable = append(importable, importableFile{
+			Filename:   path.Base(entry.Location),
+			URLs:       []string{artifactURL.String()},
+			SHA256:     entry.SHA256,
+			Provenance: state.ProvenanceIndexChain,
+			Ambiguous:  entry.Ambiguous,
+		})
+	}
+	sort.Slice(importable, func(left, right int) bool { return importable[left].Filename < importable[right].Filename })
+	return importable, primaryURL.String(), nil
 }
 
 // findReleaseFile locates a Packages entry, trying each compression Release may
