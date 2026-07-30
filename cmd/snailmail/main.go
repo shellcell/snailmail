@@ -85,7 +85,11 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runApprovalKey(args[1:], stdout, stderr)
 	case "keys":
 		return runKeys(ctx, args[1:], stdout, stderr)
-	case "render":
+	// "dashboard" says what it produces. "render" said nothing, and sat one letter
+	// of meaning away from "site", which builds the browsable package listing that
+	// clients install from — a different thing entirely. Kept as an alias because
+	// someone's script may call it.
+	case "dashboard", "render":
 		return runRender(args[1:], stdout, stderr)
 	case "build":
 		return runBuild(ctx, args[1:], stdout, stderr)
@@ -119,6 +123,8 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 	}
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "✉️   initialized workspace %s\n", *name)
+	suggestNext(stdout, flags, "snailmail setup raw --name tools --output public/tools",
+		"configure a repository")
 	return nil
 }
 
@@ -186,6 +192,8 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  configured %s repository %s\n", format, *name)
 	fmt.Fprintf(stdout, "✉️   desired state will publish to %s\n", target)
+	suggestNext(stdout, flags, "snailmail add "+*name+" ./path/to/artifact",
+		"record an artifact")
 	return nil
 }
 
@@ -394,6 +402,11 @@ func runAdd(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	for _, packageVersion := range result.Packages {
 		fmt.Fprintf(stdout, "✉️   %s\n", packageVersion)
 	}
+	// Commit first, and say why: plan refuses an uncommitted workspace, which is the
+	// first refusal most people meet and reads as a bug until the reason is clear.
+	// Desired state is reviewed as a diff, so it has to be committed to be reviewed.
+	suggestNext(stdout, flags, "git commit -am \"add artifacts\" && snailmail plan",
+		"plan reads committed state, because desired state is reviewed as a diff")
 	return nil
 }
 
@@ -780,7 +793,7 @@ func runBlobStore(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("plan", stderr).withWorkspace().withJSON()
-	output := flags.String("out", "snailmail.snailmail-plan.json", "plan output file")
+	output := flags.String("out", defaultPlanFile, "plan output file")
 	generatedAtValue := flags.String("generated-at", "", "explicit RFC3339 repository generation time")
 	expires := flags.Duration("expires", 2*time.Hour, "plan lifetime")
 	structuralOnly := flags.Bool("structural-only", false, "review a plan without ecosystem client verification")
@@ -812,6 +825,16 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	fmt.Fprintf(stdout, "📦  planned %d repository %s\n", result.Changes, plural(result.Changes, "change", "changes"))
 	fmt.Fprintf(stdout, "✉️   %s\n", result.Output)
 	fmt.Fprintf(stdout, "    plan sha256:%s\n", result.PlanID)
+	if result.Changes != 0 {
+		// apply defaults to the same file plan defaults to, so the common case needs
+		// no flag. Naming the absolute path when it is the default would be a long
+		// line telling someone to type what they would get for free.
+		next := "snailmail apply"
+		if filepath.Base(result.Output) != defaultPlanFile {
+			next += " --plan " + result.Output
+		}
+		suggestNext(stdout, flags, next, "publish it")
+	}
 	for _, acquisition := range result.Acquisitions {
 		fmt.Fprintf(stdout, "✉️   adopted %s/%s@%s %s sha256:%s\n",
 			acquisition.Repository, acquisition.Package, acquisition.Version, acquisition.OriginURL, acquisition.SHA256)
@@ -821,7 +844,7 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 
 func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("apply", stderr).withWorkspace().withJSON()
-	plan := flags.String("plan", "snailmail.snailmail-plan.json", "reviewed plan file")
+	plan := flags.String("plan", defaultPlanFile, "reviewed plan file")
 	structuralOnly := flags.Bool("structural-only", false, "skip ecosystem client verification")
 	dryRun := flags.Bool("dry-run", false, "build, verify and check gates, then stop before writing to any host")
 	python := flags.String("python", "python3", "Python executable for PyPI verification")
@@ -906,7 +929,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 
 func runApprove(args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("approve", stderr).withWorkspace().withJSON()
-	plan := flags.String("plan", "snailmail.snailmail-plan.json", "reviewed plan file")
+	plan := flags.String("plan", defaultPlanFile, "reviewed plan file")
 	output := flags.String("out", "", "approval evidence output")
 	repository := flags.String("repository", "", "repository to approve")
 	keyFile := flags.String("key", "", "Ed25519 approval private key file")
@@ -966,8 +989,8 @@ func runApprovalKey(args []string, stdout, stderr io.Writer) error {
 }
 
 func runRender(args []string, stdout, stderr io.Writer) error {
-	flags := newCommandFlags("render", stderr).withWorkspace().withJSON()
-	output := flags.String("output", "site", "status site output directory")
+	flags := newCommandFlags("dashboard", stderr).withWorkspace().withJSON()
+	output := flags.String("output", "site", "output directory for the status page")
 	plan := flags.String("plan", "snailmail.snailmail-plan.json", "optional plan used for pending gates")
 	if err := flags.parse(args); err != nil {
 		return err
@@ -1389,7 +1412,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail keys rotate REPOSITORY --advance --yes")
 	fmt.Fprintln(output, "  snailmail keys audit")
 	fmt.Fprintln(output, "  snailmail approve --plan PLAN --repository NAME --key FILE --yes")
-	fmt.Fprintln(output, "  snailmail render [--output site]")
+	fmt.Fprintln(output, "  snailmail dashboard [--output site]")
 	fmt.Fprintln(output, "  snailmail apply [--plan snailmail.snailmail-plan.json] [--dry-run]")
 	fmt.Fprintln(output, "  snailmail build pypi --input DIR --output DIR")
 	fmt.Fprintln(output, "  snailmail build deb --input DIR --output DIR [--suite stable --architectures amd64]")
@@ -1543,6 +1566,11 @@ func largestLockSuffix(result engine.StatusWorkspaceResult) string {
 	return fmt.Sprintf(", largest %s at %s", largest.Name, humanBytes(largest.LockBytes))
 }
 
+// defaultPlanFile is where plan writes and apply reads when neither is told
+// otherwise. Named because a next-step hint has to agree with it, and three flags
+// repeated the literal.
+const defaultPlanFile = "snailmail.snailmail-plan.json"
+
 func runCollect(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("collect", stderr).withWorkspace().withJSON()
 	repository := flags.String("repo", "", "collect one repository")
@@ -1585,4 +1613,20 @@ func runCollect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 		fmt.Fprintln(stdout, "✉️   nothing was removed; pass --yes to collect")
 	}
 	return nil
+}
+
+// suggestNext prints the command that usually comes next.
+//
+// Five commands stand between an empty directory and a published repository, and
+// nothing in any of them said what the next one was — so the sequence lived only
+// in the README, which is exactly where someone who has already started is not
+// looking. Printing it puts the path where the person following it already is.
+//
+// Suppressed under --json, because a caller asking for one machine-readable
+// document does not want advice around it.
+func suggestNext(stdout io.Writer, flags *commandFlags, command, purpose string) {
+	if flags.jsonRequested() {
+		return
+	}
+	fmt.Fprintf(stdout, "→   next: %s   (%s)\n", command, purpose)
 }

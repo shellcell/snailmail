@@ -38,6 +38,10 @@ go run ./cmd/snailmail apply --plan snailmail.snailmail-plan.json
 `plan` writes what it intends to do; `apply` does it and records a publication
 ledger entry. Nothing reaches a host until a plan has been applied.
 
+Each command prints the one that usually comes next, so the sequence can be
+followed without this page. The `git commit` in the middle is not incidental:
+desired state is reviewed as a diff, and `plan` reads committed state only.
+
 `apply` reports each phase as it runs — a publication takes minutes, most of it
 building and running a real client per format — and writes that narration to
 stderr, so `--json` still emits exactly one document on stdout.
@@ -532,7 +536,7 @@ Render the read-only public matrix and machine-readable status from committed
 locks, ledgers, deployment receipts, and an optional current plan:
 
 ```sh
-go run ./cmd/snailmail render --output site
+go run ./cmd/snailmail dashboard --output site
 ```
 
 ## Build layout and binary size
