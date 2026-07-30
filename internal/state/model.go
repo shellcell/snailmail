@@ -50,10 +50,25 @@ type Repository struct {
 	SigningKeys     []string         `toml:"signing_keys,omitempty"`
 	SigningKeyring  string           `toml:"signing_keyring,omitempty"`
 	SigningRotation *SigningRotation `toml:"signing_rotation,omitempty"`
-	Track           string           `toml:"track"`
-	Suite           string           `toml:"suite,omitempty"`
-	Component       string           `toml:"component,omitempty"`
-	Architectures   []string         `toml:"architectures,omitempty"`
+	// Keep is how many recent publications collection retains beyond the live
+	// revision and whatever a rollback depends on, which a host protects in any
+	// case. Zero means unconfigured, and collect falls back to its own default.
+	//
+	// In the manifest rather than only a flag because collect is the one operation
+	// here that deletes published bytes, and a policy living in whichever CI job
+	// someone wrote is the one policy nobody reviews. Changing how much history a
+	// repository keeps should be a diff, exactly like changing its gate or its
+	// signing key.
+	//
+	// A count rather than an age, matching what the ledger-derived retention
+	// already computes. An age is arguably what people mean by "a month of
+	// rollback"; the ledger records publication times, so it can be added beside
+	// this later without changing what a count means.
+	Keep          int      `toml:"keep,omitempty"`
+	Track         string   `toml:"track"`
+	Suite         string   `toml:"suite,omitempty"`
+	Component     string   `toml:"component,omitempty"`
+	Architectures []string `toml:"architectures,omitempty"`
 }
 
 type SigningRotation struct {
@@ -383,6 +398,7 @@ type SetupOptions struct {
 	ApprovalKeys      []string
 	SigningKeys       []string
 	AllowUnsigned     bool
+	Keep              int
 	Track             string
 	Visibility        string
 	Target            string

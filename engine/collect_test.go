@@ -89,11 +89,16 @@ func TestTheRetentionIsOrderIndependent(t *testing.T) {
 	}
 }
 
+// keepOf is a retention override, which is a pointer because every integer value
+// means something: zero keeps nothing beyond what the host protects, and a negative
+// one is an error. Nil is the only way to say "use the repository's own policy".
+func keepOf(value int) *int { return &value }
+
 // A negative keep is a caller bug, and acting on it would mean deleting on the
 // strength of a number nobody checked.
 func TestCollectRefusesANegativeKeep(t *testing.T) {
 	root := multiRepositoryWorkspace(t, "pypi")
-	if _, err := CollectWorkspace(context.Background(), CollectWorkspaceRequest{Root: root, Keep: -1}); err == nil {
+	if _, err := CollectWorkspace(context.Background(), CollectWorkspaceRequest{Root: root, Keep: keepOf(-1)}); err == nil {
 		t.Error("a negative keep was accepted")
 	}
 }
@@ -102,7 +107,7 @@ func TestCollectRefusesANegativeKeep(t *testing.T) {
 // cannot tell "nothing to do" from "not looked at".
 func TestAHostThatKeepsNothingSaysSo(t *testing.T) {
 	root := multiRepositoryWorkspace(t, "pypi", "deb")
-	result, err := CollectWorkspace(context.Background(), CollectWorkspaceRequest{Root: root, Keep: 5})
+	result, err := CollectWorkspace(context.Background(), CollectWorkspaceRequest{Root: root, Keep: keepOf(5)})
 	if err != nil {
 		t.Fatal(err)
 	}

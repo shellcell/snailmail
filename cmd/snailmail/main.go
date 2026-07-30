@@ -162,6 +162,8 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	signingKey := flags.String("signing-key", "", "repository signing key name")
 	allowUnsigned := flags.Bool("allow-unsigned", false, "explicitly allow a new unsigned Debian repository")
 	track := flags.String("track", "stable", "rendered placement track")
+	keep := flags.Int("keep", 0,
+		"publications to retain when collecting; 0 uses the default and can be changed later in snailmail.toml")
 	sshTarget := flags.String("target", "", "ssh destination for an rsync host, such as deploy@packages.example")
 	bucket := flags.String("bucket", "", "S3 bucket")
 	prefix := flags.String("prefix", "", "S3 object prefix")
@@ -193,7 +195,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	if err := engine.SetupRepository(engine.SetupRepositoryRequest{
 		Root: flags.Root(), Name: *name, Format: format, Output: *output,
 		HostType: *hostType, Visibility: *visibility, Gate: *gatePolicy, ApprovalKeys: resolvedApprovalKeys, SigningKey: *signingKey, AllowUnsigned: *allowUnsigned, Bucket: *bucket, Prefix: *prefix,
-		Target: *sshTarget,
+		Target: *sshTarget, Keep: *keep,
 		Region: *region, Endpoint: *endpoint, CanonicalEndpoint: *canonicalEndpoint,
 		UsePathStyle: *usePathStyle,
 		ReadAuth:     *readAuth, CredentialBroker: *credentialBroker,
@@ -1677,7 +1679,8 @@ func shortDigest(digest string) string {
 func runCollect(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("collect", stderr).withWorkspace().withJSON()
 	repository := flags.String("repo", "", "collect one repository")
-	keep := flags.Int("keep", 10, "recent publications to retain beyond the live revision and its rollback")
+	keep := flags.Int("keep", 0,
+		"override the retention this repository declares, for one run")
 	// Reporting is the default and deleting needs saying, which is how every other
 	// command here that destroys something behaves.
 	yes := flags.Bool("yes", false, "actually remove; without it this reports what would be removed")
@@ -1686,8 +1689,14 @@ func runCollect(ctx context.Context, args []string, stdout, stderr io.Writer) er
 	}
 	hosts := wire.NewHostResolver()
 	defer hosts.Close()
+	// Only an override when the operator actually asked for one; otherwise the
+	// repository's declared retention applies.
+	var override *int
+	if flags.wasSet("keep") {
+		override = keep
+	}
 	result, err := engine.CollectWorkspace(ctx, engine.CollectWorkspaceRequest{
-		Root: flags.Root(), Repository: *repository, Keep: *keep, Apply: *yes, Hosts: hosts,
+		Root: flags.Root(), Repository: *repository, Keep: override, Apply: *yes, Hosts: hosts,
 	})
 	if err != nil {
 		return err

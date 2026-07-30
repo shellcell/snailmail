@@ -121,7 +121,7 @@ func Setup(root string, options SetupOptions) error {
 	lockPath := filepath.ToSlash(filepath.Join("repos", options.Name+".lock.toml"))
 	repository := Repository{
 		Format: options.Format, Lock: lockPath, Gate: gatePolicy, ApprovalKeys: append([]string(nil), options.ApprovalKeys...), SigningKeys: append([]string(nil), options.SigningKeys...), Visibility: visibility,
-		Track: options.Track,
+		Keep: options.Keep, Track: options.Track,
 		Host: HostConfig{
 			Type: hostType, Path: filepath.ToSlash(options.Output), Target: options.Target, Bucket: options.Bucket,
 			Prefix: options.Prefix, Region: options.Region, Endpoint: options.Endpoint,
@@ -471,6 +471,9 @@ func migrateLegacyManifest(legacy legacyManifest) Manifest {
 }
 
 func validateRepositoryHost(name string, repository Repository) error {
+	if repository.Keep < 0 {
+		return fmt.Errorf("repository %q keep %d is not a number of publications", name, repository.Keep)
+	}
 	if repository.Visibility != "public" && repository.Visibility != "private" {
 		return fmt.Errorf("repository %q has invalid visibility %q", name, repository.Visibility)
 	}

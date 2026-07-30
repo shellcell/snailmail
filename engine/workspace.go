@@ -56,6 +56,7 @@ type SetupRepositoryRequest struct {
 	SigningKey    string
 	AllowUnsigned bool
 	Visibility    string
+	Keep          int
 	// Target is the ssh destination for an rsync host.
 	Target            string
 	Bucket            string
@@ -288,8 +289,8 @@ func SetupRepository(request SetupRepositoryRequest) error {
 	return state.Setup(root, state.SetupOptions{
 		Name: request.Name, Format: request.Format, Output: request.Output,
 		HostType: request.HostType, Visibility: request.Visibility, Bucket: request.Bucket,
-		Target: request.Target,
-		Gate:   request.Gate, ApprovalKeys: append([]string(nil), request.ApprovalKeys...), SigningKeys: optionalSigningKeys(request.SigningKey), AllowUnsigned: request.AllowUnsigned,
+		Target: request.Target, Keep: request.Keep,
+		Gate: request.Gate, ApprovalKeys: append([]string(nil), request.ApprovalKeys...), SigningKeys: optionalSigningKeys(request.SigningKey), AllowUnsigned: request.AllowUnsigned,
 		Prefix: request.Prefix, Region: request.Region, Endpoint: request.Endpoint,
 		CanonicalEndpoint: request.CanonicalEndpoint, UsePathStyle: request.UsePathStyle,
 		ReadAuth: request.ReadAuth, CredentialBroker: request.CredentialBroker,

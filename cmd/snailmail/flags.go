@@ -203,3 +203,20 @@ func hoistFlags(set *flag.FlagSet, arguments []string) []string {
 	// would stop parsing early and undo the hoist.
 	return append(append(flags, "--"), positional...)
 }
+
+// wasSet reports whether a flag was given on the command line, as opposed to
+// holding its default.
+//
+// Needed where every value of a flag means something and "unspecified" is a
+// distinct third answer — collect's --keep, where zero is a real retention and a
+// negative one is an error the operator must still be told about, so neither can
+// double as a sentinel.
+func (flags *commandFlags) wasSet(name string) bool {
+	given := false
+	flags.set.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			given = true
+		}
+	})
+	return given
+}

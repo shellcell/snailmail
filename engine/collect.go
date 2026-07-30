@@ -18,10 +18,12 @@ type CollectWorkspaceRequest struct {
 	// Repository narrows the work to one. Empty collects every repository whose
 	// host can.
 	Repository string
-	// Keep is how many recent publications to retain beyond what a host protects
+	// Keep overrides the retention a repository declares, for one run. Nil uses
+	// the manifest, which is the reviewed policy; a value here is a deliberate
+	// one-off. It is how many recent publications to retain beyond what a host protects
 	// on its own. Zero keeps only the minimum: the live revision and whatever its
 	// restore rolls back to.
-	Keep int
+	Keep *int
 	// Apply performs the deletion. Without it this reports what would be removed
 	// and removes nothing, which is the default because the alternative is a
 	// command that deletes published state when someone was curious.
@@ -66,9 +68,31 @@ type CollectRepository struct {
 // Read-only against committed evidence, like status and rollout: the ledger is
 // validated the same way, so nothing is collected on the strength of records that
 // were never committed.
+// DefaultKeep is what a repository that declares no retention gets.
+const DefaultKeep = 10
+
+// retentionFor resolves how many publications a repository keeps.
+//
+// The manifest is the policy and the flag is the override, in that order, because
+// the flag is for a one-off and the manifest is what was reviewed. A collection run
+// by hand with a different number should be a deliberate act, not the default.
+// A pointer rather than a sentinel value, because every integer is a real answer:
+// zero means keep nothing beyond what the host protects, and a negative one is an
+// error a caller must still be told about. Nil is the only way to say "unspecified"
+// without stealing a value that means something else.
+func retentionFor(repository state.Repository, requested *int) int {
+	if requested != nil {
+		return *requested
+	}
+	if repository.Keep > 0 {
+		return repository.Keep
+	}
+	return DefaultKeep
+}
+
 func CollectWorkspace(ctx context.Context, request CollectWorkspaceRequest) (CollectWorkspaceResult, error) {
-	if request.Keep < 0 {
-		return CollectWorkspaceResult{}, fmt.Errorf("keep %d is not a number of publications", request.Keep)
+	if request.Keep != nil && *request.Keep < 0 {
+		return CollectWorkspaceResult{}, fmt.Errorf("keep %d is not a number of publications", *request.Keep)
 	}
 	root, err := workspaceRoot(request.Root)
 	if err != nil {
@@ -105,7 +129,7 @@ func CollectWorkspace(ctx context.Context, request CollectWorkspaceRequest) (Col
 		repository := manifest.Repositories[name]
 		reported, err := collectRepository(ctx, collectContext{
 			root: root, name: name, repository: repository, revision: revision,
-			hosts: hosts, keep: request.Keep, apply: request.Apply,
+			hosts: hosts, keep: retentionFor(repository, request.Keep), apply: request.Apply,
 			workspaceID: manifest.Workspace.ID,
 		})
 		if err != nil {

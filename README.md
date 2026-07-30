@@ -530,6 +530,19 @@ expected. If a surviving revision's release descriptor cannot be read, the whole
 collection is refused rather than run against an unknown reference set — deleting
 too little costs storage, deleting too much costs the repository.
 
+How much a repository keeps is part of its configuration, not a flag someone
+remembers:
+
+```sh
+snailmail setup deb --name apt --keep 20 ...
+```
+
+`collect` uses that, and `--keep N` overrides it for one run. The order matters:
+collection is the only operation here that deletes published bytes, so the policy
+belongs in the reviewed manifest where changing it is a diff, exactly like changing
+a gate or a signing key. A repository that declares nothing keeps the default of
+10, so nothing configured before this behaves differently.
+
 ## Inspecting someone else's repository
 
 `snailmail doctor URL` needs no workspace and inspects a public HTTPS PyPI,
