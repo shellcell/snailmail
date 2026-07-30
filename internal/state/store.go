@@ -994,6 +994,13 @@ func LoadLock(root string, repository Repository) (RepositoryLock, error) {
 	if err != nil {
 		return RepositoryLock{}, err
 	}
+	// Before parsing, not after: reading an oversized lock to discover it is
+	// oversized has already spent the memory the limit exists to protect.
+	if info, statErr := os.Stat(name); statErr == nil {
+		if err := requireLockWithinLimit(repository.Lock, info.Size()); err != nil {
+			return RepositoryLock{}, err
+		}
+	}
 	if err := decodeTOML(name, &lock); err != nil {
 		return RepositoryLock{}, err
 	}

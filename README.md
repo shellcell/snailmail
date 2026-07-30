@@ -185,6 +185,40 @@ one as a service; its jobs share no filesystem, so what apply builds is declared
 as an artifact; and Pages there serves a job artifact rather than a moved ref, so
 there is no orphan commit.
 
+## How large a workspace can get
+
+A repository lock is parsed whole on every plan, apply, status and check, so its
+size is what decides how long those take and how much memory they need. Measured
+at roughly 385 bytes per package-version, with parsing costing about one and a half
+times the file in heap:
+
+| package-versions | lock file | parse | heap |
+|---|---|---|---|
+| 2,000 | 0.8 MB | 5 ms | 1 MB |
+| 20,000 | 7.7 MB | 44 ms | 12 MB |
+| 100,000 | 38.5 MB | 226 ms | 59 MB |
+
+snailmail refuses a lock over **128 MiB** — about 330,000 package-versions — and
+says so, naming the repository, the size and what to do:
+
+```
+repository "repos/apt.lock.toml" has a 200 MiB lock, over the 128 MiB limit, and
+parsing it needs roughly 300 MiB of memory on every plan and apply: prune retained
+versions, split the repository, or set SNAILMAIL_MAX_LOCK_BYTES to proceed anyway
+```
+
+That is the honest state of things: one lock per repository is the current design,
+and a workspace past this size wants the lock sharded per package rather than a
+larger limit. The limit exists so that a workspace which has outgrown the design
+finds out in a sentence instead of getting slower until something is killed.
+`snailmail status` reports every lock's size, so the number can be watched before
+it becomes a refusal.
+
+Artifacts themselves are not held in memory — they stream from content-addressed
+storage — so the ceiling is index and lock size, not repository size. Generated
+indexes are held whole, which for Debian and yum is the binding constraint at
+around a million package-versions.
+
 ## Collecting superseded releases
 
 An object store keeps every revision it has ever published: a publication writes a
