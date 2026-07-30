@@ -222,6 +222,10 @@ func InitWorkspace(request InitWorkspaceRequest) error {
 type InitWorkspaceResult struct {
 	CreatedGitRepository bool `json:"created_git_repository,omitempty"`
 	Committed            bool `json:"committed,omitempty"`
+	// CommitPending reports a workspace that was created but not committed, because
+	// git has no identity to attribute the commit to. The workspace is written and
+	// correct; it needs one commit before the next command will read it.
+	CommitPending bool `json:"commit_pending,omitempty"`
 }
 
 // InitWorkspaceReporting sets up a workspace and reports what it created.
@@ -264,7 +268,18 @@ func InitWorkspaceReporting(request InitWorkspaceRequest) (InitWorkspaceResult, 
 	// stopped at writing the manifest would still leave the next one to fail. Only
 	// for a repository this call created: committing into somebody's existing
 	// repository is their decision, not this command's.
+	//
+	// And only when git can attribute the commit. Without a configured identity it
+	// fails, and failing here would leave the workspace written but unusable —
+	// strictly worse than never having tried, which is what CI found. snailmail
+	// does not invent an identity to get past that: authorship is a claim, and not
+	// one this command has any standing to make in somebody's history. It reports
+	// what is left instead, which is a commit the operator was going to make anyway.
 	if result.CreatedGitRepository && !state.HasCommit(root) {
+		if !state.HasGitIdentity(root) {
+			result.CommitPending = true
+			return result, nil
+		}
 		if err := state.CommitAll(root, "snailmail workspace"); err != nil {
 			return result, err
 		}

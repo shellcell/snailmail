@@ -68,6 +68,11 @@ test: ## Run the suite
 	go test -count=1 ./...
 
 .PHONY: test-race
+# The race detector is written in C, so it needs cgo — and the CGO_ENABLED=0 above
+# turns that into "go: -race requires cgo" rather than into a static binary. That
+# setting exists so shipped binaries do not link glibc; nothing this target builds
+# is shipped, so the override is scoped here and changes no artifact.
+test-race: export CGO_ENABLED := 1
 test-race: ## Run the suite under the race detector
 	go test -race -count=1 ./...
 

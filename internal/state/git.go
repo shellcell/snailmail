@@ -1331,6 +1331,17 @@ func CreateGitRepository(root string) error {
 	return nil
 }
 
+// HasGitIdentity reports whether git can attribute a commit here.
+//
+// The same question git commit asks itself: GIT_COMMITTER_IDENT fails exactly when
+// there is no configured name and email and none can be derived from the
+// environment. Asked in advance, so a workspace is never written and then left
+// half-made by a commit that could not be attributed.
+func HasGitIdentity(root string) bool {
+	_, err := gitOutputContext(context.Background(), root, "var", "GIT_COMMITTER_IDENT")
+	return err == nil
+}
+
 // CommitAll records everything in the working tree.
 //
 // Used for the first commit of a new workspace, which is what makes it usable: a

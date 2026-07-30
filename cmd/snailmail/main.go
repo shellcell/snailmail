@@ -140,6 +140,15 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 	if created.Committed {
 		fmt.Fprintln(stdout, "📦  committed the new workspace, so it is ready to use")
 	}
+	// The workspace is written and correct; git simply cannot say who made the
+	// commit. Naming both commands, because someone who has never configured git is
+	// exactly the person who will not know the second one either.
+	if created.CommitPending {
+		fmt.Fprintln(stderr, "⚠️   the workspace was created but not committed: Git has no configured identity")
+		fmt.Fprintln(stderr, "     git config --global user.name \"Your Name\"")
+		fmt.Fprintln(stderr, "     git config --global user.email \"you@example.com\"")
+		fmt.Fprintln(stderr, "     git -C . add -A && git -C . commit -m \"snailmail workspace\"")
+	}
 	fmt.Fprintf(stdout, "✉️   initialized workspace %s\n", *name)
 	suggestNext(stdout, flags, "snailmail setup raw --name tools --output public/tools",
 		"configure a repository")
