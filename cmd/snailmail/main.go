@@ -101,11 +101,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 func runInit(args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("init", stderr).withWorkspace().withJSON()
 	name := flags.String("name", "", "workspace name")
-	forgeRepository := flags.String("forge-repo", "", "GitHub state repository (owner/name) for PR gates")
+	forgeRepository := flags.String("forge-repo", "", "state repository reference for PR gates, such as owner/name")
+	forgeProvider := flags.String("forge", "", "forge hosting the state repository: github, gitlab, forgejo, gitea, none")
+	forgeHost := flags.String("forge-host", "", "self-hosted or Enterprise forge hostname")
 	if err := flags.parse(args); err != nil {
 		return err
 	}
-	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: flags.Root(), Name: *name, ForgeRepository: *forgeRepository}); err != nil {
+	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: flags.Root(), Name: *name,
+		Forge: *forgeProvider, ForgeRepository: *forgeRepository, ForgeHost: *forgeHost}); err != nil {
 		return err
 	}
 	if done, err := flags.emit(stdout, initResult{Workspace: *name}); done || err != nil {

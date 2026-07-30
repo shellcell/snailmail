@@ -315,6 +315,14 @@ a PR and remains reachable from that repository's default branch.
 
 ```sh
 go run ./cmd/snailmail init --name example --forge-repo example/state
+
+# On a forge other than GitHub, name it. The reference shape alone cannot say
+# which service to ask whether a revision was reviewed, and omitting this means
+# github.com.
+go run ./cmd/snailmail init --name example \
+  --forge gitlab --forge-repo acme/platform/state
+go run ./cmd/snailmail init --name example \
+  --forge gitea --forge-repo acme/state --forge-host git.acme.example
 ```
 
 Approval gates use Ed25519 evidence. Keep the generated private key outside the

@@ -27,6 +27,8 @@ type Requirement struct {
 	Root            string
 	Now             time.Time
 	ForgeRepository string
+	Forge           string
+	ForgeHost       string
 	ApprovalKeys    []string
 }
 
@@ -92,7 +94,7 @@ func (evaluator *DefaultEvaluator) requireApproval(requirement Requirement) erro
 }
 
 func (evaluator *DefaultEvaluator) requireMergedPR(ctx context.Context, requirement Requirement) error {
-	return verifyMergedPR(ctx, evaluator.forges, requirement.Root, requirement.ForgeRepository, requirement.GitRevision)
+	return verifyMergedPR(ctx, evaluator.forges, requirement, requirement.GitRevision)
 }
 
 type PrivateKeyFile struct {
@@ -171,14 +173,18 @@ func approvalKeyID(publicKey []byte) string {
 // merged pull request. Every failure to read review state is a refusal:
 // ARCHITECTURE §18 requires an unavailable provider to render unknown and never
 // silently authorize.
-func verifyMergedPR(ctx context.Context, forges forge.Resolver, root, forgeRepository, revision string) error {
+func verifyMergedPR(ctx context.Context, forges forge.Resolver, requirement Requirement, revision string) error {
+	forgeRepository := requirement.ForgeRepository
 	if forgeRepository == "" {
 		return errors.New("PR gate has no reviewed forge repository")
 	}
 	if forges == nil {
 		return errors.New("PR gate has no configured forge")
 	}
-	target := forge.Repository{Name: forgeRepository, WorkingDirectory: root}
+	target := forge.Repository{
+		Name: forgeRepository, Provider: requirement.Forge,
+		Host: requirement.ForgeHost, WorkingDirectory: requirement.Root,
+	}
 	provider, err := forges.Resolve(ctx, target)
 	if err != nil {
 		return fmt.Errorf("PR gate could not select a forge: %w", err)

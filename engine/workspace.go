@@ -38,6 +38,8 @@ type InitWorkspaceRequest struct {
 	Root            string
 	Name            string
 	ForgeRepository string
+	Forge           string
+	ForgeHost       string
 }
 
 type SetupRepositoryRequest struct {
@@ -203,7 +205,8 @@ func InitWorkspace(request InitWorkspaceRequest) error {
 		return err
 	}
 	defer unlock()
-	return state.Init(root, state.InitOptions{Name: request.Name, ForgeRepository: request.ForgeRepository})
+	return state.Init(root, state.InitOptions{Name: request.Name, Forge: request.Forge,
+		ForgeRepository: request.ForgeRepository, ForgeHost: request.ForgeHost})
 }
 
 func SetupRepository(request SetupRepositoryRequest) error {
@@ -644,7 +647,8 @@ func PlanWorkspace(ctx context.Context, request PlanWorkspaceRequest) (PlanWorks
 	}
 	payload := state.PlanPayload{
 		EngineVersion: phase1EngineVersion, GitRevision: gitRevision, ManifestSHA256: manifestDigest,
-		WorkspaceID: manifest.Workspace.ID, ForgeRepository: manifest.Workspace.ForgeRepository,
+		WorkspaceID: manifest.Workspace.ID, Forge: manifest.Workspace.Forge,
+		ForgeRepository: manifest.Workspace.ForgeRepository, ForgeHost: manifest.Workspace.ForgeHost,
 		BlobStore: manifest.BlobStore, BlobStoreIdentitySHA256: blobStoreIdentity, KnowledgeSHA256: knowledge.SigningDigest(),
 		GeneratedAt: generatedAt.UTC().Format(time.RFC3339), CreatedAt: createdAt.UTC().Format(time.RFC3339),
 		ExpiresAt: createdAt.Add(expiresIn).UTC().Format(time.RFC3339),
@@ -814,7 +818,8 @@ func openApply(ctx context.Context, request ApplyWorkspaceRequest) (*applyPrepar
 		return nil, nil, errors.New("plan does not cover every configured repository")
 	}
 	blobIdentity, err := blobStoreIdentity(manifest)
-	if err != nil || plan.Payload.WorkspaceID != manifest.Workspace.ID || plan.Payload.ForgeRepository != manifest.Workspace.ForgeRepository || plan.Payload.BlobStore != manifest.BlobStore || plan.Payload.BlobStoreIdentitySHA256 != blobIdentity {
+	if err != nil || plan.Payload.WorkspaceID != manifest.Workspace.ID || plan.Payload.ForgeRepository != manifest.Workspace.ForgeRepository ||
+		plan.Payload.Forge != manifest.Workspace.Forge || plan.Payload.ForgeHost != manifest.Workspace.ForgeHost || plan.Payload.BlobStore != manifest.BlobStore || plan.Payload.BlobStoreIdentitySHA256 != blobIdentity {
 		return nil, nil, errors.New("stale plan: blob store changed")
 	}
 	blobStore, err := resolveBlobStore(ctx, manifest, request.Blobs)
@@ -2222,7 +2227,8 @@ func (preparation *applyPreparation) authorize(item applyRepository) error {
 	if err := preparation.request.Gates.Authorize(preparation.ctx, gate.Requirement{
 		Policy: item.repository.Gate, PlanID: plan.PlanID, Repository: item.planned.Name,
 		GitRevision: plan.Payload.GitRevision, Root: preparation.root, Now: effectNow,
-		ForgeRepository: plan.Payload.ForgeRepository, ApprovalKeys: item.planned.ApprovalKeys,
+		ForgeRepository: plan.Payload.ForgeRepository, Forge: plan.Payload.Forge,
+		ForgeHost: plan.Payload.ForgeHost, ApprovalKeys: item.planned.ApprovalKeys,
 	}); err != nil {
 		return fmt.Errorf("repository %q gate: %w", item.planned.Name, err)
 	}

@@ -25,6 +25,12 @@ var ErrUnavailable = errors.New("forge is unavailable")
 type Repository struct {
 	// Name is the provider-native identity, such as "owner/name".
 	Name string
+	// Provider names the service, as recorded in the manifest. Empty means
+	// DefaultProvider — a workspace written before the field existed.
+	Provider string
+	// Host is the instance to ask, for a self-hosted or Enterprise deployment.
+	// Empty means the provider's own, which is what DefaultHost reports.
+	Host string
 	// WorkingDirectory is the local checkout a provider CLI may need for
 	// credential and host resolution.
 	WorkingDirectory string

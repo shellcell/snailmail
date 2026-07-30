@@ -27,6 +27,7 @@ import (
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/source"
 
+	"github.com/shellcell/snailmail/forge"
 	"github.com/shellcell/snailmail/internal/hexdigest"
 )
 
@@ -48,8 +49,10 @@ func Init(root string, options InitOptions) error {
 	if !identifierPattern.MatchString(options.Name) {
 		return fmt.Errorf("workspace name %q must use lowercase letters, digits, and hyphens", options.Name)
 	}
-	if options.ForgeRepository != "" && !validGitHubRepository(options.ForgeRepository) {
-		return errors.New("forge repository must use GitHub owner/name syntax")
+	if err := validateForgeIdentity(Workspace{
+		Forge: options.Forge, ForgeRepository: options.ForgeRepository, ForgeHost: options.ForgeHost,
+	}); err != nil {
+		return err
 	}
 	root, err := filepath.Abs(root)
 	if err != nil {
@@ -69,7 +72,8 @@ func Init(root string, options InitOptions) error {
 		return fmt.Errorf("create workspace identity: %w", err)
 	}
 	manifest := Manifest{
-		SchemaVersion: ManifestSchema, Workspace: Workspace{Name: options.Name, ID: workspaceID, ForgeRepository: options.ForgeRepository},
+		SchemaVersion: ManifestSchema, Workspace: Workspace{Name: options.Name, ID: workspaceID, Forge: options.Forge,
+			ForgeRepository: options.ForgeRepository, ForgeHost: options.ForgeHost},
 		BlobStore: BlobStoreConfig{Type: "local"}, Keys: map[string]SigningKey{}, Repositories: map[string]Repository{},
 	}
 	if err := WriteManifest(root, manifest); err != nil {
@@ -388,8 +392,8 @@ func LoadManifest(root string) (Manifest, error) {
 	if manifest.SchemaVersion != ManifestSchema || !identifierPattern.MatchString(manifest.Workspace.Name) || !hexdigest.ValidSHA256(manifest.Workspace.ID) {
 		return Manifest{}, errors.New("invalid workspace manifest schema or name")
 	}
-	if manifest.Workspace.ForgeRepository != "" && !validGitHubRepository(manifest.Workspace.ForgeRepository) {
-		return Manifest{}, errors.New("invalid workspace forge repository")
+	if err := validateForgeIdentity(manifest.Workspace); err != nil {
+		return Manifest{}, err
 	}
 	if err := ValidateBlobStore(manifest.BlobStore); err != nil {
 		return Manifest{}, err
@@ -601,6 +605,41 @@ func validateHTTPURL(value string) error {
 
 func isLoopbackHost(value string) bool {
 	return value == "localhost" || value == "127.0.0.1" || value == "::1"
+}
+
+// validateForgeIdentity checks the provider, its repository reference and its
+// host together, because they are only meaningful as a set: a reference is valid
+// for a provider rather than in general, and a provider that exists only
+// self-hosted needs a host to be reachable at all.
+func validateForgeIdentity(workspace Workspace) error {
+	provider := workspace.Forge
+	if provider == "" {
+		provider = forge.DefaultProvider
+	}
+	if !forge.KnownProvider(provider) {
+		return fmt.Errorf("workspace forge %q is not one of %s", workspace.Forge,
+			strings.Join(forge.Providers(), ", "))
+	}
+	if workspace.ForgeRepository != "" && !forge.ValidRepositoryReference(provider, workspace.ForgeRepository) {
+		return fmt.Errorf("forge repository %q is not how %s addresses a repository",
+			workspace.ForgeRepository, provider)
+	}
+	if workspace.ForgeHost != "" && !forge.ValidHost(workspace.ForgeHost) {
+		return fmt.Errorf("forge host %q is not a hostname", workspace.ForgeHost)
+	}
+	// A provider with no hostname of its own exists only as an instance someone
+	// runs, so there is nothing to fall back to. A plain remote is exempt: it is
+	// never reached over an API, so it has no host to be reached at.
+	if workspace.ForgeHost == "" && workspace.ForgeRepository != "" &&
+		provider != forge.ProviderNone && forge.DefaultHost(provider) == "" {
+		return fmt.Errorf("forge %q is self-hosted and needs forge_host", provider)
+	}
+	// A forge is named to be read. Naming one with no repository to read leaves a
+	// PR gate configurable and unsatisfiable.
+	if workspace.Forge != "" && workspace.Forge != forge.ProviderNone && workspace.ForgeRepository == "" {
+		return fmt.Errorf("workspace forge %q has no forge_repository to read", workspace.Forge)
+	}
+	return nil
 }
 
 func validGitHubRepository(value string) bool {
@@ -840,8 +879,8 @@ func WriteManifest(root string, manifest Manifest) error {
 	if !identifierPattern.MatchString(manifest.Workspace.Name) || !hexdigest.ValidSHA256(manifest.Workspace.ID) {
 		return errors.New("invalid workspace name or identity")
 	}
-	if manifest.Workspace.ForgeRepository != "" && !validGitHubRepository(manifest.Workspace.ForgeRepository) {
-		return errors.New("invalid workspace forge repository")
+	if err := validateForgeIdentity(manifest.Workspace); err != nil {
+		return err
 	}
 	if err := ValidateBlobStore(manifest.BlobStore); err != nil {
 		return err

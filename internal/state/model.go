@@ -19,9 +19,16 @@ type Manifest struct {
 }
 
 type Workspace struct {
-	Name            string `toml:"name"`
-	ID              string `toml:"id"`
+	Name string `toml:"name"`
+	ID   string `toml:"id"`
+	// Forge names the code-hosting service the state repository lives on. Empty
+	// means forge.DefaultProvider, which is what every workspace written before
+	// this field existed was implicitly using.
+	Forge           string `toml:"forge,omitempty"`
 	ForgeRepository string `toml:"forge_repository,omitempty"`
+	// ForgeHost is a self-hosted or Enterprise instance. Empty means the
+	// provider's own hostname.
+	ForgeHost string `toml:"forge_host,omitempty"`
 }
 
 type BlobStoreConfig struct {
@@ -173,7 +180,9 @@ type PlanPayload struct {
 	GitRevision             string           `json:"git_revision"`
 	ManifestSHA256          string           `json:"manifest_sha256"`
 	WorkspaceID             string           `json:"workspace_id"`
+	Forge                   string           `json:"forge,omitempty"`
 	ForgeRepository         string           `json:"forge_repository,omitempty"`
+	ForgeHost               string           `json:"forge_host,omitempty"`
 	GeneratedAt             string           `json:"generated_at"`
 	CreatedAt               string           `json:"created_at"`
 	ExpiresAt               string           `json:"expires_at"`
@@ -272,7 +281,9 @@ type SigningNode struct {
 
 type InitOptions struct {
 	Name            string
+	Forge           string
 	ForgeRepository string
+	ForgeHost       string
 }
 
 type BlobStoreOptions struct {

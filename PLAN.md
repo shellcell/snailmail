@@ -703,6 +703,12 @@ status matrix (§13).
 ```toml
 [workspace]
 name = "shellcell"
+# The forge is recorded rather than inferred from forge_repository, because
+# owner/name is a shape every provider shares. Omitted means github.com, which
+# is what every workspace written before the field said implicitly.
+forge = "gitlab"                          # github | gitlab | forgejo | gitea | none
+forge_repository = "acme/platform/state"  # GitLab nests groups; GitHub does not
+forge_host = "git.acme.example"           # self-hosted or Enterprise instance
 
 [product.ttysvg]
 source = { type = "github-release", repo = "shellcell/ttysvg" }
