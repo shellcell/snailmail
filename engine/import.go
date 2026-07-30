@@ -102,6 +102,14 @@ type importableFile struct {
 // importEnumerator reads a published index and returns the artifacts it names.
 type importEnumerator func(context.Context, ImportRepositoryRequest) ([]importableFile, string, error)
 
+// importCheckpointEvery is how many artifacts are adopted between lock writes.
+//
+// The trade is bounded rework against write cost: at 200, an interrupted import
+// loses at most 200 artifacts' lock entries — whose bytes are already stored, so
+// resuming re-reads the index and re-downloads nothing — while a 63,440-artifact
+// import writes the lock 318 times instead of 63,440.
+const importCheckpointEvery = 200
+
 var importEnumerators = map[string]importEnumerator{
 	"pypi": importPyPIFiles,
 	"helm": importHelmFiles,
@@ -166,6 +174,14 @@ func ImportRepository(ctx context.Context, request ImportRepositoryRequest) (Imp
 	if err != nil {
 		return ImportRepositoryResult{}, err
 	}
+	// One session for the whole import. Establishing the workspace per artifact —
+	// three git invocations, a lock acquire, a full lock write — was measured at
+	// 35 ms each and is what made a large import take hours rather than minutes.
+	session, closeSession, err := openAdoptSession(ctx, root, request.Repository)
+	if err != nil {
+		return ImportRepositoryResult{}, err
+	}
+	defer closeSession()
 	result := ImportRepositoryResult{
 		SchemaVersion: importSchemaVersion, Repository: request.Repository,
 		IndexURL: indexURL, Listed: len(files), DryRun: request.DryRun,
@@ -210,7 +226,7 @@ func ImportRepository(ctx context.Context, request ImportRepositoryRequest) (Imp
 			})
 			continue
 		}
-		adopted, err := adoptFirstReachable(ctx, root, request, indexURL, file)
+		adopted, err := adoptFirstReachable(ctx, root, request, indexURL, file, session)
 		if err != nil {
 			// One artifact failing does not abandon the rest. A repository being
 			// imported is someone else's, and a single unreachable file or one whose
@@ -223,6 +239,21 @@ func ImportRepository(ctx context.Context, request ImportRepositoryRequest) (Imp
 			Package: adopted.Package, Version: adopted.Version, Filename: adopted.Filename,
 			SHA256: adopted.SHA256, Origin: adopted.OriginURL,
 		})
+		// Checkpointed rather than written once at the end, so an import interrupted
+		// part way still leaves a consistent lock holding what it managed — the
+		// property per-artifact writing gave for free, kept at a fraction of the
+		// cost. Every artifact is already in content-addressed storage by this
+		// point, so a resumed import re-reads the index but re-downloads nothing.
+		if !request.DryRun && len(result.Imported)%importCheckpointEvery == 0 {
+			if err := session.flush(); err != nil {
+				return ImportRepositoryResult{}, err
+			}
+		}
+	}
+	if !request.DryRun {
+		if err := session.flush(); err != nil {
+			return ImportRepositoryResult{}, err
+		}
 	}
 	return result, nil
 }
@@ -248,7 +279,7 @@ func importFormat(root, repository string) (string, error) {
 // to go — recording the first listed would record somewhere that may never have
 // worked.
 func adoptFirstReachable(ctx context.Context, root string, request ImportRepositoryRequest,
-	indexURL string, file importableFile) (AdoptArtifactResult, error) {
+	indexURL string, file importableFile, session *adoptSession) (AdoptArtifactResult, error) {
 	var lastErr error
 	for _, reference := range file.URLs {
 		artifactURL, err := resolveDoctorReference(indexURL, reference)
@@ -260,7 +291,7 @@ func adoptFirstReachable(ctx context.Context, root string, request ImportReposit
 			Root: root, Repository: request.Repository, URL: artifactURL.String(),
 			SHA256: file.SHA256, Filename: file.Filename, Track: request.Track,
 			Distro: request.Distro, DryRun: request.DryRun, PublicOrigin: true,
-			Provenance: file.Provenance, Fetcher: request.Fetcher,
+			Provenance: file.Provenance, Fetcher: request.Fetcher, session: session,
 		})
 		if err == nil {
 			return adopted, nil

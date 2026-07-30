@@ -39,6 +39,13 @@ type AdoptArtifactRequest struct {
 	// every lock written before this field recorded.
 	Provenance state.DigestProvenance
 	Fetcher    source.Fetcher
+
+	// session, when set, is an open adopt session the caller owns: it already
+	// holds the workspace lock and the loaded state, and it decides when the lock
+	// is written. Unexported because it is not a choice a caller outside this
+	// package can make — import sets it to avoid re-establishing the workspace
+	// once per artifact, which is otherwise the dominant cost of an import.
+	session *adoptSession
 }
 
 type AdoptArtifactResult struct {
@@ -93,39 +100,16 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	if err := state.RequireCompleteGitHistoryContext(ctx, root); err != nil {
 		return AdoptArtifactResult{}, err
 	}
-	unlock, err := state.AcquireWorkspaceLock(root)
-	if err != nil {
-		return AdoptArtifactResult{}, err
+	session := request.session
+	if session == nil {
+		opened, closeSession, err := openAdoptSession(ctx, root, request.Repository)
+		if err != nil {
+			return AdoptArtifactResult{}, err
+		}
+		defer closeSession()
+		session = opened
 	}
-	defer unlock()
-	manifest, err := state.LoadManifest(root)
-	if err != nil {
-		return AdoptArtifactResult{}, err
-	}
-	if state.BlobConfiguration(manifest).Type != "local" {
-		return AdoptArtifactResult{}, errors.New("adopt requires a local blob store; migrate blobs explicitly after review")
-	}
-	repository, exists := manifest.Repositories[request.Repository]
-	if !exists {
-		return AdoptArtifactResult{}, fmt.Errorf("repository %q is not configured", request.Repository)
-	}
-	lock, err := state.LoadLock(root, repository)
-	if err != nil {
-		return AdoptArtifactResult{}, err
-	}
-	if err := state.ValidateLock(lock, request.Repository, repository.Format); err != nil {
-		return AdoptArtifactResult{}, err
-	}
-	ledger, err := state.LoadLedgerHistoryContext(ctx, root, request.Repository)
-	if err != nil {
-		return AdoptArtifactResult{}, err
-	}
-	if err := state.ValidatePublicationHistory(request.Repository, ledger); err != nil {
-		return AdoptArtifactResult{}, err
-	}
-	if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
-		return AdoptArtifactResult{}, err
-	}
+	repository, lock, ledger := session.repository, &session.lock, session.ledger
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	response, err := request.Fetcher.Fetch(ctx, originURL.String(), maximumAdoptBytes)
@@ -176,19 +160,19 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 		return AdoptArtifactResult{}, fmt.Errorf("digest provenance %q is not one snailmail records", provenance)
 	}
 	locked.Origin = &state.ArtifactOrigin{Kind: "https", URL: originURL.String(), Provenance: provenance}
-	added, err := state.AddBlob(&lock, repository.Format, track, distro, locked, packageName, blob.Facts.Version)
+	added, err := state.AddBlob(lock, repository.Format, track, distro, locked, packageName, blob.Facts.Version)
 	if err != nil {
 		return AdoptArtifactResult{}, err
 	}
-	originChanged, err := state.SetBlobOrigin(&lock, packageName, blob.Facts.Version, filename, blob.SHA256, *locked.Origin)
+	originChanged, err := state.SetBlobOrigin(lock, packageName, blob.Facts.Version, filename, blob.SHA256, *locked.Origin)
 	if err != nil {
 		return AdoptArtifactResult{}, err
 	}
 	changed := added || originChanged
-	if err := state.ValidateLock(lock, request.Repository, repository.Format); err != nil {
+	if err := state.ValidateLock(*lock, request.Repository, repository.Format); err != nil {
 		return AdoptArtifactResult{}, err
 	}
-	if err := state.ValidatePublishedBindings(lock, ledger); err != nil {
+	if err := state.ValidatePublishedBindings(*lock, ledger); err != nil {
 		return AdoptArtifactResult{}, err
 	}
 	result := AdoptArtifactResult{
@@ -223,7 +207,13 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	if !changed {
 		return result, nil
 	}
-	if err := state.WriteLock(root, repository, lock); err != nil {
+	session.dirty = true
+	// A caller that owns the session decides when to write, so an import pays for
+	// one lock write per checkpoint rather than one per artifact.
+	if request.session != nil {
+		return result, nil
+	}
+	if err := session.flush(); err != nil {
 		return AdoptArtifactResult{}, err
 	}
 	return result, nil
