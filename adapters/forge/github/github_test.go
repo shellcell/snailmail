@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/shellcell/snailmail/adapters/forge/cliforge"
+	"github.com/shellcell/snailmail/adapters/forge/forgeio"
 	"github.com/shellcell/snailmail/forge"
 	"github.com/shellcell/snailmail/forge/forgetest"
 )
@@ -199,7 +199,7 @@ func TestGitHubRefusesAResponseItCannotAccountFor(t *testing.T) {
 		"trailing document": `{"full_name":"shellcell/state","default_branch":"main"}{"full_name":"other"}`,
 		"not json":          `<html>proxy error</html>`,
 		"truncated":         `{"full_name":"shellcell/state",`,
-		"oversized":         `{"default_branch":"` + strings.Repeat("x", cliforge.MaxResponseSize+1) + `"}`,
+		"oversized":         `{"default_branch":"` + strings.Repeat("x", forgeio.MaxResponseSize+1) + `"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(fixtures, "repo.json"), []byte(body), 0o644); err != nil {

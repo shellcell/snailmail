@@ -1,23 +1,20 @@
-// Package cliforge reads JSON from a provider's own CLI.
+// Package forgeio reads JSON from a forge, over either transport an adapter has.
 //
-// Both forge adapters delegate authentication and host resolution to the
-// vendor's tool — gh, glab — rather than handling tokens themselves. What is
-// shared is not the endpoints but the hardening around the call: a bounded read,
-// a decode that accounts for the whole response, and every failure rendered as
-// forge.ErrUnavailable so a gate refuses rather than guesses.
+// Where a vendor CLI exists — gh, glab — it is preferred, because it owns
+// authentication and host resolution and snailmail never sees a token. Where one
+// does not, or is not installed, the adapter speaks HTTP and presents a token
+// from a broker.
 //
-// That hardening lives here because it is the part that must not differ between
-// providers. A second adapter that bounded its response differently, or accepted
-// a body with trailing data, would be a weaker path to the same authorization.
-package cliforge
+// What is shared is not the endpoints but the hardening: a bounded read, a decode
+// that accounts for the whole response, and every failure rendered as
+// forge.ErrUnavailable so a gate refuses rather than guesses. That lives here
+// because it is the part that must not differ by transport or provider — a second
+// path to the same authorization must not be a weaker one.
+package forgeio
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"os/exec"
 
 	"github.com/shellcell/snailmail/forge"
@@ -60,16 +57,9 @@ func ReadJSON(ctx context.Context, request Request, target any) error {
 	if len(output) > MaxResponseSize {
 		return fmt.Errorf("%w: response from %s exceeds the read limit", forge.ErrUnavailable, request.Endpoint)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(output))
-	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("%w: invalid response from %s", forge.ErrUnavailable, request.Endpoint)
-	}
-	// A second document means something other than the API answered, or answered
-	// twice. Taking the first would be reading review evidence from a source that
-	// has not been identified.
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("%w: trailing data in response from %s", forge.ErrUnavailable, request.Endpoint)
-	}
-	return nil
+	// A second document would mean something other than the API answered, or
+	// answered twice; taking the first would be reading review evidence from a
+	// source that has not been identified. Shared with the HTTP transport so the
+	// two cannot come to disagree about what a complete answer is.
+	return decodeSingle(output, target, request.Endpoint)
 }

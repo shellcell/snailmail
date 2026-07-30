@@ -981,11 +981,25 @@ Docker daemon, its jobs share no filesystem, and Pages serves a job artifact
 rather than a moved ref — so what is shared is the derivation and only the
 rendering differs.
 
-Remaining order: Forgejo/Gitea —
-whose API is GitHub-shaped but whose per-commit pull-request and compare
-endpoints vary by version, so it needs its support floor pinned to a version
-rather than assumed. Bitbucket is last and may stay unsupported: it has no
-merge-base endpoint, which is the one question the gate cannot do without.
+Remaining order: Forgejo/Gitea, then Bitbucket if ever.
+
+Forgejo answers all three questions — checked against codeberg.org rather than
+assumed — but not the way the other two do, and one of the differences is
+architectural. There is no `tea api` passthrough, so the adapter cannot delegate
+authentication to a vendor CLI the way gh and glab do; it has to speak HTTP and
+hold a token, which needs a decided source. That is also required for
+correctness, because the per-commit endpoint returns 404 when a commit has no
+pull request and a CLI wrapper cannot tell that from a network failure — the two
+must not both render as "review state unknown".
+
+Two traps recorded so they are not rediscovered: `merged` is a boolean and a
+merged pull request has state `"closed"`, so GitLab's `state == "merged"` rule
+would read every merged Forgejo review as unmerged; and there is no merge-base
+endpoint, so containment comes from the *reverse* comparison being empty, which
+is the same proposition as `merge_base(revision, branch) == revision`.
+
+Bitbucket has no merge-base endpoint either and no reverse-comparison
+equivalent, which is the one question the gate cannot do without.
 
 ### 11.5 Automation: the container image is the integration point
 

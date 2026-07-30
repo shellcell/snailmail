@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/shellcell/snailmail/adapters/forge/cliforge"
+	"github.com/shellcell/snailmail/adapters/forge/forgeio"
 	"github.com/shellcell/snailmail/forge"
 	"github.com/shellcell/snailmail/forge/forgetest"
 )
@@ -243,7 +243,7 @@ func TestGitLabRefusesAResponseItCannotAccountFor(t *testing.T) {
 		"trailing document": `{"path_with_namespace":"shellcell/state","default_branch":"main"}{"x":1}`,
 		"not json":          `<html>502</html>`,
 		"truncated":         `{"path_with_namespace":`,
-		"oversized":         `{"default_branch":"` + strings.Repeat("x", cliforge.MaxResponseSize+1) + `"}`,
+		"oversized":         `{"default_branch":"` + strings.Repeat("x", forgeio.MaxResponseSize+1) + `"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(fixtures, "project.json"), []byte(body), 0o644); err != nil {

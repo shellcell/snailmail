@@ -18,7 +18,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/shellcell/snailmail/adapters/forge/cliforge"
+	"github.com/shellcell/snailmail/adapters/forge/forgeio"
 	"github.com/shellcell/snailmail/forge"
 )
 
@@ -129,7 +129,7 @@ func validRevision(revision string) bool {
 }
 
 func (adapter *Adapter) api(ctx context.Context, repository forge.Repository, target any, endpoint string) error {
-	return cliforge.ReadJSON(ctx, cliforge.Request{
+	return forgeio.ReadJSON(ctx, forgeio.Request{
 		Binary:           "glab",
 		Arguments:        []string{"api", "--hostname", adapter.hostname, endpoint},
 		WorkingDirectory: repository.WorkingDirectory,
