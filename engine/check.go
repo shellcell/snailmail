@@ -214,7 +214,7 @@ func checkLockedOrigin(ctx context.Context, locked state.LockedBlob, fetcher sou
 	if fetcher == nil {
 		return errors.New("origin fetcher is required")
 	}
-	response, err := fetcher.Fetch(ctx, locked.Origin.URL, maximumAdoptBytes)
+	response, err := fetcher.Fetch(ctx, locked.Origin.URL, maximumArtifactBytes())
 	if err != nil {
 		return err
 	}

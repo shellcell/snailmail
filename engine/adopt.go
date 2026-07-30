@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,7 +20,38 @@ import (
 	"github.com/shellcell/snailmail/source"
 )
 
-const maximumAdoptBytes = 128 << 20
+// DefaultMaxArtifactBytes bounds a single fetched artifact, which is held whole in
+// memory while it is hashed and inspected.
+//
+// It is a memory bound rather than a policy about package size, and until adoption
+// streams it cannot be otherwise. That distinction matters because real packages
+// exceed it: 0ad-data in Debian bookworm is over 128 MiB, so importing that suite
+// skips it. A constant would make such a package unadoptable at any setting, which
+// is a refusal an operator cannot act on.
+const DefaultMaxArtifactBytes = 128 << 20
+
+// MaxArtifactBytesEnvironment raises or lowers the limit for one invocation.
+//
+// The same escape hatch the lock limit has, for the same reason: someone who has
+// read the message and knows their machine can hold a larger artifact should be
+// able to proceed. Raising it costs memory proportional to the largest artifact,
+// which is the trade being made explicit rather than hidden.
+const MaxArtifactBytesEnvironment = "SNAILMAIL_MAX_ARTIFACT_BYTES"
+
+// maximumArtifactBytes is the limit in force. A value that is not a positive number
+// is ignored rather than treated as zero, because a typo must not refuse every
+// artifact.
+func maximumArtifactBytes() int64 {
+	given := os.Getenv(MaxArtifactBytesEnvironment)
+	if given == "" {
+		return DefaultMaxArtifactBytes
+	}
+	parsed, err := strconv.ParseInt(given, 10, 64)
+	if err != nil || parsed <= 0 {
+		return DefaultMaxArtifactBytes
+	}
+	return parsed
+}
 
 type AdoptArtifactRequest struct {
 	Root       string
@@ -112,8 +144,15 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	repository, lock, ledger := session.repository, &session.lock, session.ledger
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	response, err := request.Fetcher.Fetch(ctx, originURL.String(), maximumAdoptBytes)
+	response, err := request.Fetcher.Fetch(ctx, originURL.String(), maximumArtifactBytes())
 	if err != nil {
+		if errors.Is(err, source.ErrLimit) {
+			// Naming the remedy, because the alternative reads as "this package is
+			// too big" when what it means is "this machine was told to hold less".
+			return AdoptArtifactResult{}, fmt.Errorf(
+				"%s is larger than the %d byte artifact limit; raise %s to adopt it: %w",
+				filename, maximumArtifactBytes(), MaxArtifactBytesEnvironment, err)
+		}
 		return AdoptArtifactResult{}, fmt.Errorf("fetch adopted artifact: %w", err)
 	}
 	if response.StatusCode != http.StatusOK {

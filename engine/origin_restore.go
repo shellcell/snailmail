@@ -61,7 +61,7 @@ func restoreBlobFromOrigin(ctx context.Context, root, format string, locked stat
 	}
 	// The same bound adoption applies. Nothing can carry an origin without
 	// having been adopted, so no blob reachable here was ever larger.
-	response, err := fetcher.Fetch(ctx, origin.String(), maximumAdoptBytes)
+	response, err := fetcher.Fetch(ctx, origin.String(), maximumArtifactBytes())
 	if err != nil {
 		return domain.Blob{}, "", err
 	}

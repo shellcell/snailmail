@@ -1392,47 +1392,82 @@ func runServe(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	return err
 }
 
+// printUsage groups commands by when someone reaches for them.
+//
+// A flat list of thirty-nine usage lines is accurate and useless to a newcomer:
+// blob-store, keys rotate and dashboard sat at the same visual level as add and
+// apply, and apply — the command that actually publishes — was the thirty-second
+// line. The grammar lines were never the problem; the absence of an order was.
 func printUsage(output io.Writer) {
 	printBrand(output)
 	fmt.Fprintln(output, "relaxed package delivery")
 	fmt.Fprintln(output)
-	fmt.Fprintln(output, "Usage:")
-	fmt.Fprintln(output, "  snailmail init --name NAME")
-	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR")
-	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail collect [--repo NAME] [--keep N] [--yes]\n  snailmail import --public-origin [--project NAME|--suite NAME] [--dry-run --limit N] REPOSITORY URL\n  snailmail ci <github|gitlab> [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
-	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
-	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
-	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
-	fmt.Fprintln(output, "  snailmail prune REPOSITORY --keep N")
-	fmt.Fprintln(output, "  snailmail check [--workspace DIR] [--json] [--origins --max-origins N --origin-offset N]")
-	fmt.Fprintln(output, "  snailmail status [--workspace DIR] [--json]")
-	fmt.Fprintln(output, "  snailmail doctor [--format auto|pypi|deb|helm] [--json] URL")
-	fmt.Fprintln(output, "  snailmail adopt --sha256 HEX --public-origin [--filename NAME --track TRACK --distro DISTRO --dry-run --json --workspace DIR] REPOSITORY URL")
-	fmt.Fprintln(output, "  snailmail blob-store s3 --bucket BUCKET [--prefix PREFIX --region REGION]")
-	fmt.Fprintln(output, "  snailmail plan [--out snailmail.snailmail-plan.json]")
-	fmt.Fprintln(output, "  snailmail approval-key generate --out FILE")
-	fmt.Fprintln(output, "  snailmail keys new NAME [--algo openpgp-rsa4096]")
-	fmt.Fprintln(output, "  snailmail keys publish NAME")
-	fmt.Fprintln(output, "  snailmail keys attach REPOSITORY --key NAME")
-	fmt.Fprintln(output, "  snailmail keys rotate REPOSITORY --successor KEY [--minimum-refresh 720h]")
-	fmt.Fprintln(output, "  snailmail keys rotate REPOSITORY --advance --yes")
-	fmt.Fprintln(output, "  snailmail keys audit")
-	fmt.Fprintln(output, "  snailmail approve --plan PLAN --repository NAME --key FILE --yes")
-	fmt.Fprintln(output, "  snailmail dashboard [--output site]")
-	fmt.Fprintln(output, "  snailmail apply [--plan snailmail.snailmail-plan.json] [--dry-run]")
-	fmt.Fprintln(output, "  snailmail build pypi --input DIR --output DIR")
-	fmt.Fprintln(output, "  snailmail build deb --input DIR --output DIR [--suite stable --architectures amd64]")
-	fmt.Fprintln(output, "  snailmail build helm --input DIR --output DIR")
-	fmt.Fprintln(output, "  snailmail verify pypi --repo DIR [--python python3]")
-	fmt.Fprintln(output, "  snailmail verify deb --repo DIR [--runner podman]")
-	fmt.Fprintln(output, "  snailmail verify helm --repo DIR [--runner podman]")
-	fmt.Fprintln(output, "  snailmail verify raw --repo DIR")
-	fmt.Fprintln(output, "  snailmail verify rpm --repo DIR [--runner podman]")
-	fmt.Fprintln(output, "  snailmail verify apk --repo DIR [--runner podman]")
-	fmt.Fprintln(output, "  snailmail serve --repo DIR [--listen 127.0.0.1:8080]")
-	fmt.Fprintln(output, "  snailmail version [--json]")
+	fmt.Fprintln(output, "  Publishing is: add an artifact, review the diff, plan, apply.")
+	fmt.Fprintln(output, "  Everything a plan will do is visible before it does it.")
+
+	for _, group := range []struct {
+		title    string
+		commands []string
+	}{
+		{"Start here", []string{
+			"init --name NAME",
+			"setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR",
+			"setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]",
+			"setup rpm --name NAME --host rsync --target USER@HOST --output /abs/remote/path",
+		}},
+		{"Every day", []string{
+			"add [--name NAME --version VERSION] REPOSITORY ARTIFACT...",
+			"plan [--out snailmail.snailmail-plan.json]",
+			"apply [--plan snailmail.snailmail-plan.json] [--dry-run]",
+			"status [--workspace DIR] [--json]",
+		}},
+		{"Curating what is published", []string{
+			"promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION",
+			"yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION",
+			"prune REPOSITORY --keep N",
+			"rollout [--repo NAME] [--package NAME] [--withdrawn]",
+			"collect [--repo NAME] [--keep N] [--yes]",
+		}},
+		{"Taking on an existing repository", []string{
+			"import --public-origin [--project NAME|--suite NAME] [--min-provenance LEVEL] [--dry-run --limit N] REPOSITORY URL",
+			"adopt --sha256 HEX --public-origin [--filename NAME --track TRACK] REPOSITORY URL",
+			"doctor [--format auto|pypi|deb|helm] [--json] URL",
+		}},
+		{"Signing and review gates", []string{
+			"keys new NAME [--algo openpgp-rsa4096]",
+			"keys attach REPOSITORY --key NAME",
+			"keys publish NAME",
+			"keys rotate REPOSITORY --successor KEY [--minimum-refresh 720h]",
+			"keys rotate REPOSITORY --advance --yes",
+			"keys audit",
+			"approval-key generate --out FILE",
+			"approve --plan PLAN --repository NAME --key FILE --yes",
+		}},
+		{"Checking and inspecting", []string{
+			"check [--workspace DIR] [--json] [--origins --max-origins N --origin-offset N]",
+			"verify <pypi|deb|helm|raw|rpm|apk> --repo DIR [--runner podman]",
+			"serve --repo DIR [--listen 127.0.0.1:8080]",
+			"version [--json]",
+		}},
+		{"Pages, sites and CI", []string{
+			"site [--title TITLE] [--description TEXT] [--output PATH]",
+			"dashboard [--output site]",
+			"ci <github|gitlab> [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml",
+		}},
+		{"Building a repository without a workspace", []string{
+			"build <pypi|deb|helm> --input DIR --output DIR [--suite stable --architectures amd64]",
+			"blob-store s3 --bucket BUCKET [--prefix PREFIX --region REGION]",
+		}},
+	} {
+		fmt.Fprintln(output)
+		fmt.Fprintf(output, "%s:\n", group.title)
+		for _, command := range group.commands {
+			fmt.Fprintf(output, "  snailmail %s\n", command)
+		}
+	}
 	fmt.Fprintln(output)
-	fmt.Fprintln(output, "Every command that reports a result accepts --json.")
+	fmt.Fprintln(output, "Flags may appear anywhere, and every command that reports a result accepts --json.")
+	fmt.Fprintln(output, "--workspace DIR works on every command that reads a workspace.")
 }
 
 func splitList(value string) []string {

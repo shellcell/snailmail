@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -115,15 +116,17 @@ func (flags *commandFlags) Root() string {
 
 // Parse, NArg, Arg and Args pass through for the commands that take positional
 // arguments and validate the count themselves.
-func (flags *commandFlags) Parse(arguments []string) error { return flags.set.Parse(arguments) }
-func (flags *commandFlags) NArg() int                      { return flags.set.NArg() }
-func (flags *commandFlags) Arg(index int) string           { return flags.set.Arg(index) }
-func (flags *commandFlags) Args() []string                 { return flags.set.Args() }
+func (flags *commandFlags) Parse(arguments []string) error {
+	return flags.set.Parse(hoistFlags(flags.set, arguments))
+}
+func (flags *commandFlags) NArg() int            { return flags.set.NArg() }
+func (flags *commandFlags) Arg(index int) string { return flags.set.Arg(index) }
+func (flags *commandFlags) Args() []string       { return flags.set.Args() }
 
 // parse reads arguments and rejects any positional argument, which every
 // command using it treats as a usage error.
 func (flags *commandFlags) parse(arguments []string) error {
-	if err := flags.set.Parse(arguments); err != nil {
+	if err := flags.set.Parse(hoistFlags(flags.set, arguments)); err != nil {
 		return err
 	}
 	if flags.set.NArg() != 0 {
@@ -135,11 +138,68 @@ func (flags *commandFlags) parse(arguments []string) error {
 // parseWithArguments reads arguments and requires exactly count positional
 // arguments, reporting usage when the count does not match.
 func (flags *commandFlags) parseWithArguments(arguments []string, count int, usage string) ([]string, error) {
-	if err := flags.set.Parse(arguments); err != nil {
+	if err := flags.set.Parse(hoistFlags(flags.set, arguments)); err != nil {
 		return nil, err
 	}
 	if flags.set.NArg() != count {
 		return nil, errors.New(usage)
 	}
 	return flags.set.Args(), nil
+}
+
+// hoistFlags reorders arguments so flags may appear anywhere, including after
+// positional ones.
+//
+// Go's flag package stops parsing at the first argument that is not a flag, so
+// `snailmail doctor URL --json` silently treats --json as a positional and reports
+// a usage error that does not mention it. Every CLI people arrive from — git,
+// docker, kubectl, gh, cargo — accepts flags in any position, so the strict
+// behaviour reads as a bug rather than a convention. It cost three separate
+// mistakes while building features in this repository, which is a fair prediction
+// of how a newcomer fares.
+//
+// Everything after a bare "--" is left alone, which is what lets an artifact
+// legitimately be named "-weird.deb".
+func hoistFlags(set *flag.FlagSet, arguments []string) []string {
+	var flags, positional []string
+	for index := 0; index < len(arguments); index++ {
+		argument := arguments[index]
+		if argument == "--" {
+			// Everything after the caller's terminator is positional, whatever it
+			// looks like. The terminator itself is dropped here and reinstated below,
+			// so it always lands between the flags and the positionals rather than
+			// wherever the caller happened to put it.
+			positional = append(positional, arguments[index+1:]...)
+			break
+		}
+		if len(argument) < 2 || argument[0] != '-' {
+			positional = append(positional, argument)
+			continue
+		}
+		flags = append(flags, argument)
+		if strings.Contains(argument, "=") {
+			continue
+		}
+		// A non-boolean flag takes the next argument as its value, so that argument
+		// has to travel with it rather than being read as a positional. An unknown
+		// flag is left to Parse, which reports it better than this could.
+		declared := set.Lookup(strings.TrimLeft(argument, "-"))
+		if declared == nil {
+			continue
+		}
+		if boolean, ok := declared.Value.(interface{ IsBoolFlag() bool }); ok && boolean.IsBoolFlag() {
+			continue
+		}
+		if index+1 < len(arguments) {
+			index++
+			flags = append(flags, arguments[index])
+		}
+	}
+	if len(positional) == 0 {
+		return flags
+	}
+	// A terminator of our own, always. Without it an artifact legitimately named
+	// "-weird.deb" is read as a flag, and a positional that arrived before a flag
+	// would stop parsing early and undo the hoist.
+	return append(append(flags, "--"), positional...)
 }
