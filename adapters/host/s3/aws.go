@@ -63,6 +63,53 @@ func (client *AWSClient) Head(ctx context.Context, key string) (ObjectInfo, erro
 	}, nil
 }
 
+func (client *AWSClient) List(ctx context.Context, request ListRequest) (ListResult, error) {
+	if request.Prefix == "" {
+		// Refused rather than defaulted: every listing snailmail performs is scoped
+		// to a repository, and an accidental whole-bucket enumeration is expensive
+		// on a bucket that is not only snailmail's.
+		return ListResult{}, errors.New("a listing must be scoped to a prefix")
+	}
+	limit := request.Limit
+	if limit <= 0 || limit > maxListPage {
+		limit = maxListPage
+	}
+	input := &s3.ListObjectsV2Input{
+		Bucket:  &client.bucket,
+		Prefix:  &request.Prefix,
+		MaxKeys: aws.Int32(int32(limit)),
+	}
+	if request.After != "" {
+		input.ContinuationToken = &request.After
+	}
+	result, err := client.client.ListObjectsV2(ctx, input)
+	if err != nil {
+		return ListResult{}, normalizeAWSError(err)
+	}
+	objects := make([]ListedObject, 0, len(result.Contents))
+	for _, object := range result.Contents {
+		key := aws.ToString(object.Key)
+		if key == "" {
+			continue
+		}
+		objects = append(objects, ListedObject{
+			Key: key, Size: aws.ToInt64(object.Size), ETag: aws.ToString(object.ETag),
+		})
+	}
+	// The token is returned only when S3 says the listing was truncated, so a
+	// caller looping until it is empty sees every key exactly once. Trusting
+	// NextContinuationToken alone would loop forever against an implementation
+	// that returns one on the final page.
+	page := ListResult{Objects: objects}
+	if aws.ToBool(result.IsTruncated) {
+		page.More = aws.ToString(result.NextContinuationToken)
+		if page.More == "" {
+			return ListResult{}, errors.New("object store reported a truncated listing with no continuation token")
+		}
+	}
+	return page, nil
+}
+
 func (client *AWSClient) Get(ctx context.Context, key string, maximum int64) ([]byte, ObjectInfo, error) {
 	result, err := client.client.GetObject(ctx, &s3.GetObjectInput{Bucket: &client.bucket, Key: &key})
 	if err != nil {

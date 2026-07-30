@@ -966,6 +966,42 @@ func newMemoryObjects() *memoryObjects {
 	return &memoryObjects{objects: make(map[string]memoryObject)}
 }
 
+// List pages the way S3 does, in lexical key order with a continuation token,
+// because a double that returned everything at once would let a caller forget to
+// follow the token and still pass.
+func (store *memoryObjects) List(_ context.Context, request ListRequest) (ListResult, error) {
+	if request.Prefix == "" {
+		return ListResult{}, errors.New("a listing must be scoped to a prefix")
+	}
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	keys := make([]string, 0, len(store.objects))
+	for key := range store.objects {
+		if strings.HasPrefix(key, request.Prefix) && key > request.After {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	limit := request.Limit
+	if limit <= 0 || limit > maxListPage {
+		limit = maxListPage
+	}
+	page := ListResult{}
+	for _, key := range keys {
+		if len(page.Objects) == limit {
+			// The token is the last key returned, which is what makes After
+			// exclusive and the paging total.
+			page.More = page.Objects[len(page.Objects)-1].Key
+			break
+		}
+		object := store.objects[key]
+		page.Objects = append(page.Objects, ListedObject{
+			Key: key, Size: int64(len(object.content)), ETag: object.info.ETag,
+		})
+	}
+	return page, nil
+}
+
 func (store *memoryObjects) Head(_ context.Context, key string) (ObjectInfo, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()

@@ -65,6 +65,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runSite(ctx, args[1:], stdout, stderr)
 	case "rollout":
 		return runRollout(ctx, args[1:], stdout, stderr)
+	case "collect":
+		return runCollect(ctx, args[1:], stdout, stderr)
 	case "ci":
 		return runCI(ctx, args[1:], stdout, stderr)
 	case "doctor":
@@ -1368,7 +1370,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR")
-	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail ci <github|gitlab> [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
+	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail collect [--repo NAME] [--keep N] [--yes]\n  snailmail ci <github|gitlab> [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
 	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
@@ -1539,4 +1541,48 @@ func largestLockSuffix(result engine.StatusWorkspaceResult) string {
 		return ""
 	}
 	return fmt.Sprintf(", largest %s at %s", largest.Name, humanBytes(largest.LockBytes))
+}
+
+func runCollect(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := newCommandFlags("collect", stderr).withWorkspace().withJSON()
+	repository := flags.String("repo", "", "collect one repository")
+	keep := flags.Int("keep", 10, "recent publications to retain beyond the live revision and its rollback")
+	// Reporting is the default and deleting needs saying, which is how every other
+	// command here that destroys something behaves.
+	yes := flags.Bool("yes", false, "actually remove; without it this reports what would be removed")
+	if err := flags.parse(args); err != nil {
+		return err
+	}
+	hosts := wire.NewHostResolver()
+	defer hosts.Close()
+	result, err := engine.CollectWorkspace(ctx, engine.CollectWorkspaceRequest{
+		Root: flags.Root(), Repository: *repository, Keep: *keep, Apply: *yes, Hosts: hosts,
+	})
+	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
+	printBrand(stdout)
+	for _, reported := range result.Repositories {
+		if !reported.Collectable {
+			fmt.Fprintf(stdout, "✉️   %s: %s\n", reported.Name, reported.Note)
+			continue
+		}
+		fmt.Fprintf(stdout, "✉️   %s: %d %s (%s), %d %s kept\n",
+			reported.Name, reported.Removed, plural(reported.Removed, "object", "objects"),
+			humanBytes(reported.RemovedBytes), reported.KeptRevisions,
+			plural(reported.KeptRevisions, "revision", "revisions"))
+	}
+	verb := "would remove"
+	if result.Applied {
+		verb = "removed"
+	}
+	fmt.Fprintf(stdout, "📦  %s %d %s, %s\n", verb, result.Removed,
+		plural(result.Removed, "object", "objects"), humanBytes(result.RemovedBytes))
+	if !result.Applied && result.Removed != 0 {
+		fmt.Fprintln(stdout, "✉️   nothing was removed; pass --yes to collect")
+	}
+	return nil
 }

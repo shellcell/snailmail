@@ -185,6 +185,31 @@ one as a service; its jobs share no filesystem, so what apply builds is declared
 as an artifact; and Pages there serves a job artifact rather than a moved ref, so
 there is no orphan commit.
 
+## Collecting superseded releases
+
+An object store keeps every revision it has ever published: a publication writes a
+whole tree under `.snailmail/releases/<tree>/`, and nothing removes the previous
+one. A project publishing daily accumulates a copy a day.
+
+```sh
+snailmail collect                 # report what would be removed
+snailmail collect --keep 3 --yes  # remove it, retaining three recent revisions
+```
+
+Reporting is the default; `--yes` deletes. Three things always survive whatever
+`--keep` says: the live revision, whatever its rollback depends on, and any
+revision the ledger records within `--keep`. The first two are established by
+reading the host rather than the workspace, so a checkout whose ledger is behind
+cannot delete what is being served.
+
+Note that with only two publications nothing is collectable — both are protected,
+the live one and the one it rolls back to. Local directories and GitHub Pages have
+nothing to collect and say so: the first leaves nothing behind, and the second
+leaves unreachable objects to git.
+
+Collection is the one operation that needs `s3:ListBucket`, so it may run under a
+different credential from publishing.
+
 ## Inspecting someone else's repository
 
 `snailmail doctor URL` needs no workspace and inspects a public HTTPS PyPI,
@@ -342,6 +367,23 @@ git commit -m "configure hosted Python repository"
 go run ./cmd/snailmail plan
 go run ./cmd/snailmail apply
 ```
+
+### What the credential has to be allowed to do
+
+Publishing needs, scoped to the configured prefix:
+
+- `s3:GetObject` — reading back what it wrote, to verify it
+- `s3:PutObject` — writing artifacts, indexes and the root object
+- `s3:DeleteObject` — removing an abandoned stage, and removing the root object
+  when a restore has to leave a repository with none
+
+It does **not** need `s3:ListBucket`. Every operation on the publishing path
+addresses an object by a key snailmail already knows, which is what lets a
+publication be verified without trusting a listing.
+
+`s3:ListBucket` is needed only to discover state a publication has superseded —
+collecting old releases. That is a separate operation and may run under a separate
+credential, so a publishing role stays as narrow as the list above.
 
 The bucket or gateway must serve the configured prefix, including
 `.snailmail/stages/` during pre-publication verification. Use `--endpoint` and
