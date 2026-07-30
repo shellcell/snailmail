@@ -398,8 +398,17 @@ func (rawFormat) RequiresLegacyDigests() bool { return false }
 
 func (rawFormat) SigningAlgorithm() string { return "" }
 
-func (rawFormat) ImplementsSigning() bool         { return false }
-func (rawFormat) CommitPaths(Repository) []string { return []string{"index.html", "SHA256SUMS"} }
+func (rawFormat) ImplementsSigning() bool { return false }
+
+// SHA256SUMS alone. It is the document a client fetches and verifies against, and
+// everything it names is at a path fixed by the artifact's name and version.
+//
+// index.html was listed here too, which was wrong and made raw look like a
+// multi-path format: that file is snailmail's own browsable listing, appended to
+// every format's tree by AppendListing, and no other format counts it. Nothing
+// resolves through it — the install steps curl SHA256SUMS, and verification skips
+// it as generated — so switching it is not what makes a revision live.
+func (rawFormat) CommitPaths(Repository) []string { return []string{"SHA256SUMS"} }
 func (rawFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
 	artifact, err := raw.Build(blobs, raw.BuildOptions{GeneratedAt: options.GeneratedAt})
 	if err != nil {

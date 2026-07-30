@@ -16,12 +16,11 @@ func TestSupportsDeniesUnknownPairs(t *testing.T) {
 		// An object store commits one object, so a format qualifies only if one
 		// path makes a revision live: Debian needs a Release and its detached
 		// signature together, Alpine has an index per architecture, raw has a
-		// listing and a SHA256SUMS. A signed yum repository is in the same
+		// architecture. A signed yum repository is in the same
 		// position, and is refused by the adapter's path count rather than here,
 		// which is why rpm is declared.
 		{"s3", "deb"},
 		{"s3", "apk"},
-		{"s3", "raw"},
 	} {
 		support := Supports(pair[0], pair[1])
 		if support.Publish || support.RemoteClientVerification || support.InstallDocument {

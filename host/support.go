@@ -74,6 +74,10 @@ var formatSupport = map[string]map[string]FormatSupport{
 		// one — so the limitation is enforced by the path count rather than stated
 		// again here.
 		"rpm": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		// Plain artifacts, which is the simplest thing anyone wants from an object
+		// store. One document makes a revision live — SHA256SUMS — and everything it
+		// names sits at a path fixed by the artifact's name and version.
+		"raw": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 	},
 	// Pages commits by moving a publish ref to an orphan commit of the whole
 	// tree, which is atomic and format-neutral, so a suite's Release and its

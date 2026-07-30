@@ -54,15 +54,20 @@ Every command that takes `--workspace` also accepts `--root`.
 |---|---|---|---|---|---|---|
 | local directory | yes | yes | yes | yes | yes | yes |
 | GitHub Pages | yes | yes | yes | yes | yes | yes |
-| S3 / R2 / GCS | yes | — | unsigned only | — | yes | — |
+| S3 / R2 / GCS | yes | — | unsigned only | — | yes | yes |
 
 An object store makes a revision live by writing one object, so it can serve a
-format only where a single path switches. Debian needs a `Release` and its
-detached signature to become live together; Alpine has one index per
-architecture; `raw` has a listing and a `SHA256SUMS`; and a *signed* yum
-repository has to switch `repomd.xml` with the `repomd.xml.asc` that signs it.
-Those are structural limits, not missing work — a local directory or GitHub Pages
-commits a whole tree at once and serves all six.
+format only where a single path switches. Debian needs a `Release` and its detached
+signature to become live together; Alpine has one index per architecture; and a
+*signed* yum repository has to switch `repomd.xml` with the `repomd.xml.asc` that
+signs it. Those are structural limits, not missing work — a local directory or
+GitHub Pages commits a whole tree at once and serves all six.
+
+One caveat for object storage: the browsable `index.html` is generated fresh for
+every revision, so it is kept with the release rather than at the repository root.
+Clients are unaffected — they fetch `simple/`, `index.yaml`, `repodata/` or
+`SHA256SUMS` — but there is no human-browsable page at the root of a bucket-hosted
+repository yet.
 
 ## Status
 
@@ -184,6 +189,25 @@ than wording. A GitLab runner has no Docker daemon, so client verification needs
 one as a service; its jobs share no filesystem, so what apply builds is declared
 as an artifact; and Pages there serves a job artifact rather than a moved ref, so
 there is no orphan commit.
+
+## Two runners at once
+
+The workspace lock is a file inside the checkout, so it serialises operations on
+one machine and not two. What protects a repository when two CI runners publish
+at the same time is the conditional commit: each states the revision it observed,
+and the second to arrive is refused because that is no longer what is live.
+
+So the failure mode is **one run fails, not one run waits**. It fails as a stale
+plan, which is a retry signal — replanning against what is actually live and
+applying again succeeds. A pipeline that publishes from more than one place at once
+wants a concurrency group so this is rare rather than routine; the generated
+workflows set one.
+
+Two things worth knowing. Staging is *not* exclusive, deliberately: two runners can
+both stage, because a stage writes only under its own identifier and touches nothing
+a client reads. And a local host cannot be shared at all — its output path is
+relative to its workspace — so this only arises for object storage and Pages, where
+two runners can name the same bucket and prefix or the same repository and branch.
 
 ## How large a workspace can get
 
