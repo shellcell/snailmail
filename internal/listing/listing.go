@@ -229,6 +229,20 @@ func writeArtifacts(document *bytes.Buffer, artifacts []Artifact, endpoint strin
 	// from; a copied relative path would be worse than no button.
 	linkable := endpoint != ""
 
+	// A filter is the difference between a page you scan and a page you search.
+	// Five hundred rows is past what anyone reads down, and the browser's own
+	// find-in-page cannot hide the rows that do not match.
+	//
+	// Rendered before the table and outside it, so a reader with no JavaScript sees
+	// a control that does nothing rather than a table that has lost its header —
+	// which is why the script, not the markup, is what reveals it.
+	document.WriteString("<div class=\"filter\" hidden>\n")
+	document.WriteString("<label class=\"visually-hidden\" for=\"filter\">Filter packages</label>\n")
+	document.WriteString("<input id=\"filter\" type=\"search\" autocomplete=\"off\" " +
+		"placeholder=\"Filter by name, version or architecture\" aria-controls=\"artifacts\">\n")
+	document.WriteString("<p class=\"filter-count\" role=\"status\" aria-live=\"polite\"></p>\n")
+	document.WriteString("</div>\n")
+
 	document.WriteString("<div class=\"table-scroll\">\n<table id=\"artifacts\">\n<thead><tr>")
 	columns := []struct{ label, kind string }{
 		{"Package", "text"}, {"Version", "text"}, {"Arch", "text"},
@@ -237,28 +251,40 @@ func writeArtifacts(document *bytes.Buffer, artifacts []Artifact, endpoint strin
 	for index, column := range columns {
 		// Every column of facts sorts; the ones a reader compares by magnitude
 		// have to sort by their value rather than by the text they are shown as.
-		fmt.Fprintf(document, "<th data-column=\"%d\" data-sort=\"%s\">%s</th>", index, column.kind, column.label)
+		// aria-sort is set by the script, so a screen reader is told what sighted
+		// readers see in the arrow.
+		fmt.Fprintf(document, "<th scope=\"col\" data-column=\"%d\" data-sort=\"%s\">"+
+			"<button type=\"button\" class=\"sort\">%s</button></th>", index, column.kind, column.label)
 	}
-	document.WriteString("<th class=\"plain\">SHA-256</th>")
+	document.WriteString("<th scope=\"col\" class=\"plain\">SHA-256</th>")
 	if linkable {
-		document.WriteString("<th class=\"plain\">Link</th>")
+		document.WriteString("<th scope=\"col\" class=\"plain\">Link</th>")
 	}
 	document.WriteString("</tr></thead>\n<tbody>\n")
 	for _, artifact := range artifacts {
 		document.WriteString("<tr>")
-		fmt.Fprintf(document, "<td><a href=\"%s\">%s</a></td>", escape(artifact.Path), escape(artifact.Name))
-		fmt.Fprintf(document, "<td>%s</td>", escape(artifact.Version))
-		fmt.Fprintf(document, "<td>%s</td>", escape(defaulted(artifact.Architecture, "any")))
-		fmt.Fprintf(document, "<td class=\"size\" data-value=\"%d\">%s</td>", artifact.Size, escape(humanSize(artifact.Size)))
+		// data-label carries each cell's column name so a narrow screen can show
+		// the table as cards without the header row. Hiding columns by position,
+		// which is what this replaced, drops facts a phone reader came for.
+		fmt.Fprintf(document, "<td data-label=\"Package\"><a href=\"%s\">%s</a></td>",
+			escape(artifact.Path), escape(artifact.Name))
+		fmt.Fprintf(document, "<td data-label=\"Version\">%s</td>", escape(artifact.Version))
+		fmt.Fprintf(document, "<td data-label=\"Arch\">%s</td>", escape(defaulted(artifact.Architecture, "any")))
+		fmt.Fprintf(document, "<td class=\"size\" data-label=\"Size\" data-value=\"%d\">%s</td>",
+			artifact.Size, escape(humanSize(artifact.Size)))
 		writePublished(document, artifact.Published)
 		// The digest is shown in full. A truncated one cannot be checked against
 		// anything, which is the only reason to put it on the page at all.
-		fmt.Fprintf(document, "<td class=\"digest\"><code>%s</code>"+
-			"<button class=\"copy\" data-copy=\"%s\">Copy</button></td>",
-			escape(artifact.SHA256), escape(artifact.SHA256))
+		fmt.Fprintf(document, "<td class=\"digest\" data-label=\"SHA-256\"><code>%s</code>"+
+			"<button type=\"button\" class=\"copy\" data-copy=\"%s\" "+
+			"aria-label=\"Copy the SHA-256 of %s\">Copy</button></td>",
+			escape(artifact.SHA256), escape(artifact.SHA256), escape(artifact.Name))
 		if linkable {
-			fmt.Fprintf(document, "<td class=\"link\"><button class=\"copy\" data-copy=\"%s\">Copy link</button></td>",
-				escape(strings.TrimRight(endpoint, "/")+"/"+artifact.Path))
+			fmt.Fprintf(document, "<td class=\"link\" data-label=\"Link\">"+
+				"<button type=\"button\" class=\"copy\" data-copy=\"%s\" "+
+				"aria-label=\"Copy the download URL of %s\">Copy link</button></td>",
+				escape(strings.TrimRight(endpoint, "/")+"/"+artifact.Path),
+				escape(artifact.Name))
 		}
 		document.WriteString("</tr>\n")
 	}
@@ -269,10 +295,11 @@ func writeArtifacts(document *bytes.Buffer, artifacts []Artifact, endpoint strin
 // column orders correctly however it is formatted.
 func writePublished(document *bytes.Buffer, published time.Time) {
 	if published.IsZero() {
-		document.WriteString("<td class=\"when\" data-value=\"0\"><span class=\"unknown\">unknown</span></td>")
+		document.WriteString("<td class=\"when\" data-label=\"Published\" data-value=\"0\">" +
+			"<span class=\"unknown\">unknown</span></td>")
 		return
 	}
-	fmt.Fprintf(document, "<td class=\"when\" data-value=\"%d\"><time datetime=\"%s\">%s</time></td>",
+	fmt.Fprintf(document, "<td class=\"when\" data-label=\"Published\" data-value=\"%d\"><time datetime=\"%s\">%s</time></td>",
 		published.Unix(),
 		escape(published.UTC().Format(time.RFC3339)),
 		escape(published.UTC().Format("2006-01-02")))

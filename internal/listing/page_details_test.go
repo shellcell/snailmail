@@ -17,8 +17,13 @@ func TestDigestIsShownInFull(t *testing.T) {
 	if !strings.Contains(rendered, "<code>"+strings.Repeat("a", 64)+"</code>") {
 		t.Fatal("the full digest is not shown")
 	}
-	if !strings.Contains(rendered, `data-copy="`+strings.Repeat("a", 64)+`">Copy</button>`) {
-		t.Fatal("the digest has no labelled copy button")
+	// Asserted as "a copy button carrying the whole digest" rather than as an exact
+	// run of markup, so adding an attribute to the button is not a test failure.
+	if !strings.Contains(rendered, `data-copy="`+strings.Repeat("a", 64)+`"`) {
+		t.Fatal("the digest has no copy button carrying it")
+	}
+	if !strings.Contains(rendered, ">Copy</button>") {
+		t.Fatal("the digest copy button has no label")
 	}
 }
 
@@ -49,11 +54,15 @@ func TestPublishedDateIsPerArtifact(t *testing.T) {
 // copied relative path would send someone nowhere.
 func TestCopyLinkNeedsAnEndpoint(t *testing.T) {
 	page := samplePage()
-	if !strings.Contains(string(Render(page)), `data-copy="https://dl.example/releases/a/1.0.0/a.tar.gz">Copy link</button>`) {
+	rendered := string(Render(page))
+	if !strings.Contains(rendered, `data-copy="https://dl.example/releases/a/1.0.0/a.tar.gz"`) {
 		t.Fatal("no absolute link is offered for a repository that knows its URL")
 	}
+	if !strings.Contains(rendered, ">Copy link</button>") {
+		t.Fatal("the link copy button has no label")
+	}
 	page.Endpoint = ""
-	rendered := string(Render(page))
+	rendered = string(Render(page))
 	if strings.Contains(rendered, "Copy link") {
 		t.Fatal("a link was offered for a repository with no URL to build one from")
 	}
