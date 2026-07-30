@@ -568,3 +568,40 @@ func formatMaximum(format string) (int64, error) {
 	}
 	return selected.MaxArtifactSize(), nil
 }
+
+// InspectArtifactFile reads an artifact's facts and digests from a file.
+//
+// The same work InspectArtifactBytes does, without the artifact being in memory.
+// It costs nothing to support: the format inspectors already take an io.ReaderAt,
+// which an *os.File satisfies, so only the digesting had to change — and that is a
+// streaming operation that was reading from a slice for no reason.
+func InspectArtifactFile(format, filename string, file *os.File, size int64, supplied formats.Identity) (domain.Blob, error) {
+	if filename == "" || filepath.Base(filename) != filename || strings.ContainsAny(filename, "\x00\r\n/\\") {
+		return domain.Blob{}, errors.New("artifact filename is unsafe")
+	}
+	maximum, err := formatMaximum(format)
+	if err != nil {
+		return domain.Blob{}, err
+	}
+	if size > maximum {
+		return domain.Blob{}, errors.New("artifact exceeds format size limit")
+	}
+	facts, err := inspect(format, filename, file, size, supplied)
+	if err != nil {
+		return domain.Blob{}, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return domain.Blob{}, err
+	}
+	// The same rule the other paths use, so an artifact adopted and the same
+	// artifact added agree about what the lock records for it.
+	legacy := newLegacyDigests(format, LockedBlob{})
+	sha256Hash := sha256.New()
+	if _, err := io.Copy(legacy.writers(sha256Hash), file); err != nil {
+		return domain.Blob{}, err
+	}
+	return domain.Blob{
+		Filename: filename, Size: size, MD5: legacy.md5Hex(), SHA1: legacy.sha1Hex(),
+		SHA256: hex.EncodeToString(sha256Hash.Sum(nil)), Facts: facts,
+	}, nil
+}

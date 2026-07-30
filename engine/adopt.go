@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,22 +21,20 @@ import (
 	"github.com/shellcell/snailmail/source"
 )
 
-// DefaultMaxArtifactBytes bounds a single fetched artifact, which is held whole in
-// memory while it is hashed and inspected.
+// DefaultMaxArtifactBytes bounds a single fetched artifact.
 //
-// It is a memory bound rather than a policy about package size, and until adoption
-// streams it cannot be otherwise. That distinction matters because real packages
-// exceed it: 0ad-data in Debian bookworm is over 128 MiB, so importing that suite
-// skips it. A constant would make such a package unadoptable at any setting, which
-// is a refusal an operator cannot act on.
-const DefaultMaxArtifactBytes = 128 << 20
+// It used to be 128 MiB because the artifact was held whole in memory, which made
+// it a memory limit wearing the costume of a policy about package size — and real
+// packages exceeded it. 0ad-data in Debian bookworm is over 128 MiB, so importing
+// that suite skipped it.
+//
+// Adoption now spools to a file, so the cost of a large artifact is disk and time
+// rather than resident memory, and the limit can reflect what it is actually for:
+// stopping a server from handing over something absurd, not stopping a legitimate
+// package from being adopted. Two gigabytes is past every package in the
+// distributions this reads and still bounded.
+const DefaultMaxArtifactBytes = 2 << 30
 
-// MaxArtifactBytesEnvironment raises or lowers the limit for one invocation.
-//
-// The same escape hatch the lock limit has, for the same reason: someone who has
-// read the message and knows their machine can hold a larger artifact should be
-// able to proceed. Raising it costs memory proportional to the largest artifact,
-// which is the trade being made explicit rather than hidden.
 const MaxArtifactBytesEnvironment = "SNAILMAIL_MAX_ARTIFACT_BYTES"
 
 // maximumArtifactBytes is the limit in force. A value that is not a positive number
@@ -144,7 +143,21 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	repository, lock, ledger := session.repository, &session.lock, session.ledger
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
-	response, err := request.Fetcher.Fetch(ctx, originURL.String(), maximumArtifactBytes())
+	// Spooled to a file rather than held in memory. The artifact is going to disk
+	// anyway — it is hashed, inspected and then stored content-addressed — so
+	// accumulating it first bought nothing and made the size limit a memory limit.
+	temporaryDirectory, err := os.MkdirTemp("", ".snailmail-adopt-*")
+	if err != nil {
+		return AdoptArtifactResult{}, err
+	}
+	defer os.RemoveAll(temporaryDirectory)
+	temporaryName := filepath.Join(temporaryDirectory, filename)
+	spooled, err := os.OpenFile(temporaryName, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return AdoptArtifactResult{}, err
+	}
+	defer spooled.Close()
+	response, err := fetchArtifact(ctx, request.Fetcher, originURL.String(), spooled)
 	if err != nil {
 		if errors.Is(err, source.ErrLimit) {
 			// Naming the remedy, because the alternative reads as "this package is
@@ -167,16 +180,19 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 			return AdoptArtifactResult{}, errors.New("adopt fetcher returned an unsafe final URL")
 		}
 	}
-	actualDigest := sha256.Sum256(response.Body)
+	if _, err := spooled.Seek(0, io.SeekStart); err != nil {
+		return AdoptArtifactResult{}, err
+	}
+	blob, err := state.InspectArtifactFile(repository.Format, filename, spooled, response.Size,
+		adoptIdentity(repository.Format, request))
+	if err != nil {
+		return AdoptArtifactResult{}, err
+	}
 	// When computing, there is nothing to compare against: the digest recorded is of
 	// the bytes that arrived, which is exactly what ProvenanceComputed says and no
 	// more. Everywhere else the stated digest is the gate.
-	if !computing && hex.EncodeToString(actualDigest[:]) != request.SHA256 {
+	if !computing && blob.SHA256 != request.SHA256 {
 		return AdoptArtifactResult{}, errors.New("adopted artifact does not match the required SHA-256")
-	}
-	blob, err := state.InspectArtifactBytes(repository.Format, filename, response.Body, adoptIdentity(repository.Format, request))
-	if err != nil {
-		return AdoptArtifactResult{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return AdoptArtifactResult{}, err
@@ -224,15 +240,6 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	if err := ctx.Err(); err != nil {
 		return AdoptArtifactResult{}, err
 	}
-	temporaryDirectory, err := os.MkdirTemp("", ".snailmail-adopt-*")
-	if err != nil {
-		return AdoptArtifactResult{}, err
-	}
-	defer os.RemoveAll(temporaryDirectory)
-	temporaryName := filepath.Join(temporaryDirectory, filename)
-	if err := os.WriteFile(temporaryName, response.Body, 0o600); err != nil {
-		return AdoptArtifactResult{}, err
-	}
 	stored, err := state.PutArtifact(root, repository.Format, temporaryName, adoptIdentity(repository.Format, request))
 	if err != nil {
 		return AdoptArtifactResult{}, err
@@ -265,6 +272,32 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 // What the operator typed is passed through unfiltered so a format that reads
 // identity from the bytes rejects it. Filtering here would silently discard the
 // flags instead, leaving an operator believing they had renamed an artifact.
+// fetchArtifact writes an artifact to dst, streaming when the fetcher can.
+//
+// The capability is optional and discovered by type assertion, the way a host's
+// collector is, so a fetcher that only returns bytes keeps working — every test
+// fake in this repository is one. The fallback still writes to dst, so everything
+// downstream reads from the file either way and there is one path to maintain.
+func fetchArtifact(ctx context.Context, fetcher source.Fetcher, address string, dst *os.File) (source.Response, error) {
+	limit := maximumArtifactBytes()
+	if streaming, ok := fetcher.(source.StreamingFetcher); ok {
+		return streaming.FetchTo(ctx, address, limit, dst)
+	}
+	response, err := fetcher.Fetch(ctx, address, limit)
+	if err != nil {
+		return response, err
+	}
+	if response.StatusCode != http.StatusOK {
+		return response, nil
+	}
+	if _, err := dst.Write(response.Body); err != nil {
+		return source.Response{}, err
+	}
+	response.Size = int64(len(response.Body))
+	response.Body = nil
+	return response, nil
+}
+
 func adoptIdentity(_ string, request AdoptArtifactRequest) formats.Identity {
 	return formats.Identity{Name: request.Name, Version: request.Version}
 }

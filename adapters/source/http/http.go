@@ -46,7 +46,20 @@ func New() *Fetcher {
 	return fetcher
 }
 
+// FetchTo writes the body to dst rather than returning it, so a large artifact is
+// never held in memory. The limit is enforced while copying.
+func (fetcher *Fetcher) FetchTo(ctx context.Context, rawURL string, maximum int64, dst io.Writer) (source.Response, error) {
+	return fetcher.fetch(ctx, rawURL, maximum, dst)
+}
+
 func (fetcher *Fetcher) Fetch(ctx context.Context, rawURL string, maximum int64) (source.Response, error) {
+	return fetcher.fetch(ctx, rawURL, maximum, nil)
+}
+
+// fetch is both paths. When dst is nil the body is returned in the response, which
+// is what every caller reading an index wants; when it is not, the body is streamed
+// to it and never accumulated.
+func (fetcher *Fetcher) fetch(ctx context.Context, rawURL string, maximum int64, dst io.Writer) (source.Response, error) {
 	if maximum <= 0 {
 		return source.Response{}, errors.New("response size limit must be positive")
 	}
@@ -84,6 +97,19 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, rawURL string, maximum int64)
 	if response.ContentLength > maximum {
 		return source.Response{}, fmt.Errorf("%w: maximum is %d bytes", source.ErrLimit, maximum)
 	}
+	if dst != nil {
+		// One byte past the limit so an oversized body is detected rather than
+		// silently truncated into something that parses.
+		written, err := io.Copy(dst, io.LimitReader(response.Body, maximum+1))
+		if err != nil {
+			return source.Response{}, err
+		}
+		if written > maximum {
+			return source.Response{}, fmt.Errorf("%w: maximum is %d bytes", source.ErrLimit, maximum)
+		}
+		result.Size = written
+		return result, nil
+	}
 	content, err := io.ReadAll(io.LimitReader(response.Body, maximum+1))
 	if err != nil {
 		return source.Response{}, err
@@ -92,6 +118,7 @@ func (fetcher *Fetcher) Fetch(ctx context.Context, rawURL string, maximum int64)
 		return source.Response{}, fmt.Errorf("%w: maximum is %d bytes", source.ErrLimit, maximum)
 	}
 	result.Body = content
+	result.Size = int64(len(content))
 	return result, nil
 }
 

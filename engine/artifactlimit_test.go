@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// The limit is a memory bound, not a statement about how large a package may be —
-// and real packages exceed it. 0ad-data in Debian bookworm is over 128 MiB, so a
-// constant would make it unadoptable at any setting.
+// The limit stops a server handing over something absurd; it is no longer a memory
+// bound, because adoption spools to a file. It stays liftable for the same reason
+// the lock limit is: someone who has read the message should be able to proceed.
 func TestTheArtifactLimitCanBeRaised(t *testing.T) {
 	if maximumArtifactBytes() != DefaultMaxArtifactBytes {
 		t.Fatalf("default is %d", maximumArtifactBytes())

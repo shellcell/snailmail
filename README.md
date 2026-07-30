@@ -251,9 +251,11 @@ explicitly selected artifact in an existing owned repository. The lowercase
 SHA-256 pin is mandatory; `--public-origin` confirms that the complete requested
 URL is non-secret and may be committed and printed. Lock schema 2 retains that
 URL, plans display every visible adopted acquisition, and `--dry-run` validates
-up to 128 MiB without changing CAS or lock state. Adoption currently requires
-the local blob store and does not claim authorship, build provenance, source
-signatures, or historical snailmail publication.
+without changing CAS or lock state. An adopted artifact is streamed to disk rather
+than held in memory, so its size costs disk and time rather than resident memory;
+`SNAILMAIL_MAX_ARTIFACT_BYTES` raises the 2 GiB ceiling that remains. Adoption
+requires the local blob store and does not claim authorship, build provenance,
+source signatures, or historical snailmail publication.
 
 ## Inspecting a workspace
 

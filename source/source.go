@@ -3,6 +3,7 @@ package source
 import (
 	"context"
 	"errors"
+	"io"
 	"net/netip"
 	"net/url"
 	"strings"
@@ -88,9 +89,31 @@ type Response struct {
 	URL         string
 	StatusCode  int
 	ContentType string
-	Body        []byte
+	// Body is the whole response, and is empty when it was streamed to a writer
+	// instead. Size reports how many bytes arrived either way, so a caller that
+	// streamed still knows what it received.
+	Body []byte
+	Size int64
 }
 
 type Fetcher interface {
 	Fetch(context.Context, string, int64) (Response, error)
+}
+
+// StreamingFetcher writes a response body to a writer instead of returning it.
+//
+// Optional, discovered by type assertion the way a host's collector and a format's
+// root rewrite are. A fetcher that does not implement it still works — the caller
+// falls back to Fetch — so every existing implementation and every test fake is
+// unaffected by this existing.
+//
+// It exists because Response.Body is a []byte, which means an adopted artifact is
+// held whole in memory purely to be hashed and then written to disk. Nothing in
+// that sequence needs the bytes at once, and the 128 MiB bound on it is a memory
+// limit wearing the costume of a policy about package size.
+type StreamingFetcher interface {
+	// FetchTo writes the body to dst and returns the response without it. The
+	// limit is enforced while copying, so an oversized body is refused without
+	// having been held.
+	FetchTo(ctx context.Context, url string, maximum int64, dst io.Writer) (Response, error)
 }
