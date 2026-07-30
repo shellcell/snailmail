@@ -18,6 +18,16 @@ VERSION = $(patsubst v%,%,$(STAMP))
 MODULE := github.com/shellcell/snailmail
 LDFLAGS := -s -w -X $(MODULE)/internal/version.stamped=$(STAMP)
 
+# Built without cgo, so every binary is statically linked and runs against any
+# libc. Left to Go's default this varies by the machine that built it: cgo is on
+# for a native build when a C compiler is present and off when cross-compiling.
+# On an amd64 runner that made the amd64 binaries link glibc while the
+# cross-compiled arm64 ones stayed static — so snailmail_0.1.3-r1_x86_64.apk
+# installed on Alpine and then failed with "failed to open elf at
+# /lib64/ld-linux-x86-64.so.2", while the aarch64 package worked. Exported, so
+# it covers every go build here rather than the ones remembered.
+export CGO_ENABLED := 0
+
 DIST := dist
 BUILD := build
 
@@ -72,7 +82,10 @@ lint-workflows: ## Lint the GitHub workflows, including their shell
 # ---------------------------------------------------------------- release
 
 .PHONY: release
-release: require-version binaries packages checksums ## Build every release artifact
+# verify-packages is part of building a release, not a step a workflow remembers
+# to add. v0.1.3 shipped an apk that could not run because the only check that
+# ran the binary ran it on the build machine, which is not where it fails.
+release: require-version binaries packages verify-packages checksums ## Build and verify every release artifact
 
 .PHONY: require-version
 require-version:
@@ -111,6 +124,44 @@ packages: require-version ## Debian, RPM and Alpine packages
 				$(NFPM) package --config nfpm.yaml --packager $$packager --target $(DIST)/ >/dev/null; \
 		done; \
 	done
+
+# Distributions the packages are installed into for verification. Installing is
+# not evidence that a package works: the broken apk installed cleanly and
+# reported the right version to "apk info -v", and only running the binary showed
+# that it could not start.
+DEB_IMAGE ?= debian:bookworm-slim
+RPM_IMAGE ?= fedora:41
+APK_IMAGE ?= alpine:3.21
+
+.PHONY: verify-packages
+verify-packages: ## Install every built package in its distribution and run it
+	@command -v docker >/dev/null || { echo "docker is needed to install the packages" >&2; exit 1; }
+	@run_package() { \
+	    arch=$$1; image=$$2; package=$$3; install=$$4; \
+	    echo "  $$arch $$image $$(basename "$$package")"; \
+	    test -f "$$package" || { echo "missing $$package" >&2; exit 1; }; \
+	    target=/tmp/$$(basename "$$package"); \
+	    reported=$$(docker run --rm --platform "linux/$$arch" \
+	        -v "$$PWD/$$package:$$target:ro" "$$image" \
+	        sh -c "$$install $$target >/dev/null 2>&1 && snailmail version --json" 2>&1) || { \
+	        echo "$$reported" >&2; \
+	        echo "snailmail does not run after installing $$package on $$image" >&2; \
+	        exit 1; }; \
+	    case "$$reported" in *'"$(VERSION)"'*) return 0 ;; esac; \
+	    echo "installed $$package reports $$reported, want $(VERSION)" >&2; \
+	    exit 1; \
+	}; \
+	for arch in $(PACKAGE_ARCHES); do \
+	    case $$arch in \
+	        amd64) rpmarch=x86_64; apkarch=x86_64 ;; \
+	        arm64) rpmarch=aarch64; apkarch=aarch64 ;; \
+	        *) echo "no distribution images known for $$arch" >&2; exit 1 ;; \
+	    esac; \
+	    run_package "$$arch" "$(DEB_IMAGE)" "$(DIST)/snailmail_$(VERSION)-1_$${arch}.deb" "dpkg -i"; \
+	    run_package "$$arch" "$(RPM_IMAGE)" "$(DIST)/snailmail-$(VERSION)-1.$${rpmarch}.rpm" "rpm -i --nodeps"; \
+	    run_package "$$arch" "$(APK_IMAGE)" "$(DIST)/snailmail_$(VERSION)-r1_$${apkarch}.apk" "apk add --allow-untrusted --quiet"; \
+	done
+	@echo "every package installs and runs"
 
 .PHONY: checksums
 checksums: ## Digests for everything built, which is what an adopter pins

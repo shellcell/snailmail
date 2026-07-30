@@ -975,7 +975,13 @@ One thing still to know about hosting:
   therefore means the review gate and a CI template first, with S3 or rsync as
   the host — not a Pages adapter.
 
-Remaining order: a `snailmail ci gitlab` template, then Forgejo/Gitea —
+GitLab is now first-class on both counts: the review gate and the CI template.
+The template is not a translation of the Actions one — a GitLab runner has no
+Docker daemon, its jobs share no filesystem, and Pages serves a job artifact
+rather than a moved ref — so what is shared is the derivation and only the
+rendering differs.
+
+Remaining order: Forgejo/Gitea —
 whose API is GitHub-shaped but whose per-commit pull-request and compare
 endpoints vary by version, so it needs its support floor pinned to a version
 rather than assumed. Bitbucket is last and may stay unsupported: it has no

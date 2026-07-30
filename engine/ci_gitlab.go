@@ -63,9 +63,9 @@ variables:
 
 publish:
   stage: publish
-  # A glibc image rather than Alpine. The released linux_amd64 binary is built
-  # where a C compiler is present, so cgo is enabled and it links against glibc;
-  # on a musl image it would not run at all.
+  # Ubuntu rather than an Alpine image because the job needs git, curl and a
+  # Docker client, which apt installs in one line. The snailmail binary itself is
+  # statically linked, so it would run on either.
   image: ubuntu:24.04
   services:
     - name: docker:29-dind

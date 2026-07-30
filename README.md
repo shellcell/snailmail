@@ -117,6 +117,19 @@ number of published trees that have carried it, and whether the repository still
 serves it; `--withdrawn` includes versions that were published and later yanked
 or pruned, because publication is immutable even when the offer is not.
 
+`snailmail ci github` and `snailmail ci gitlab` emit a pipeline that publishes
+this workspace, to stdout rather than to a file: it carries decisions snailmail
+cannot make — which registry to pull verification images through, which secret
+names a project uses — and a file the tool owned would be rewritten over an
+operator's edits. What it does derive is what the workspace already says: which
+signing keys need materialising, whether a foreign architecture needs emulation,
+and which repositories publish into a directory something else must serve. Both
+providers derive the same facts; only the rendering differs, and it differs more
+than wording. A GitLab runner has no Docker daemon, so client verification needs
+one as a service; its jobs share no filesystem, so what apply builds is declared
+as an artifact; and Pages there serves a job artifact rather than a moved ref, so
+there is no orphan commit.
+
 `snailmail doctor URL` needs no workspace and inspects a public HTTPS PyPI,
 Debian, or Helm repository. It parses bounded native indexes, follows at most the
 configured artifact limit, and checks referenced availability, size, SHA-256,

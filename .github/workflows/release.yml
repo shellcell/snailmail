@@ -49,6 +49,12 @@ jobs:
       # built here is built the same way as one built by hand. nfpm renders
       # deb, rpm and apk in pure Go, which is why no packaging toolchain or
       # container is installed for it.
+      # make release installs every package in its own distribution and runs it,
+      # and the arm64 containers cannot execute on an amd64 runner without
+      # emulation registered for them.
+      - name: Register emulation for the arm64 package checks
+        run: docker run --rm --privileged multiarch/qemu-user-static --reset -p yes >/dev/null
+
       - name: Build the release
         run: make release
 
