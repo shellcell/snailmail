@@ -370,6 +370,21 @@ leaves unreachable objects to git.
 Collection is the one operation that needs `s3:ListBucket`, so it may run under a
 different credential from publishing.
 
+Two things accumulate, and they are collected together. Release directories are
+one; the other only exists for helm and unsigned rpm, which write their artifacts
+at the paths clients fetch them from rather than inside a release directory —
+because `index.yaml` and `repomd.xml` name those paths, and rewriting a signed rpm
+would invalidate it. A chart dropped from the workspace a year ago is still a
+billable object that no release collection has ever touched. `collect` now removes
+those too, keeping every file that any surviving revision publishes.
+
+Two revisions are always protected: the live one and the one its restore rolls
+back to. So the first collectable revision is the live one's grandparent, which is
+worth knowing before reading a `--dry-run` and concluding it reclaims less than
+expected. If a surviving revision's release descriptor cannot be read, the whole
+collection is refused rather than run against an unknown reference set — deleting
+too little costs storage, deleting too much costs the repository.
+
 ## Inspecting someone else's repository
 
 `snailmail doctor URL` needs no workspace and inspects a public HTTPS PyPI,
