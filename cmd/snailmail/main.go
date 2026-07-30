@@ -62,6 +62,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runStatus(ctx, args[1:], stdout, stderr)
 	case "site":
 		return runSite(ctx, args[1:], stdout, stderr)
+	case "rollout":
+		return runRollout(ctx, args[1:], stdout, stderr)
 	case "doctor":
 		return runDoctor(ctx, args[1:], stdout, stderr)
 	case "adopt":
@@ -539,6 +541,43 @@ func runSite(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	printBrand(stdout)
 	fmt.Fprintf(stdout, "📦  wrote %s: %d packages across %d repositories\n",
 		result.Path, result.Packages, result.Repositories)
+	return nil
+}
+
+func runRollout(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := newCommandFlags("rollout", stderr).withWorkspace().withJSON()
+	repository := flags.String("repo", "", "report one repository")
+	pkg := flags.String("package", "", "report one package")
+	withdrawn := flags.Bool("withdrawn", false, "include versions no longer served")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: snailmail rollout [--workspace DIR] [--repo NAME] [--package NAME] [--withdrawn] [--json]")
+	}
+	result, err := engine.RolloutWorkspace(ctx, engine.RolloutWorkspaceRequest{
+		Root: flags.Root(), Repository: *repository, Package: *pkg, IncludeWithdrawn: *withdrawn,
+	})
+	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
+	printBrand(stdout)
+	fmt.Fprintf(stdout, "📦  workspace %s at %s\n", result.Workspace, result.GitRevision)
+	for _, release := range result.Releases {
+		note := fmt.Sprintf(", in %d published %s", release.Publications,
+			plural(release.Publications, "tree", "trees"))
+		if !release.Served {
+			note += ", no longer served"
+		}
+		fmt.Fprintf(stdout, "✉️   %s: %s@%s first published %s%s\n",
+			release.Repository, release.Package, release.Version, release.PublishedAt, note)
+	}
+	if len(result.Releases) == 0 {
+		fmt.Fprintln(stdout, "✉️   nothing has been published from this workspace")
+	}
 	return nil
 }
 
@@ -1275,7 +1314,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR")
-	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]")
+	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]")
 	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")

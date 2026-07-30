@@ -109,6 +109,14 @@ receipt is recorded; `--json` emits the same deterministic schema for
 automation. A receipt is evidence of a prior successful apply, not proof that a
 host currently serves those bytes.
 
+`snailmail rollout` answers when each version reached a client, derived from the
+publication ledger rather than stored anywhere. The ledger already records one
+append-only entry per publication, so the date is read back rather than kept a
+second time. A version is listed with the date it was first published, the
+number of published trees that have carried it, and whether the repository still
+serves it; `--withdrawn` includes versions that were published and later yanked
+or pruned, because publication is immutable even when the offer is not.
+
 `snailmail doctor URL` needs no workspace and inspects a public HTTPS PyPI,
 Debian, or Helm repository. It parses bounded native indexes, follows at most the
 configured artifact limit, and checks referenced availability, size, SHA-256,
