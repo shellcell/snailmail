@@ -3,22 +3,14 @@
 package githubforge
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os/exec"
 	"strings"
 
+	"github.com/shellcell/snailmail/adapters/forge/cliforge"
 	"github.com/shellcell/snailmail/forge"
 )
-
-// maxResponseSize bounds a provider response. Review metadata is small, and an
-// unbounded read would let a compromised or misconfigured endpoint exhaust
-// memory during the one step that authorizes publication.
-const maxResponseSize = 4 << 20
 
 // Adapter reads GitHub review evidence.
 type Adapter struct {
@@ -96,24 +88,12 @@ func (adapter *Adapter) RevisionAncestry(ctx context.Context, repository forge.R
 
 func (adapter *Adapter) api(ctx context.Context, repository forge.Repository, target any, endpoint string, extra ...string) error {
 	arguments := append([]string{"api", "--hostname", adapter.hostname}, extra...)
-	command := exec.CommandContext(ctx, "gh", append(arguments, endpoint)...)
-	command.Dir = repository.WorkingDirectory
-	output, err := command.Output()
-	if err != nil {
-		return fmt.Errorf("%w: gh api %s", forge.ErrUnavailable, endpoint)
-	}
-	if len(output) > maxResponseSize {
-		return fmt.Errorf("%w: response from %s exceeds the read limit", forge.ErrUnavailable, endpoint)
-	}
-	decoder := json.NewDecoder(bytes.NewReader(output))
-	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("%w: invalid response from %s", forge.ErrUnavailable, endpoint)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("%w: trailing data in response from %s", forge.ErrUnavailable, endpoint)
-	}
-	return nil
+	return cliforge.ReadJSON(ctx, cliforge.Request{
+		Binary:           "gh",
+		Arguments:        append(arguments, endpoint),
+		WorkingDirectory: repository.WorkingDirectory,
+		Endpoint:         endpoint,
+	}, target)
 }
 
 // Resolver selects this adapter for every repository.

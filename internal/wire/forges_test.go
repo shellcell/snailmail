@@ -28,19 +28,62 @@ func TestAnUndeclaredForgeIsStillGitHub(t *testing.T) {
 func TestAGitLabReferenceIsNoLongerQueriedAgainstGitHub(t *testing.T) {
 	selected, err := NewForgeResolver().Resolve(context.Background(),
 		forge.Repository{Name: "acme/tools", Provider: forge.ProviderGitLab})
-	if err == nil {
-		t.Fatalf("a GitLab repository resolved to %q", selected.Name())
+	if err != nil {
+		t.Fatalf("a GitLab repository failed to resolve: %v", err)
 	}
-	// The error has to distinguish "not implemented" from "unreachable", or it
-	// sends an operator to look at credentials and networking for a missing
-	// adapter.
-	if !strings.Contains(err.Error(), "recognised") || !strings.Contains(err.Error(), "gitlab") {
-		t.Errorf("error = %v, want a recognised-but-unimplemented forge named", err)
+	if selected.Name() != forge.ProviderGitLab {
+		t.Errorf("resolved %q, want gitlab", selected.Name())
 	}
-	// And it has to say what to do instead, since the workspace is otherwise
-	// stuck with a gate it cannot satisfy.
-	if !strings.Contains(err.Error(), "approval") {
-		t.Errorf("error = %v, want the usable gates suggested", err)
+}
+
+// A self-hosted GitLab is reached by hostname, and gitlab.com must still resolve
+// to the shared adapter rather than a second one built per call.
+func TestASelfHostedGitLabReachesTheAdapter(t *testing.T) {
+	shared := NewForgeResolver()
+	selected, err := shared.Resolve(context.Background(),
+		forge.Repository{Name: "acme/state", Provider: forge.ProviderGitLab, Host: "git.acme.example"})
+	if err != nil {
+		t.Fatalf("a self-hosted GitLab was refused: %v", err)
+	}
+	if selected.Name() != forge.ProviderGitLab {
+		t.Errorf("resolved %q, want gitlab", selected.Name())
+	}
+	explicit, err := shared.Resolve(context.Background(),
+		forge.Repository{Name: "acme/state", Provider: forge.ProviderGitLab, Host: "gitlab.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	implicit, err := shared.Resolve(context.Background(),
+		forge.Repository{Name: "acme/state", Provider: forge.ProviderGitLab})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicit != implicit {
+		t.Error("naming gitlab.com explicitly built a different adapter than omitting it")
+	}
+	if _, err := shared.Resolve(context.Background(), forge.Repository{
+		Name: "acme/state", Provider: forge.ProviderGitLab, Host: "git acme/api"}); err == nil {
+		t.Error("an unusable GitLab hostname was accepted")
+	}
+}
+
+// Forgejo and Gitea are recognised and not yet implemented, which is a different
+// failure from unreadable and has to be reported as one.
+func TestARecognisedForgeWithNoAdapterSaysSo(t *testing.T) {
+	for _, provider := range []string{forge.ProviderForgejo, forge.ProviderGitea} {
+		_, err := NewForgeResolver().Resolve(context.Background(),
+			forge.Repository{Name: "acme/state", Provider: provider, Host: "git.acme.example"})
+		if err == nil {
+			t.Fatalf("%s resolved to an adapter that does not exist", provider)
+		}
+		if !strings.Contains(err.Error(), "recognised") || !strings.Contains(err.Error(), provider) {
+			t.Errorf("error = %v, want %s reported as recognised but unimplemented", err, provider)
+		}
+		// And it has to say what to do instead, since the workspace is otherwise
+		// stuck with a gate it cannot satisfy.
+		if !strings.Contains(err.Error(), "approval") {
+			t.Errorf("error = %v, want the usable gates suggested", err)
+		}
 	}
 }
 

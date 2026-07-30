@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	githubforge "github.com/shellcell/snailmail/adapters/forge/github"
+	gitlabforge "github.com/shellcell/snailmail/adapters/forge/gitlab"
 	plainforge "github.com/shellcell/snailmail/adapters/forge/plain"
 	"github.com/shellcell/snailmail/forge"
 )
@@ -20,11 +21,12 @@ import (
 // unimplemented one are different errors.
 type ForgeResolver struct {
 	github *githubforge.Adapter
+	gitlab *gitlabforge.Adapter
 	plain  *plainforge.Adapter
 }
 
 func NewForgeResolver() *ForgeResolver {
-	return &ForgeResolver{github: githubforge.New(), plain: plainforge.New()}
+	return &ForgeResolver{github: githubforge.New(), gitlab: gitlabforge.New(), plain: plainforge.New()}
 }
 
 func (resolver *ForgeResolver) Resolve(_ context.Context, repository forge.Repository) (forge.Forge, error) {
@@ -47,6 +49,15 @@ func (resolver *ForgeResolver) Resolve(_ context.Context, repository forge.Repos
 			return adapter, nil
 		}
 		return resolver.github, nil
+	case forge.ProviderGitLab:
+		if host := repository.Host; host != "" && host != forge.DefaultHost(forge.ProviderGitLab) {
+			adapter, err := gitlabforge.NewForHost(host)
+			if err != nil {
+				return nil, err
+			}
+			return adapter, nil
+		}
+		return resolver.gitlab, nil
 	case forge.ProviderNone:
 		return resolver.plain, nil
 	}

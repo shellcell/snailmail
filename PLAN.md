@@ -937,31 +937,37 @@ cannot tell.
 one and it is done: `forge.Forge` asks three read-only questions — default
 branch, which pull requests contain a revision, is that revision an ancestor of
 the branch — and nothing in it writes, because review evidence is observed
-rather than produced. A GitLab merge request answers all three (`GET
-/projects/:id` for the branch, `.../repository/commits/:sha/merge_requests` for
-the reviews, `.../repository/merge_base` for the ancestry, which is a more direct
-answer than GitHub's comparison status). That the port needed no change to
-accommodate a second provider is the evidence that it is drawn in the right
-place.
+rather than produced. GitLab is now implemented against it and the port
+needed no change, which is the evidence it is drawn in the right place.
 
 First-class is defined by `forge/forgetest`, the conformance suite an adapter has
 to pass: it reads a default branch, refuses a provider answering about a
 different repository, distinguishes closed from merged, reads containment and
 merge base separately, reports no review as none rather than as an error, and
-renders every unreachable read as `ErrUnavailable`. The GitHub adapter passes it
-and the plain adapter deliberately fails it, answering nothing — both at 100%
+renders every unreachable read as `ErrUnavailable`. GitHub and GitLab pass it;
+the plain adapter deliberately fails it, answering nothing. All three are at 100%
 statement coverage, from nothing.
 
-Two things block a second forge, and neither is the port:
+GitLab answers the three questions more directly than GitHub does.
+`repository/merge_base` returns the common ancestor itself, so containment and
+merge base come from one read rather than from a comparison status that has to be
+interpreted — there is no equivalent of deciding what "ahead" means. Two
+differences matter: a project is addressed by its whole path URL-encoded, because
+groups nest; and a merge request carries a per-project `iid` alongside a global
+`id`, so reporting the wrong one names a review nobody can find. Both are pinned
+by tests, and the mapping was checked against gitlab.com rather than trusted —
+the live `iid` was 7077 where the `id` was 513198007.
 
-- **Resolution is name-shaped, not remote-shaped.** `internal/wire.ForgeResolver`
-  treats every `owner/name` as github.com, so a GitLab `group/project` is queried
-  against GitHub. It is not exploitable — a revision is a SHA and cannot collide
-  across providers, so the gate refuses — but it refuses with the wrong reason,
-  and no configuration can make it right. The manifest has to be able to name the
-  provider and its hostname, which is also what GitHub Enterprise needs: the
-  adapter already takes a hostname that nothing can set. Detecting from the git
-  remote, per the paragraph above, is the inference; the manifest is the record.
+The manifest now names its forge and hostname rather than the resolver inferring
+one from the reference's shape, which had made every `owner/name` github.com.
+Omitting it means github.com, so existing workspaces are unchanged. A recognised
+provider with no adapter — Forgejo, Gitea — is a loud error naming the gates that
+do work, because that is a different failure from review evidence being
+unreadable and sending an operator to check credentials for missing code wastes
+their time.
+
+One thing still to know about hosting:
+
 - **GitLab Pages is not a variant of the Pages host.** GitHub Pages is atomic
   because a revision goes live by moving a ref to an orphan commit of the whole
   tree. GitLab Pages publishes a job artifact, so that mechanism does not
@@ -969,8 +975,7 @@ Two things block a second forge, and neither is the port:
   therefore means the review gate and a CI template first, with S3 or rsync as
   the host — not a Pages adapter.
 
-Order: the manifest's forge declaration, then GitLab's gate adapter against the
-conformance suite, then a `snailmail ci gitlab` template, then Forgejo/Gitea —
+Remaining order: a `snailmail ci gitlab` template, then Forgejo/Gitea —
 whose API is GitHub-shaped but whose per-commit pull-request and compare
 endpoints vary by version, so it needs its support floor pinned to a version
 rather than assumed. Bitbucket is last and may stay unsupported: it has no
