@@ -67,6 +67,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runRollout(ctx, args[1:], stdout, stderr)
 	case "collect":
 		return runCollect(ctx, args[1:], stdout, stderr)
+	case "import":
+		return runImport(ctx, args[1:], stdout, stderr)
 	case "ci":
 		return runCI(ctx, args[1:], stdout, stderr)
 	case "doctor":
@@ -1393,7 +1395,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR")
-	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail collect [--repo NAME] [--keep N] [--yes]\n  snailmail ci <github|gitlab> [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
+	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail collect [--repo NAME] [--keep N] [--yes]\n  snailmail import --project NAME --public-origin [--dry-run --limit N] REPOSITORY URL\n  snailmail ci <github|gitlab> [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
 	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
@@ -1629,4 +1631,53 @@ func suggestNext(stdout io.Writer, flags *commandFlags, command, purpose string)
 		return
 	}
 	fmt.Fprintf(stdout, "→   next: %s   (%s)\n", command, purpose)
+}
+
+func runImport(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := newCommandFlags("import", stderr).withWorkspace().withJSON()
+	project := flags.String("project", "", "PyPI project to read")
+	track := flags.String("track", "", "track to place imported versions on")
+	distro := flags.String("distro", "", "distribution to place imported versions on")
+	limit := flags.Int("limit", 0, "import at most this many artifacts")
+	dryRun := flags.Bool("dry-run", false, "report what would be imported without recording it")
+	publicOrigin := flags.Bool("public-origin", false,
+		"confirm the recorded origin URLs are public and contain no secrets")
+	positional, err := flags.parseWithArguments(args, 2,
+		"usage: snailmail import --project NAME --public-origin [--dry-run --limit N] REPOSITORY URL")
+	if err != nil {
+		return err
+	}
+	result, err := engine.ImportRepository(ctx, engine.ImportRepositoryRequest{
+		Root: flags.Root(), Repository: positional[0], URL: positional[1],
+		Project: *project, Track: *track, Distro: *distro, Limit: *limit,
+		DryRun: *dryRun, PublicOrigin: *publicOrigin, Fetcher: httpsource.New(),
+	})
+	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
+	printBrand(stdout)
+	verb := "imported"
+	if result.DryRun {
+		verb = "would import"
+	}
+	fmt.Fprintf(stdout, "📦  %s %d of %d %s from %s\n", verb, len(result.Imported), result.Listed,
+		plural(result.Listed, "artifact", "artifacts"), result.IndexURL)
+	for _, imported := range result.Imported {
+		fmt.Fprintf(stdout, "✉️   %s@%s sha256:%s\n", imported.Package, imported.Version, imported.SHA256)
+	}
+	// Skipped artifacts are named rather than counted. An import that took nine of
+	// ten and said only "9 imported" would be discovered later, by a client.
+	for _, skipped := range result.Skipped {
+		fmt.Fprintf(stdout, "⚠️   skipped %s: %s\n", skipped.Filename, skipped.Reason)
+	}
+	if result.DryRun && len(result.Imported) != 0 {
+		fmt.Fprintln(stdout, "✉️   nothing was recorded; drop --dry-run to import")
+	} else if len(result.Imported) != 0 {
+		suggestNext(stdout, flags, "git commit -am \"import "+positional[0]+"\" && snailmail plan",
+			"review what was imported as a diff, then publish it")
+	}
+	return nil
 }

@@ -147,6 +147,29 @@ re-fetches explicitly adopted URLs and compares their pinned bytes; default
 checks remain offline from external sources. Origin checks process at most four
 sorted records per run; `--origin-offset` selects subsequent batches.
 
+## Importing an existing repository
+
+Most people arrive with a repository already published somewhere. `import` reads
+its index and records every artifact it names, rather than adopting each by hand:
+
+```sh
+snailmail import --project six --public-origin --dry-run python https://pypi.org/
+snailmail import --project six --public-origin python https://pypi.org/
+```
+
+Each artifact goes through the same path as `adopt`: fetched, checked against the
+digest its index published, and recorded with its origin URL so it can be refetched
+later. Anything the index names but does not publish a SHA-256 for is skipped and
+reported — a locked artifact is pinned to a digest someone stated in advance, and
+one computed from the bytes a download happened to return would prove only that the
+download was self-consistent.
+
+One artifact failing does not abandon the rest, so a repository with a broken file
+imports the other 47 and names the one that failed.
+
+PyPI today. Debian and Helm indexes are already parsed by `doctor`, so those are
+reading work rather than design work.
+
 ## Adopting an artifact from a URL
 
 `snailmail adopt --sha256 HEX --public-origin REPOSITORY URL` records one
