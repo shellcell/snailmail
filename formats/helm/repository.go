@@ -28,11 +28,37 @@ type RepositoryChart struct {
 	Version string
 	Digest  string
 	URLs    []string
+	// Ambiguous marks every entry of a name and version the index lists more than
+	// once. Two entries claiming one identity cannot both be that chart, and a
+	// reader that took either could take the wrong bytes — so this is reported
+	// rather than resolved, and a caller decides.
+	Ambiguous bool
 }
 
+// MaximumIndexBytes bounds a published index this reads.
+//
+// Set from measurement, because the previous 256 KiB refused every real
+// repository: grafana's index.yaml is 4.0 MB and prometheus-community's is 6.2 MB,
+// so a limit meant to bound a hostile response was excluding ordinary ones and
+// neither doctor nor import could read a public Helm repository at all.
+//
+// Stated per format rather than shared, because index shapes differ: a Helm index
+// holds every version of every chart in one document, where a PyPI project page
+// holds one project. One number for both would be false precision.
+const MaximumIndexBytes = 32 << 20
+
+// maximumIndexNodes bounds the YAML tree a repository index may expand into.
+//
+// Measured rather than guessed: grafana's index is 4.0 MB and expands to about
+// 111,000 nodes — roughly one node per 36 bytes — so the previous cap of 10,000
+// refused every real repository long before the byte limit did. This is
+// proportional to the byte limit at that density, with headroom, and still bounds
+// a small document crafted to expand pathologically.
+const maximumIndexNodes = 1_000_000
+
 func ParseRepositoryIndex(content []byte) ([]RepositoryChart, error) {
-	if len(content) > 256<<10 {
-		return nil, errors.New("Helm repository index exceeds 256 KiB")
+	if len(content) > MaximumIndexBytes {
+		return nil, errors.New("Helm repository index exceeds the readable size")
 	}
 	decoder := yaml.NewDecoder(strings.NewReader(string(content)))
 	var root yaml.Node
@@ -57,6 +83,7 @@ func ParseRepositoryIndex(content []byte) ([]RepositoryChart, error) {
 	}
 	var result []RepositoryChart
 	identities := make(map[string]string)
+	ambiguous := make(map[string]bool)
 	for key, versions := range document.Entries {
 		for _, version := range versions {
 			if err := validateChartEntry(key, version); err != nil {
@@ -68,8 +95,13 @@ func ParseRepositoryIndex(content []byte) ([]RepositoryChart, error) {
 				}
 			}
 			identity := key + "\x00" + version.Version
-			if existing := identities[identity]; existing != "" {
-				return nil, errors.New("Helm repository has a duplicate chart version")
+			if _, repeated := identities[identity]; repeated {
+				// Marked, not refused. A production repository can carry a handful of
+				// these — grafana's index lists 3574 chart versions of which 2 are
+				// duplicated — and rejecting the whole document over them made every
+				// real Helm repository unreadable. The ambiguity is a fact about that
+				// repository, so it is reported alongside everything sound.
+				ambiguous[identity] = true
 			}
 			identities[identity] = version.Digest
 			result = append(result, RepositoryChart{Name: key, Version: version.Version, Digest: version.Digest, URLs: append([]string(nil), version.URLs...)})
@@ -78,12 +110,19 @@ func ParseRepositoryIndex(content []byte) ([]RepositoryChart, error) {
 			}
 		}
 	}
+	// Applied afterwards so that every entry of a repeated identity is marked, not
+	// only the ones seen after the first.
+	for index := range result {
+		if ambiguous[result[index].Name+"\x00"+result[index].Version] {
+			result[index].Ambiguous = true
+		}
+	}
 	return result, nil
 }
 
 func validateRepositoryNode(node *yaml.Node, depth int, count *int) error {
 	*count++
-	if depth > 64 || *count > 10000 || node.Kind == yaml.AliasNode || len(node.Value) > 256<<10 {
+	if depth > 64 || *count > maximumIndexNodes || node.Kind == yaml.AliasNode || len(node.Value) > 256<<10 {
 		return errors.New("unsafe Helm repository YAML")
 	}
 	for _, child := range node.Content {

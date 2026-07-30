@@ -30,9 +30,19 @@ type SimpleFile struct {
 	Supported bool
 }
 
+// MaximumIndexBytes bounds a published index this reads.
+//
+// Set from measurement rather than guessed, because the previous 2 MiB refused
+// real repositories: numpy's simple page is 2.2 MB and boto3's is 1.5 MB and
+// growing, so the limit that was meant to bound a hostile response was quietly
+// excluding ordinary ones. 32 MiB leaves room for the largest index observed —
+// prometheus-community's Helm index at 6.2 MB — with headroom, while still
+// refusing a response that could exhaust memory.
+const MaximumIndexBytes = 32 << 20
+
 func ParseSimpleIndex(contentType string, content []byte) ([]SimpleProject, error) {
-	if len(content) > 2<<20 {
-		return nil, errors.New("PyPI project index exceeds 2 MiB")
+	if len(content) > MaximumIndexBytes {
+		return nil, errors.New("PyPI project index exceeds the readable size")
 	}
 	if strings.Contains(strings.ToLower(contentType), "json") || firstNonSpace(content) == '{' {
 		var document struct {
@@ -99,8 +109,8 @@ func ParseSimpleIndex(contentType string, content []byte) ([]SimpleProject, erro
 }
 
 func ParseSimpleProject(contentType string, content []byte) (string, []SimpleFile, error) {
-	if len(content) > 2<<20 {
-		return "", nil, errors.New("PyPI project page exceeds 2 MiB")
+	if len(content) > MaximumIndexBytes {
+		return "", nil, errors.New("PyPI project page exceeds the readable size")
 	}
 	if strings.Contains(strings.ToLower(contentType), "json") || firstNonSpace(content) == '{' {
 		var document struct {

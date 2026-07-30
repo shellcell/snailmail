@@ -22,8 +22,11 @@ import (
 )
 
 const (
-	doctorSchemaVersion        = 1
-	maximumIndexBytes          = 2 << 20
+	doctorSchemaVersion = 1
+	// Large enough for a real published index: prometheus-community's Helm index
+	// is 6.2 MB and numpy's PyPI page is 2.2 MB, both of which the previous 2 MiB
+	// refused. Each format parser enforces its own bound on what it will read.
+	maximumIndexBytes          = 32 << 20
 	maximumDoctorArtifactBytes = 128 << 20
 	maximumDoctorRunBytes      = 256 << 20
 	maximumDoctorExpandedBytes = 64 << 20

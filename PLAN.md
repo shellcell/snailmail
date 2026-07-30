@@ -458,7 +458,9 @@ provenance is a field beside the origin, with the levels ordered:
 | `computed` | snailmail hashed what it downloaded | apk, and a last resort |
 | `operator` | a person supplied it to `adopt` | all |
 
-`import` defaults to the strongest level a format supports without extra
+PyPI, Helm and Debian are read today; Debian walks the chain and so records
+`index-chain`, where the other two record `index-stated`. `import` defaults to the
+strongest level a format supports without extra
 configuration — `index-chain` for deb and rpm, `index-stated` for pypi and helm —
 and takes a key to reach `signed-index`. A minimum acceptable level is a flag, so a
 workspace that will not accept unauthenticated bytes can say so once rather than

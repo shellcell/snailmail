@@ -1395,7 +1395,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR")
-	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail collect [--repo NAME] [--keep N] [--yes]\n  snailmail import --project NAME --public-origin [--dry-run --limit N] REPOSITORY URL\n  snailmail ci <github|gitlab> [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
+	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail collect [--repo NAME] [--keep N] [--yes]\n  snailmail import --public-origin [--project NAME|--suite NAME] [--dry-run --limit N] REPOSITORY URL\n  snailmail ci <github|gitlab> [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
 	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
@@ -1636,6 +1636,9 @@ func suggestNext(stdout io.Writer, flags *commandFlags, command, purpose string)
 func runImport(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("import", stderr).withWorkspace().withJSON()
 	project := flags.String("project", "", "PyPI project to read")
+	suite := flags.String("suite", "", "Debian suite to read, such as bookworm")
+	component := flags.String("component", "", "Debian component, defaulting to the first Release names")
+	architecture := flags.String("architecture", "", "Debian architecture, defaulting to the first Release names")
 	track := flags.String("track", "", "track to place imported versions on")
 	distro := flags.String("distro", "", "distribution to place imported versions on")
 	limit := flags.Int("limit", 0, "import at most this many artifacts")
@@ -1649,7 +1652,8 @@ func runImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	}
 	result, err := engine.ImportRepository(ctx, engine.ImportRepositoryRequest{
 		Root: flags.Root(), Repository: positional[0], URL: positional[1],
-		Project: *project, Track: *track, Distro: *distro, Limit: *limit,
+		Project: *project, Suite: *suite, Component: *component, Architecture: *architecture,
+		Track: *track, Distro: *distro, Limit: *limit,
 		DryRun: *dryRun, PublicOrigin: *publicOrigin, Fetcher: httpsource.New(),
 	})
 	if err != nil {

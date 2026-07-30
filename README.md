@@ -180,8 +180,32 @@ download was self-consistent.
 One artifact failing does not abandon the rest, so a repository with a broken file
 imports the other 47 and names the one that failed.
 
-PyPI today. Debian and Helm indexes are already parsed by `doctor`, so those are
-reading work rather than design work.
+PyPI and Helm today. A Helm repository has no per-project page, so importing one
+imports the repository:
+
+```sh
+snailmail import --public-origin --dry-run charts https://grafana.github.io/helm-charts
+```
+
+Where an index lists several mirrors of a chart, the origin recorded is the URL
+that actually served. Where it lists the same name and version twice, both entries
+are skipped and named — two entries claiming one identity cannot both be it, and
+picking one would record bytes nobody chose.
+
+Debian too, which reads a suite rather than a project:
+
+```sh
+snailmail import --public-origin --dry-run --suite bookworm apt https://deb.debian.org/debian
+```
+
+A Debian import walks the chain rather than trusting the leaf: `Release` states the
+digest of `Packages`, and a `Packages` whose bytes disagree is refused outright —
+nothing in an index that failed its own root can be trusted. That is why Debian
+artifacts record `index-chain` where PyPI and Helm record `index-stated`. The
+`Release` signature itself is not verified yet, so the root of trust is still the
+transport, and the lock says exactly that.
+
+yum and Alpine are not read yet.
 
 ## Adopting an artifact from a URL
 

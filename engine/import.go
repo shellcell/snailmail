@@ -4,14 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
+	"strings"
 
+	"github.com/shellcell/snailmail/formats/deb"
+	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
 	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/source"
 )
 
 const importSchemaVersion = 1
+
+// maximumPackagesBytes bounds a Debian Packages index, which is far larger than
+// the other formats' indexes: Debian main for one architecture is tens of
+// megabytes uncompressed. doctor already reads it at this size.
+const maximumPackagesBytes = 64 << 20
 
 // ImportRepositoryRequest reads a published repository into a workspace.
 type ImportRepositoryRequest struct {
@@ -21,6 +30,12 @@ type ImportRepositoryRequest struct {
 	Repository string
 	// URL is the published repository to read.
 	URL string
+	// Suite, Component and Architecture select which Debian index to read. Each
+	// defaults to what the repository's Release names first, which is what apt
+	// would pick given the same URL.
+	Suite        string
+	Component    string
+	Architecture string
 	// Project narrows a PyPI import to one project. A simple index lists projects
 	// and not their files, so importing every project means a request per project;
 	// this imports one at a time, which is also how someone adopting a repository
@@ -56,6 +71,34 @@ type ImportArtifact struct {
 	Filename string `json:"filename"`
 	SHA256   string `json:"sha256"`
 	Origin   string `json:"origin_url"`
+}
+
+// importableFile is one artifact an index names, in the terms every format can
+// state: where it is, what its digest is said to be, and what it is called.
+//
+// URLs rather than one URL because a Helm index entry may list several mirrors of
+// the same chart; the first that serves is the origin recorded, since that is where
+// it can be refetched from.
+type importableFile struct {
+	Filename string
+	URLs     []string
+	SHA256   string
+	// Provenance is how strongly this format's index states the digest. Set by the
+	// enumerator, because it is a property of the index rather than of the fetch.
+	Provenance state.DigestProvenance
+	// Ambiguous marks an artifact the index names more than once with different
+	// entries, which cannot be imported because there is no single answer to what
+	// it is.
+	Ambiguous bool
+}
+
+// importEnumerator reads a published index and returns the artifacts it names.
+type importEnumerator func(context.Context, ImportRepositoryRequest) ([]importableFile, string, error)
+
+var importEnumerators = map[string]importEnumerator{
+	"pypi": importPyPIFiles,
+	"helm": importHelmFiles,
+	"deb":  importDebFiles,
 }
 
 // ImportSkipped is one artifact the index named that was not imported, with the
@@ -102,15 +145,15 @@ func ImportRepository(ctx context.Context, request ImportRepositoryRequest) (Imp
 	if err != nil {
 		return ImportRepositoryResult{}, err
 	}
-	if format != "pypi" {
-		// Named rather than silently ignored. deb and Helm indexes are already
-		// parsed by doctor, so extending this is reading work rather than design
-		// work — but claiming to import a format that is not read yet would be worse
-		// than saying so.
+	enumerate, known := importEnumerators[format]
+	if !known {
+		// Named rather than silently ignored. Claiming to import a format whose index
+		// is not read yet would be worse than saying which one it is.
 		return ImportRepositoryResult{}, fmt.Errorf(
-			"import reads PyPI repositories; repository %q is %s", request.Repository, format)
+			"import does not read %s repositories yet; repository %q is %s",
+			format, request.Repository, format)
 	}
-	files, indexURL, err := importPyPIFiles(ctx, request)
+	files, indexURL, err := enumerate(ctx, request)
 	if err != nil {
 		return ImportRepositoryResult{}, err
 	}
@@ -124,9 +167,13 @@ func ImportRepository(ctx context.Context, request ImportRepositoryRequest) (Imp
 		if err := ctx.Err(); err != nil {
 			return ImportRepositoryResult{}, err
 		}
-		if limit > 0 && len(result.Imported) >= limit {
+		// Ambiguity is reported before the limit, because it is a fact about the
+		// repository rather than about how much of it was asked for. A limited
+		// import that hid it would report a clean index that is not one.
+		if file.Ambiguous {
 			result.Skipped = append(result.Skipped, ImportSkipped{
-				Filename: file.Filename, Reason: "beyond the requested limit",
+				Filename: file.Filename,
+				Reason:   "the index lists this name and version more than once, so which artifact it is cannot be established",
 			})
 			continue
 		}
@@ -137,21 +184,13 @@ func ImportRepository(ctx context.Context, request ImportRepositoryRequest) (Imp
 			})
 			continue
 		}
-		artifactURL, err := resolveDoctorReference(indexURL, file.URL)
-		if err != nil {
-			result.Skipped = append(result.Skipped, ImportSkipped{Filename: file.Filename, Reason: err.Error()})
+		if limit > 0 && len(result.Imported) >= limit {
+			result.Skipped = append(result.Skipped, ImportSkipped{
+				Filename: file.Filename, Reason: "beyond the requested limit",
+			})
 			continue
 		}
-		adopted, err := AdoptArtifact(ctx, AdoptArtifactRequest{
-			Root: root, Repository: request.Repository, URL: artifactURL.String(),
-			SHA256: file.SHA256, Filename: file.Filename, Track: request.Track,
-			Distro: request.Distro, DryRun: request.DryRun, PublicOrigin: true,
-			// The index stated this digest and adopt checks the bytes against it,
-			// which is the strongest a simple index supports: there is nothing here
-			// to verify a signature against, and no root document naming the page.
-			Provenance: state.ProvenanceIndexStated,
-			Fetcher:    request.Fetcher,
-		})
+		adopted, err := adoptFirstReachable(ctx, root, request, indexURL, file)
 		if err != nil {
 			// One artifact failing does not abandon the rest. A repository being
 			// imported is someone else's, and a single unreachable file or one whose
@@ -182,8 +221,40 @@ func importFormat(root, repository string) (string, error) {
 	return configured.Format, nil
 }
 
+// adoptFirstReachable adopts an artifact from the first URL that serves it.
+//
+// A Helm index entry may list several mirrors of one chart. The origin recorded is
+// the URL that actually served, because that is where a later check or refetch has
+// to go — recording the first listed would record somewhere that may never have
+// worked.
+func adoptFirstReachable(ctx context.Context, root string, request ImportRepositoryRequest,
+	indexURL string, file importableFile) (AdoptArtifactResult, error) {
+	var lastErr error
+	for _, reference := range file.URLs {
+		artifactURL, err := resolveDoctorReference(indexURL, reference)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		adopted, err := AdoptArtifact(ctx, AdoptArtifactRequest{
+			Root: root, Repository: request.Repository, URL: artifactURL.String(),
+			SHA256: file.SHA256, Filename: file.Filename, Track: request.Track,
+			Distro: request.Distro, DryRun: request.DryRun, PublicOrigin: true,
+			Provenance: file.Provenance, Fetcher: request.Fetcher,
+		})
+		if err == nil {
+			return adopted, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("the index names no URL for this artifact")
+	}
+	return AdoptArtifactResult{}, lastErr
+}
+
 // importPyPIFiles fetches a project page and returns the files it names.
-func importPyPIFiles(ctx context.Context, request ImportRepositoryRequest) ([]pypi.SimpleFile, string, error) {
+func importPyPIFiles(ctx context.Context, request ImportRepositoryRequest) ([]importableFile, string, error) {
 	if request.Project == "" {
 		return nil, "", errors.New(
 			"import needs the project to read, because a simple index lists projects rather than their files: pass --project")
@@ -215,14 +286,189 @@ func importPyPIFiles(ctx context.Context, request ImportRepositoryRequest) ([]py
 	if pageName != "" && pypi.NormalizeName(pageName) != pypi.NormalizeName(request.Project) {
 		return nil, "", fmt.Errorf("%s names project %q rather than %q", indexURL, pageName, request.Project)
 	}
-	supported := make([]pypi.SimpleFile, 0, len(files))
+	importable := make([]importableFile, 0, len(files))
 	for _, file := range files {
-		if file.Supported {
-			supported = append(supported, file)
+		if !file.Supported {
+			continue
+		}
+		importable = append(importable, importableFile{
+			Filename: file.Filename, URLs: []string{file.URL}, SHA256: file.SHA256,
+			// The index stated the digest and adopt checks the bytes against it,
+			// which is the strongest a simple index supports: nothing here signs the
+			// page, and no root document names it.
+			Provenance: state.ProvenanceIndexStated,
+		})
+	}
+	sort.Slice(importable, func(left, right int) bool { return importable[left].Filename < importable[right].Filename })
+	return importable, indexURL.String(), nil
+}
+
+// importHelmFiles fetches index.yaml and returns the charts it names.
+//
+// One index covers every chart, so unlike PyPI there is no per-project page and
+// nothing to narrow by: importing a Helm repository imports the repository.
+func importHelmFiles(ctx context.Context, request ImportRepositoryRequest) ([]importableFile, string, error) {
+	base, err := parseDoctorURL(request.URL)
+	if err != nil {
+		return nil, "", err
+	}
+	indexURL, err := doctorIndexURL(base, "helm", DoctorRequest{})
+	if err != nil {
+		return nil, "", err
+	}
+	response, err := request.Fetcher.Fetch(ctx, indexURL.String(), maximumIndexBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", indexURL, err)
+	}
+	charts, err := helm.ParseRepositoryIndex(response.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", indexURL, err)
+	}
+	importable := make([]importableFile, 0, len(charts))
+	for _, chart := range charts {
+		if chart.Ambiguous {
+			// Two entries claim this name and version. Neither can be trusted to be
+			// the chart, so it is left out and named rather than resolved by picking
+			// one — the same rule as an artifact whose bytes disagree with its digest.
+			importable = append(importable, importableFile{
+				Filename: chart.Name + "-" + chart.Version + ".tgz", Ambiguous: true,
+			})
+			continue
+		}
+		// A chart's filename is not stated by the index, and adopt derives identity
+		// from it, so it is composed the way Helm names a packaged chart. Composing
+		// rather than taking the URL's basename keeps a mirror that serves the same
+		// chart under a different name from renaming the package.
+		importable = append(importable, importableFile{
+			Filename: chart.Name + "-" + chart.Version + ".tgz",
+			URLs:     append([]string(nil), chart.URLs...),
+			SHA256:   chart.Digest,
+			// index.yaml states each chart's digest and nothing signs the index, so
+			// this is the same level a simple index reaches.
+			Provenance: state.ProvenanceIndexStated,
+		})
+	}
+	sort.Slice(importable, func(left, right int) bool { return importable[left].Filename < importable[right].Filename })
+	return importable, indexURL.String(), nil
+}
+
+// importDebFiles reads a suite's Packages index and returns the artifacts it names.
+//
+// The digest of every artifact comes from Packages, and the digest of Packages
+// comes from Release — so this fetches Release first, finds the entry for the
+// wanted index, and refuses to read a Packages that does not match the size and
+// SHA-256 Release states for it. That check is what ProvenanceIndexChain claims,
+// and recording the level without performing it would make the lock say something
+// untrue.
+//
+// Release itself is not authenticated here. InRelease and Release.gpg sign it, and
+// verifying that is what would raise this to ProvenanceSignedIndex; until then the
+// root of trust is the transport, and the lock says so.
+func importDebFiles(ctx context.Context, request ImportRepositoryRequest) ([]importableFile, string, error) {
+	// The URL given to import is the repository root — what an apt line names —
+	// rather than a path inside it, so it is used as given with a trailing
+	// separator. debRepositoryBase is doctor's helper for the other case, where the
+	// URL points at a Release or a suite and the root has to be derived.
+	base, err := parseDoctorURL(request.URL)
+	if err != nil {
+		return nil, "", err
+	}
+	if !strings.HasSuffix(base.Path, "/") {
+		base.Path += "/"
+	}
+	suite := request.Suite
+	if suite == "" {
+		return nil, "", errors.New(
+			"import needs the suite to read, because a Debian repository serves several: pass --suite")
+	}
+	releaseURL, err := resolveDoctorReference(base.String(), "dists/"+suite+"/Release")
+	if err != nil {
+		return nil, "", err
+	}
+	releaseResponse, err := request.Fetcher.Fetch(ctx, releaseURL.String(), maximumIndexBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", releaseURL, err)
+	}
+	release, err := deb.ParseRepositoryRelease(releaseResponse.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", releaseURL, err)
+	}
+	component := request.Component
+	if component == "" && len(release.Components) != 0 {
+		component = release.Components[0]
+	}
+	architecture := request.Architecture
+	if architecture == "" {
+		for _, candidate := range release.Architectures {
+			// "all" is architecture-independent content rather than a machine to
+			// install on, so it is not what someone importing means by default.
+			if candidate != "all" {
+				architecture = candidate
+				break
+			}
 		}
 	}
-	// Ordered by filename so an import is reproducible and a dry run reports what
-	// the real thing will do.
-	sort.Slice(supported, func(left, right int) bool { return supported[left].Filename < supported[right].Filename })
-	return supported, indexURL.String(), nil
+	if component == "" || architecture == "" {
+		return nil, "", fmt.Errorf("%s names no component or architecture to read; pass --component and --architecture", releaseURL)
+	}
+	wanted := component + "/binary-" + architecture + "/Packages"
+	listed := findReleaseFile(release, wanted)
+	if listed == nil {
+		return nil, "", fmt.Errorf("%s does not list %s", releaseURL, wanted)
+	}
+	packagesURL, err := resolveDoctorReference(releaseURL.String(), listed.Path)
+	if err != nil {
+		return nil, "", err
+	}
+	packagesResponse, err := request.Fetcher.Fetch(ctx, packagesURL.String(), maximumPackagesBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", packagesURL, err)
+	}
+	// The chain, and the reason this import can claim index-chain rather than
+	// index-stated: what Release says about Packages has to hold before anything
+	// Packages says about an artifact is worth recording.
+	if int64(len(packagesResponse.Body)) != listed.Size || digest(packagesResponse.Body) != listed.SHA256 {
+		return nil, "", fmt.Errorf("%s does not match the size and SHA-256 that %s states for it",
+			packagesURL, releaseURL)
+	}
+	content, err := deb.DecompressRepositoryPackages(listed.Path, packagesResponse.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("decompress %s: %w", packagesURL, err)
+	}
+	packages, err := deb.ParseRepositoryPackages(content)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", packagesURL, err)
+	}
+	importable := make([]importableFile, 0, len(packages))
+	for _, entry := range packages {
+		// Filename is a pool path relative to the repository root rather than to
+		// the index, which is why this resolves against base and not packagesURL.
+		artifactURL, err := resolveDoctorReference(base.String(), entry.Filename)
+		if err != nil {
+			continue
+		}
+		importable = append(importable, importableFile{
+			Filename:   path.Base(entry.Filename),
+			URLs:       []string{artifactURL.String()},
+			SHA256:     entry.SHA256,
+			Provenance: state.ProvenanceIndexChain,
+		})
+	}
+	sort.Slice(importable, func(left, right int) bool { return importable[left].Filename < importable[right].Filename })
+	return importable, packagesURL.String(), nil
+}
+
+// findReleaseFile locates a Packages entry, trying each compression Release may
+// list it under. Debian publishes the same index several ways and states a digest
+// for each, so any of them is a sound root — the uncompressed form is simply the
+// one least likely to be present.
+func findReleaseFile(release deb.RepositoryRelease, wanted string) *deb.ReleaseFile {
+	for _, suffix := range []string{".xz", ".gz", "", ".zst"} {
+		for index := range release.Files {
+			if release.Files[index].Path == wanted+suffix {
+				return &release.Files[index]
+			}
+		}
+	}
+	return nil
 }
