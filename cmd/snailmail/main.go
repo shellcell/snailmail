@@ -116,17 +116,30 @@ func runInit(args []string, stdout, stderr io.Writer) error {
 	forgeRepository := flags.String("forge-repo", "", "state repository reference for PR gates, such as owner/name")
 	forgeProvider := flags.String("forge", "", "forge hosting the state repository: github, gitlab, forgejo, gitea, none")
 	forgeHost := flags.String("forge-host", "", "self-hosted or Enterprise forge hostname")
+	skipGit := flags.Bool("no-git", false,
+		"do not create a Git repository here, for a workspace going inside one you will create yourself")
 	if err := flags.parse(args); err != nil {
 		return err
 	}
-	if err := engine.InitWorkspace(engine.InitWorkspaceRequest{Root: flags.Root(), Name: *name,
-		Forge: *forgeProvider, ForgeRepository: *forgeRepository, ForgeHost: *forgeHost}); err != nil {
+	created, err := engine.InitWorkspaceReporting(engine.InitWorkspaceRequest{Root: flags.Root(), Name: *name,
+		SkipGit: *skipGit, Forge: *forgeProvider, ForgeRepository: *forgeRepository, ForgeHost: *forgeHost})
+	if err != nil {
 		return err
 	}
-	if done, err := flags.emit(stdout, initResult{Workspace: *name}); done || err != nil {
+	if done, err := flags.emit(stdout, initResult{
+		Workspace: *name, CreatedGitRepository: created.CreatedGitRepository, Committed: created.Committed,
+	}); done || err != nil {
 		return err
 	}
 	printBrand(stdout)
+	// Said rather than done silently: this wrote to the operator's directory beyond
+	// the files they asked for.
+	if created.CreatedGitRepository {
+		fmt.Fprintln(stdout, "📦  created a Git repository here, because snailmail reviews its state as a diff")
+	}
+	if created.Committed {
+		fmt.Fprintln(stdout, "📦  committed the new workspace, so it is ready to use")
+	}
 	fmt.Fprintf(stdout, "✉️   initialized workspace %s\n", *name)
 	suggestNext(stdout, flags, "snailmail setup raw --name tools --output public/tools",
 		"configure a repository")
@@ -1519,7 +1532,9 @@ func plural(count int, singular, pluralForm string) string {
 // not where the value is declared.
 
 type initResult struct {
-	Workspace string `json:"workspace"`
+	Workspace            string `json:"workspace"`
+	CreatedGitRepository bool   `json:"created_git_repository,omitempty"`
+	Committed            bool   `json:"committed,omitempty"`
 }
 
 type setupResult struct {

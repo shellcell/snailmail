@@ -35,8 +35,11 @@ import (
 const phase1EngineVersion = "phase3-v1"
 
 type InitWorkspaceRequest struct {
-	Root            string
-	Name            string
+	Root string
+	Name string
+	// SkipGit leaves the directory alone when it is not a repository, for someone
+	// placing a workspace inside one they will create themselves.
+	SkipGit         bool
 	ForgeRepository string
 	Forge           string
 	ForgeHost       string
@@ -209,20 +212,64 @@ type ApplyWorkspaceResult struct {
 }
 
 func InitWorkspace(request InitWorkspaceRequest) error {
+	_, err := InitWorkspaceReporting(request)
+	return err
+}
+
+// InitWorkspaceResult reports what init had to create, so the caller can say so
+// rather than performing filesystem work silently.
+type InitWorkspaceResult struct {
+	CreatedGitRepository bool `json:"created_git_repository,omitempty"`
+	Committed            bool `json:"committed,omitempty"`
+}
+
+// InitWorkspaceReporting sets up a workspace and reports what it created.
+//
+// snailmail is git-backed by definition: the lock is reviewed as a diff and the
+// ledger is derived from history, so a workspace that is not a repository, or is
+// one with no commits, cannot work. Both used to be the operator's problem, which
+// made the tool's first interaction a refusal — and the second one too, because
+// initialising a repository leaves it without the commit everything else needs.
+//
+// So init does both by default. Neither is hard to undo and neither reaches outside
+// the directory the operator named, which is what makes doing it the right default
+// rather than a prompt. SkipGit declines for someone placing a workspace inside a
+// repository they will create themselves.
+func InitWorkspaceReporting(request InitWorkspaceRequest) (InitWorkspaceResult, error) {
 	root, err := workspaceRoot(request.Root)
 	if err != nil {
-		return err
+		return InitWorkspaceResult{}, err
 	}
-	if err := state.RequireGitRepository(root); err != nil {
-		return err
+	var result InitWorkspaceResult
+	if !state.IsGitRepository(root) {
+		if request.SkipGit {
+			return InitWorkspaceResult{}, state.RequireGitRepository(root)
+		}
+		if err := state.CreateGitRepository(root); err != nil {
+			return InitWorkspaceResult{}, err
+		}
+		result.CreatedGitRepository = true
 	}
 	unlock, err := state.AcquireWorkspaceLock(root)
 	if err != nil {
-		return err
+		return InitWorkspaceResult{}, err
 	}
 	defer unlock()
-	return state.Init(root, state.InitOptions{Name: request.Name, Forge: request.Forge,
-		ForgeRepository: request.ForgeRepository, ForgeHost: request.ForgeHost})
+	if err := state.Init(root, state.InitOptions{Name: request.Name, Forge: request.Forge,
+		ForgeRepository: request.ForgeRepository, ForgeHost: request.ForgeHost}); err != nil {
+		return InitWorkspaceResult{}, err
+	}
+	// A repository with no history fails every later command, so an init that
+	// stopped at writing the manifest would still leave the next one to fail. Only
+	// for a repository this call created: committing into somebody's existing
+	// repository is their decision, not this command's.
+	if result.CreatedGitRepository && !state.HasCommit(root) {
+		if err := state.CommitAll(root, "snailmail workspace"); err != nil {
+			return result, err
+		}
+		result.Committed = true
+	}
+	return result, nil
 }
 
 func SetupRepository(request SetupRepositoryRequest) error {

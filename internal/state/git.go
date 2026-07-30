@@ -1302,3 +1302,50 @@ func DesiredStateTime(ctx context.Context, root string) (time.Time, error) {
 	}
 	return committedAt.UTC(), nil
 }
+
+// IsGitRepository reports whether a directory is inside a working tree.
+func IsGitRepository(root string) bool {
+	_, err := gitOutputContext(context.Background(), root, "rev-parse", "--git-dir")
+	return err == nil
+}
+
+// HasCommit reports whether a repository has any history yet.
+//
+// Distinct from IsGitRepository because a freshly initialised repository is one and
+// has none, and almost everything here needs a commit to compare against.
+func HasCommit(root string) bool {
+	_, err := gitOutputContext(context.Background(), root, "rev-parse", "HEAD")
+	return err == nil
+}
+
+// CreateGitRepository initialises a working tree at root.
+//
+// snailmail is a git-backed tool by definition — the lock is reviewed as a diff and
+// the ledger is derived from history — so a workspace that is not a repository
+// cannot work at all. Refusing and leaving the operator to discover that `git init`
+// was wanted made the tool's first interaction a failure.
+func CreateGitRepository(root string) error {
+	if err := gitRun(root, "init", "-b", "main"); err != nil {
+		return fmt.Errorf("create a Git repository at %s: %w", root, err)
+	}
+	return nil
+}
+
+// CommitAll records everything in the working tree.
+//
+// Used for the first commit of a new workspace, which is what makes it usable: a
+// repository with no history fails every later command, so an init that stopped
+// short of this would still leave the next command to fail.
+func CommitAll(root, message string) error {
+	if err := gitRun(root, "add", "-A"); err != nil {
+		return fmt.Errorf("stage the new workspace: %w", err)
+	}
+	if err := gitRun(root, "commit", "-m", message); err != nil {
+		// Almost always an unset user.name or user.email, which git explains better
+		// than a guess would — but the remedy is worth naming because the workspace
+		// is otherwise written and one command from working.
+		return fmt.Errorf(
+			"the workspace was written but could not be committed (usually an unset Git identity): %w", err)
+	}
+	return nil
+}

@@ -25,8 +25,7 @@ ghcr). [PLAN.md](PLAN.md) has the design; none of it works yet.
 From an empty directory to a published PyPI repository:
 
 ```sh
-git init
-go run ./cmd/snailmail init --name example
+go run ./cmd/snailmail init --name example   # creates the Git repository if there is none
 go run ./cmd/snailmail setup pypi --name python --output public/python
 go run ./cmd/snailmail add python ./dist/*.whl
 git add .gitignore snailmail.toml repos/python.lock.toml
