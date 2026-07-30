@@ -24,20 +24,6 @@ import (
 // staging directory and no rebound root.
 const helmRootPath = "index.yaml"
 
-// requireHelmOnS3 skips while the shape is undeclared.
-//
-// Three of these tests pass and describe how the canonical-path shape works. The
-// fourth found what is still open: a published tree carries snailmail's own
-// generated files — index.html and snailmail.repository.json — at fixed paths that
-// change every revision, and a second publication cannot write them without either
-// overwriting what the live revision's descriptor points at or leaving the previous
-// revision unverifiable. They are kept, and skipped, so the work is not
-// rediscovered.
-func requireHelmOnS3(t *testing.T) {
-	t.Helper()
-	t.Skip("s3 does not serve helm yet: snailmail's own generated files are mutable at canonical paths")
-}
-
 // helmRepository has no RootRewriter, which is what selects that shape.
 func helmRepository(endpoint string) host.Repository {
 	return host.Repository{
@@ -95,7 +81,6 @@ func helmStageFixture(t *testing.T, planID, chart, version string) host.StageReq
 // The whole point of the shape: a chart lands where a client will fetch it, and
 // the index that names it is what goes live.
 func TestHelmPublishesAtCanonicalPathsAndCommitsTheIndex(t *testing.T) {
-	requireHelmOnS3(t)
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	adapter := New(objects)
@@ -155,7 +140,6 @@ func TestHelmPublishesAtCanonicalPathsAndCommitsTheIndex(t *testing.T) {
 // signed yum repository it is the difference between a repository a client accepts
 // and one whose signature no longer covers the document it signs.
 func TestTheIndexIsPublishedUnmodified(t *testing.T) {
-	requireHelmOnS3(t)
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	adapter := New(objects)
@@ -186,7 +170,6 @@ func TestTheIndexIsPublishedUnmodified(t *testing.T) {
 // switched a client sees the previous revision whole, which is the property the
 // mechanism exists for.
 func TestASecondRevisionIsLiveOnlyWhenTheIndexSwitches(t *testing.T) {
-	requireHelmOnS3(t)
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	adapter := New(objects)
@@ -258,7 +241,6 @@ func TestASecondRevisionIsLiveOnlyWhenTheIndexSwitches(t *testing.T) {
 // A client is told to fetch from where the objects actually are. Routes pointing
 // into a release directory would be verified against paths a user never uses.
 func TestClientRoutesPointAtCanonicalPaths(t *testing.T) {
-	requireHelmOnS3(t)
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	adapter := New(objects)
@@ -275,12 +257,52 @@ func TestClientRoutesPointAtCanonicalPaths(t *testing.T) {
 	if len(committed.Access.Routes) == 0 {
 		t.Fatal("no client routes were issued")
 	}
+	var canonical int
 	for _, route := range committed.Access.Routes {
-		if strings.Contains(route.URL, ".snailmail/releases") {
-			t.Errorf("route %q points into the release directory", route.URL)
-		}
 		if !strings.HasPrefix(route.URL, "https://charts.example/repo/") {
 			t.Errorf("route %q is not under the canonical endpoint", route.URL)
 		}
+		staged := strings.Contains(route.URL, ".snailmail/releases")
+		// snailmail's own files are the exception, and deliberately so: they are
+		// rewritten every revision, so they stay in the release directory and their
+		// routes have to say where they actually are.
+		own := strings.HasSuffix(route.URL, "/index.html") || strings.HasSuffix(route.URL, "/snailmail.repository.json")
+		if staged != own {
+			t.Errorf("route %q is %s, which does not match where it was written",
+				route.URL, map[bool]string{true: "staged", false: "canonical"}[staged])
+		}
+		if !staged {
+			canonical++
+		}
+	}
+	if canonical == 0 {
+		t.Error("nothing is served from a canonical path")
+	}
+}
+
+// A signed yum repository cannot be made live on an object store: repomd.xml.asc
+// is a detached signature over that revision's repomd.xml, so the two have to
+// switch together and an object store commits one. It is refused by the path count
+// rather than by a rule naming rpm, which is why declaring rpm is safe.
+func TestASignedYumRepositoryIsRefusedByItsPathCount(t *testing.T) {
+	ctx := context.Background()
+	adapter := New(newMemoryObjects())
+	signed := host.Repository{
+		Name: "yum", Format: "rpm", Type: "s3", Visibility: "public", Bucket: "b",
+		CanonicalEndpoint: "https://yum.example",
+		CommitPaths:       []string{"repodata/repomd.xml", "repodata/repomd.xml.asc"},
+	}
+	_, err := adapter.Capabilities(ctx, signed)
+	if !host.IsKind(err, host.ErrorInvalidConfiguration) {
+		t.Fatalf("a signed yum repository was accepted: %v", err)
+	}
+	if !strings.Contains(err.Error(), "switching 2 paths") {
+		t.Errorf("error = %v, want the path count named", err)
+	}
+	// Unsigned is one path and is served.
+	unsigned := signed
+	unsigned.CommitPaths = []string{"repodata/repomd.xml"}
+	if _, err := adapter.Capabilities(ctx, unsigned); err != nil {
+		t.Errorf("an unsigned yum repository was refused: %v", err)
 	}
 }

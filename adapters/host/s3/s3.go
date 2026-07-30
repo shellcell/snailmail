@@ -25,6 +25,7 @@ import (
 	"github.com/shellcell/snailmail/host"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/buildgraph"
+	"github.com/shellcell/snailmail/internal/listing"
 
 	"github.com/shellcell/snailmail/internal/hexdigest"
 )
@@ -52,6 +53,14 @@ func New(client ObjectClient, brokers ...host.CredentialBroker) *Adapter {
 
 func (adapter *Adapter) Capabilities(_ context.Context, repository host.Repository) (host.Capabilities, error) {
 	if err := adapter.validateRepository(repository); err != nil {
+		return host.Capabilities{}, err
+	}
+	// Resolved here as well as at every operation, so a repository this host cannot
+	// commit atomically is refused when it is configured rather than when a
+	// publication is attempted. A signed yum repository is the case that matters:
+	// it switches two objects, and finding that out at apply time means finding it
+	// out after the tree has been built.
+	if _, err := singleRootPath(repository); err != nil {
 		return host.Capabilities{}, err
 	}
 	capabilities := host.Capabilities{FaithfulPreview: true, ConditionalCommit: true, ConditionalRestore: true, PrivateRead: adapter.broker != nil}
@@ -1574,10 +1583,26 @@ func (adapter *Adapter) issueAccess(ctx context.Context, repository host.Reposit
 // is given match where the objects were actually written, and a verification run
 // exercises the same URLs a user would.
 func canonicalClientRoutes(endpoint, treeSHA256, rootPath string, staged bool, files []host.File, rootContent []byte) ([]host.ClientRoute, error) {
-	if !staged {
-		return clientRoutes(endpoint, rootPath, files, rootContent)
-	}
 	releaseEndpoint := strings.TrimSuffix(endpoint, "/") + "/.snailmail/releases/" + treeSHA256
+	if !staged {
+		routes := make([]host.ClientRoute, 0, len(files))
+		for _, file := range files {
+			base := endpoint
+			content := []byte(nil)
+			if snailmailOwned(file.Path) {
+				base = releaseEndpoint
+			}
+			if file.Path == rootPath {
+				content = rootContent
+			}
+			route, err := clientRoute(base, file, content)
+			if err != nil {
+				return nil, err
+			}
+			routes = append(routes, route)
+		}
+		return routes, nil
+	}
 	routes := make([]host.ClientRoute, 0, len(files))
 	for _, file := range files {
 		base := releaseEndpoint
@@ -1682,10 +1707,28 @@ func readPrefixes(repository host.Repository, treeSHA256, rootPath string) []str
 // the storage for no further guarantee, since the descriptor already pins their
 // digests.
 func publishedFileKey(repository host.Repository, treeSHA256, rootPath, name string) string {
-	if repository.RootRewriter != nil || name == rootPath {
+	if repository.RootRewriter != nil || name == rootPath || snailmailOwned(name) {
 		return releaseKey(repository, treeSHA256, name)
 	}
 	return objectKey(repository, name)
+}
+
+// snailmailOwned reports whether a published file is snailmail's own rather than
+// the format's: the browsable listing and the build-graph manifest.
+//
+// They are kept in the release directory whichever shape a repository uses,
+// because unlike the format's files they are rewritten with every revision — a
+// listing gains a row, a manifest gains a verification case. Writing them at
+// canonical paths would leave the previous revision unverifiable after a rollback,
+// since Observe checks the whole file set and would find the newer bytes.
+//
+// Nothing is lost by it. Neither is read by a package client, and neither has ever
+// been reachable at a canonical path on this host: PyPI stages its whole tree, so
+// on S3 these two have always lived in the release directory. A browsable page
+// served from an object store is a separate thing to build, not something this
+// takes away.
+func snailmailOwned(name string) bool {
+	return name == listing.Filename || name == buildgraph.ManifestFilename
 }
 
 func releaseKey(repository host.Repository, treeSHA256, name string) string {

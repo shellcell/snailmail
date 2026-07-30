@@ -54,17 +54,26 @@ var formatSupport = map[string]map[string]FormatSupport{
 	// Release and its detached signature together, Alpine has one index per
 	// architecture, and raw has a listing and a SHA256SUMS.
 	//
-	// The adapter has both publication shapes: PyPI staged under
-	// .snailmail/releases/<tree>/ with a rebound root, and a canonical-path shape
-	// for formats whose non-root files hold bytes fixed by their path. Only PyPI is
-	// declared because the second shape has one question left. A published tree
-	// contains snailmail's own generated files as well as the format's — a
-	// browsable index.html and the build-graph manifest — and both sit at fixed
-	// paths that change every revision. No client reads them, but Observe verifies
-	// the whole file set, so overwriting them in place leaves a previous revision
-	// unverifiable after a rollback. See PLAN.md §16.
+	// Two publication shapes serve them. PyPI is staged under
+	// .snailmail/releases/<tree>/ with a rebound root, because its per-project
+	// indexes are rewritten between revisions. Helm and yum are written at canonical
+	// paths and committed by switching one object, because everything else they
+	// publish sits at a path whose bytes are fixed — repodata is
+	// <sha256>-<kind>.xml.gz, a chart is stored under its digest. That also leaves a
+	// yum signature covering the document it signs, which rebinding would not.
+	//
+	// snailmail's own generated files — the browsable listing and the build-graph
+	// manifest — stay in the release directory in either shape, because they are
+	// rewritten with every revision.
 	"s3": {
 		"pypi": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		"helm": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		// yum, but only unsigned. A signed repository reports repomd.xml and
+		// repomd.xml.asc as its commit paths, because a detached signature has to
+		// become live with the document it signs, and the adapter refuses more than
+		// one — so the limitation is enforced by the path count rather than stated
+		// again here.
+		"rpm": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 	},
 	// Pages commits by moving a publish ref to an orphan commit of the whole
 	// tree, which is atomic and format-neutral, so a suite's Release and its

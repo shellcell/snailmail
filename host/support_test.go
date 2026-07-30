@@ -17,11 +17,8 @@ func TestSupportsDeniesUnknownPairs(t *testing.T) {
 		// path makes a revision live: Debian needs a Release and its detached
 		// signature together, Alpine has an index per architecture, raw has a
 		// listing and a SHA256SUMS. A signed yum repository is in the same
-		// position and would be refused by the adapter's path count. Helm and
-		// unsigned yum qualify on path count and are still undeclared, for the
-		// reason recorded in support.go.
-		{"s3", "helm"},
-		{"s3", "rpm"},
+		// position, and is refused by the adapter's path count rather than here,
+		// which is why rpm is declared.
 		{"s3", "deb"},
 		{"s3", "apk"},
 		{"s3", "raw"},

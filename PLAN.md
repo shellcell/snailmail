@@ -1427,17 +1427,21 @@ Still open:
   root rebound to point inside — now `formats.RootRewriter`, declared by PyPI
   alone.
 
-  One question remains before either is declared, and testing found it rather than
-  reading. A published tree is not only the format's files: snailmail also writes a
-  browsable `index.html` and the build-graph manifest, both at fixed paths that
-  change with every revision. No client reads either, and neither is what `Observe`
-  reads its own state from — the manifest it verifies is digest-addressed
-  elsewhere. But `Observe` does check the whole descriptor file set, so writing
-  those two in place makes the *previous* revision unverifiable after a rollback.
-  The choice is to keep them in the release directory and lose the browsable page
-  at its canonical path, to exclude them from verification, or to count them as
-  commit paths and refuse the shape. That is a decision about what a publication
-  guarantees, not an implementation detail.
+  Both are now declared. One thing testing found on the way: a published tree is
+  not only the format's files. snailmail also writes a browsable `index.html` and
+  the build-graph manifest, both at fixed paths that change with every revision, so
+  writing them canonically would leave the previous revision unverifiable after a
+  rollback — `Observe` checks the whole descriptor file set. They stay in the
+  release directory in either shape. Nothing is lost by that: neither is read by a
+  package client, and neither has ever been reachable at a canonical path on this
+  host, because PyPI stages its whole tree. Serving a browsable page from an object
+  store is a separate thing to build.
+
+  rpm is declared without a signing rule of its own. A signed repository reports
+  two commit paths since `rpmFormat.CommitPaths` was corrected, and the adapter
+  refuses more than one — checked at `Capabilities`, so a repository it cannot
+  commit atomically is refused when configured rather than after a tree has been
+  built.
 
   Debian, Alpine and raw remain out for the original reason, which is path count
   rather than rewriting: a `Release` and its detached signature have to become
