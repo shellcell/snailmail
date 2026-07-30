@@ -1030,6 +1030,22 @@ func LoadLock(root string, repository Repository) (RepositoryLock, error) {
 			return RepositoryLock{}, err
 		}
 	}
+	// A sharded lock keeps its root at the same path, so which layout a repository
+	// uses is read from the file rather than configured. Nothing above here needs
+	// to know, and no call site outside this function does.
+	if content, readErr := os.ReadFile(name); readErr == nil {
+		if root, sharded := looksSharded(content); sharded {
+			shardedLock, err := readShardedLock(name, root, repository.Lock)
+			if err != nil {
+				return RepositoryLock{}, err
+			}
+			if shardedLock.Repository == "" {
+				return RepositoryLock{}, errors.New("invalid repository lock schema")
+			}
+			canonicalizeLock(&shardedLock)
+			return shardedLock, nil
+		}
+	}
 	if err := decodeTOML(name, &lock); err != nil {
 		return RepositoryLock{}, err
 	}
@@ -1053,13 +1069,19 @@ func LoadLock(root string, repository Repository) (RepositoryLock, error) {
 func WriteLock(root string, repository Repository, lock RepositoryLock) error {
 	lock.SchemaVersion = LockSchema
 	canonicalizeLock(&lock)
-	encoded, err := toml.Marshal(lock)
-	if err != nil {
-		return fmt.Errorf("encode repository lock: %w", err)
-	}
 	name, err := WorkspacePath(root, repository.Lock)
 	if err != nil {
 		return err
+	}
+	// Past a threshold a lock is written as one file per package. The choice is
+	// made here rather than configured, because it is a consequence of how large
+	// the repository is and not a preference anyone should have to hold.
+	if shouldShard(name, lock) {
+		return writeShardedLock(name, lock)
+	}
+	encoded, err := toml.Marshal(lock)
+	if err != nil {
+		return fmt.Errorf("encode repository lock: %w", err)
 	}
 	return atomicWrite(name, encoded, 0o644)
 }

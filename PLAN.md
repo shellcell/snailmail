@@ -708,6 +708,43 @@ across mount points. An adapter cannot detect that reliably from the near side, 
 it is a documented requirement rather than a checked one.
 
 
+### 6.3 Where the walls actually are
+
+Two scale limits were identified early and deferred on measurement. Both have now
+been measured against something other than a small workspace, and the order they
+bind in turned out to matter more than either number.
+
+**The lock was the nearer wall, and is fixed.** At 385 bytes per package-version a
+whole-file lock is 38.5 MB at 100,000 versions, and the binding constraint was
+never parse time — it was that every publication rewrote the whole file and every
+review diffed it. Sharding per package under a Merkle root makes a publication
+cost one small file: 108 ms to add a version to a repository of 10,000 packages,
+and 102 ms to read the lock back.
+
+**The generated index is now the nearer wall, and it is far away.** A Debian
+`Packages` entry costs about 400 bytes, and building one holds roughly 4.5 times
+its own size in heap while it is compressed and digested:
+
+| package-versions | `Packages` | heap during build |
+|---|---|---|
+| 1,000 | 0.4 MB | 2.4 MB |
+| 20,000 | 8.0 MB | 36 MB |
+| 1,000,000 | ~400 MB | ~1.8 GB |
+
+So the index becomes a real problem somewhere around a million package-versions.
+For scale: Debian bookworm `main/amd64`, one of the largest repositories anyone
+publishes, holds 63,440 — about 25 MB of index and 110 MB of heap, which is
+unremarkable. The wall is roughly fifteen times the largest real suite.
+
+That is why streaming a generated index to a writer, rather than returning bytes,
+stays deferred. It is a genuine refactor of `domain.File`, the build graph and
+materialisation, and it would raise a ceiling nobody is within an order of
+magnitude of. The browsable listing no longer contributes to the same ceiling
+either, since it is windowed. The limits declared in §96 turn all of these into a
+sentence rather than an OOM, which is what makes deferring safe rather than
+hopeful.
+
+
 ## 7. `snailmail setup <format>`
 
 The wizard is the adoption surface, so it produces five things, not one:

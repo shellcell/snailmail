@@ -345,6 +345,27 @@ storage — so the ceiling is index and lock size, not repository size. Generate
 indexes are held whole, which for Debian and yum is the binding constraint at
 around a million package-versions.
 
+Past 2,000 package-versions a repository's lock is written as one file per
+package, under a root that indexes them and a Merkle digest over the set:
+
+```
+repos/apt.lock.toml     the root: schema, placement, shard index, Merkle root
+repos/apt.lock.d/3f/…   one file per package
+```
+
+Nothing about a lock's meaning changes — it still has a single identity that a
+plan pins, and a shard edited on its own is refused by name rather than accepted
+quietly. What changes is what a publication costs. Adding one version rewrites one
+small file instead of the whole lock, so a reviewer sees the package that changed
+rather than a multi-megabyte diff. Measured at 10,000 packages: adding a version
+takes 108 ms and reading the lock 102 ms, against 3.4 s to write when every shard
+is compared and 950 ms to read them one at a time.
+
+The transition happens once, automatically, when a repository grows past the
+threshold, and a lock never goes back to one file — returning would itself be a
+diff rewriting everything. The first sharded write of a large repository creates
+every file and takes seconds; subsequent ones do not.
+
 ## One workspace, or one per team
 
 Use one workspace for the whole organisation unless you have a reason not to.
