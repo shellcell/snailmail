@@ -2,35 +2,27 @@
 
 > relaxed package delivery
 
-One tool to **create, host, sign and operate package repositories** of any
-format — apt, dnf, apk, PyPI, npm, Helm, OCI, Cargo, Go, Maven, Nix, or plain
-artifacts — on hosting you choose, and to **publish into repositories you
-don't own** — AUR, Homebrew, nixpkgs, npmjs, PyPI, ghcr.
+One tool to **create, host, sign and operate package repositories** from a
+git-backed workspace. Builds are deterministic, plans are reviewable, artifacts
+are immutable, and before anything is published a real client — `pip`, `apt`,
+`dnf`, `apk`, `helm` — installs from the built tree in a container.
 
-**Status: Phase 2 complete; Phase 3 signing foundation implemented.** The current implementation
-builds, structurally verifies, serves, and client-tests deterministic static
-PyPI, Debian, Helm, RPM and Alpine repositories, and publishes `raw`
-repositories of artifacts that carry no ecosystem metadata. Each format's
-client-test is the real client: pip, apt, helm, dnf and apk installing from the
-built tree in a container. Debian, RPM and Alpine repositories are signed, each
-with the scheme its clients verify. Git-backed workspaces also support local
-`init`, `setup`, `add`, `plan`, and `apply` workflows with immutable blobs,
-reviewable plans, publication ledgers, and per-repository managed release
-switching. Replacement of an existing managed release needs an atomic
-directory-entry exchange, so it is implemented on Linux and macOS; creating a
-first release is portable. PyPI repositories can additionally stage and publish to
-S3-compatible object storage with immutable releases, conditional root-index
-switching, checksum observation, conditional restore, and optional scoped
-private reads. Shared S3 blob storage, public GitHub Pages with a companion
-preview site, `auto`/`pr`/signed-`approval` gates, deterministic public status
-artifacts, and a containerized GitHub Actions workflow complete Phase 2.
-Phase 3 now includes encrypted local RSA4096 OpenPGP keys, a versioned signing
-compatibility table, `keys new|publish|audit|rotate`, explicit plan-resolved signer
-effects, authenticated Debian `InRelease`/`Release.gpg` output, receipt-backed
-Debian key rotation, and placement-level `promote`/`yank`. Additional key
-backends, operational commands, and format breadth remain Phase 3 work. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for the implementation contract and
-[PLAN.md](PLAN.md) for the broader product design.
+MIT licensed. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md).
+
+**Six formats today.** Debian (`apt`), RPM (`dnf`/`yum`), Alpine (`apk`), PyPI
+(`pip`), Helm, and `raw` for artifacts that carry no ecosystem metadata. Debian,
+RPM, Alpine and Helm are signed with the scheme their own clients verify.
+
+**Three hosts today.** A local directory, GitHub Pages, and S3-compatible object
+storage — though not every format on every host; see the table below.
+
+**Planned, not built:** npm, OCI, Cargo, Go, Maven and Nix repositories, and
+publishing into registries you do not own (AUR, Homebrew, nixpkgs, npmjs, PyPI,
+ghcr). [PLAN.md](PLAN.md) has the design; none of it works yet.
+
+## Quickstart
+
+From an empty directory to a published PyPI repository:
 
 ```sh
 git init
@@ -42,6 +34,47 @@ git commit -m "configure Python repository"
 go run ./cmd/snailmail plan
 go run ./cmd/snailmail apply --plan snailmail.snailmail-plan.json
 ```
+
+`plan` writes what it intends to do; `apply` does it and records a publication
+ledger entry. Nothing reaches a host until a plan has been applied.
+
+## What runs where
+
+| Host | pypi | deb | rpm | apk | helm | raw |
+|---|---|---|---|---|---|---|
+| local directory | yes | yes | yes | yes | yes | yes |
+| GitHub Pages | yes | yes | yes | yes | yes | yes |
+| S3 / R2 / GCS | yes | — | unsigned only | — | yes | — |
+
+An object store makes a revision live by writing one object, so it can serve a
+format only where a single path switches. Debian needs a `Release` and its
+detached signature to become live together; Alpine has one index per
+architecture; `raw` has a listing and a `SHA256SUMS`; and a *signed* yum
+repository has to switch `repomd.xml` with the `repomd.xml.asc` that signs it.
+Those are structural limits, not missing work — a local directory or GitHub Pages
+commits a whole tree at once and serves all six.
+
+## Status
+
+Phase 2 is complete and Phase 3 signing is implemented. Concretely: git-backed
+workspaces with `init`, `setup`, `add`, `plan` and `apply`; immutable blobs;
+reviewable plans; publication ledgers; per-repository managed release switching;
+`auto`, `pr` and signed-`approval` gates; encrypted local RSA4096 OpenPGP keys
+with `keys new|publish|audit|rotate`; receipt-backed Debian key rotation; and
+placement-level `promote` and `yank`.
+
+Review gates read GitHub, GitLab, Forgejo and Gitea, and `snailmail ci` emits a
+GitHub Actions or GitLab CI pipeline derived from the workspace.
+
+Replacing an existing managed release needs an atomic directory-entry exchange,
+so that path is implemented on Linux and macOS; creating a first release is
+portable. There is no Windows build yet.
+
+Additional key backends, more formats, `import`, and an interactive setup remain
+Phase 3 work. [ARCHITECTURE.md](ARCHITECTURE.md) is the implementation contract
+and [PLAN.md](PLAN.md) the broader design.
+
+## Promotions and yanks
 
 Promotions and yanks edit only placement records. Package versions, blob
 bindings, and publication history remain available for later re-promotion:
@@ -84,6 +117,8 @@ package-version records, CAS objects, remote blobs, or publication history;
 physical blob GC remains a separate future operation with tombstones and a grace
 period.
 
+## Auditing what is published
+
 `snailmail check` is a read-only integrity audit of every retained package
 version, including yanked and pruned versions. It verifies local CAS bytes or
 fetches the configured S3 authority into temporary storage, reparses native
@@ -93,6 +128,8 @@ re-fetches explicitly adopted URLs and compares their pinned bytes; default
 checks remain offline from external sources. Origin checks process at most four
 sorted records per run; `--origin-offset` selects subsequent batches.
 
+## Adopting an artifact from a URL
+
 `snailmail adopt --sha256 HEX --public-origin REPOSITORY URL` records one
 explicitly selected artifact in an existing owned repository. The lowercase
 SHA-256 pin is mandatory; `--public-origin` confirms that the complete requested
@@ -101,6 +138,8 @@ URL, plans display every visible adopted acquisition, and `--dry-run` validates
 up to 128 MiB without changing CAS or lock state. Adoption currently requires
 the local blob store and does not claim authorship, build provenance, source
 signatures, or historical snailmail publication.
+
+## Inspecting a workspace
 
 `snailmail status` reports committed workspace evidence without contacting
 hosts or providers. Human output summarizes visible and retained versions,
@@ -130,6 +169,8 @@ one as a service; its jobs share no filesystem, so what apply builds is declared
 as an artifact; and Pages there serves a job artifact rather than a moved ref, so
 there is no orphan commit.
 
+## Inspecting someone else's repository
+
 `snailmail doctor URL` needs no workspace and inspects a public HTTPS PyPI,
 Debian, or Helm repository. It parses bounded native indexes, follows at most the
 configured artifact limit, and checks referenced availability, size, SHA-256,
@@ -138,6 +179,8 @@ archive validity, and package identity. Use `--project` for PyPI artifacts and
 are explicitly reported as unverified in this initial slice. Runs inspect at
 most four artifacts, cap each expanded archive at 64 MiB, and stop after two
 minutes.
+
+## Raw repositories
 
 `raw` repositories publish artifacts that carry no ecosystem metadata: release
 tarballs, static binaries, installers. Every other format reads a package name
@@ -165,6 +208,8 @@ to record it somewhere a later reader can check without knowing what was typed.
 `SHA256SUMS` is the interchange format — `sha256sum -c` verifies a raw
 repository with no snailmail present. Raw has no signing: it is not an
 ecosystem, so no client knows to check a signature.
+
+## Signing keys
 
 Signed Debian repositories use an encrypted private key outside the workspace
 and commit only canonical public forms. Set a passphrase through the environment
@@ -215,6 +260,8 @@ format's clients cannot check. Every signature is verified before it is
 published, because a repository carrying one that does not check out is worse
 than an unsigned one: a client reports it as tampering.
 
+## Rotating a signing key
+
 Debian rotation keeps one active `InRelease` signer and a stable binary keyring.
 Introduction publishes both identities while the old key continues signing;
 activation switches to the successor only after the introducing deployment
@@ -248,6 +295,8 @@ package before activation. In CI, replace `SNAILMAIL_SIGNING_KEY_REF` and its
 encrypted private-key secret with the successor before planning the activated
 state; apply still receives no private key.
 
+## What plan requires
+
 `plan` requires the manifest, configured locks, publication ledgers, and
 deployment receipts to be committed in a complete, non-shallow Git repository. `apply`
 executes the reviewed plan without replanning, verifies staged repository
@@ -258,7 +307,10 @@ from the pre-effect publication ledger. S3 keeps
 the verified tree under an immutable digest prefix and conditionally updates a
 small root index that points clients at that tree.
 
-Public S3-compatible PyPI setup uses the standard AWS credential chain; no
+## Publishing to object storage
+
+Object storage serves PyPI, Helm and unsigned yum repositories. Setup uses the
+standard AWS credential chain; no
 credential values are written to the manifest or plan:
 
 ```sh
@@ -283,7 +335,7 @@ bucket lifecycle rule to expire abandoned `.snailmail/stages/` objects after a
 grace period; immutable `.snailmail/releases/`, `.snailmail/manifests/`, and
 `.snailmail/restores/` objects must not use that short-lived rule.
 
-Private S3-compatible PyPI uses a Basic-auth gateway and a short-lived
+A private object-storage repository uses a Basic-auth gateway and a short-lived
 credential broker. The broker is a compiled executable selected at runtime by
 `SNAILMAIL_CREDENTIAL_BROKER`; set `--visibility private --read-auth basic
 --credential-broker default` during setup. Snailmail sends the reviewed
@@ -305,6 +357,8 @@ go run ./cmd/snailmail blob-store s3 \
   --region us-east-1
 ```
 
+## Publishing to GitHub Pages
+
 Public GitHub Pages requires distinct pre-provisioned production and preview
 sites that deploy the root of the configured branch. Authenticate `gh`, then:
 
@@ -321,6 +375,8 @@ go run ./cmd/snailmail setup pypi \
 Pages publication uses exact orphan commits, immutable stage and restore refs,
 force-with-lease compare-and-swap, `.nojekyll`, and bounded propagation polling.
 Private Pages repositories are rejected.
+
+## Review and approval gates
 
 For a PR gate, initialize the workspace with its reviewed state repository and
 configure `--gate pr`. Apply verifies that the exact Git revision was merged by
@@ -354,12 +410,16 @@ go run ./cmd/snailmail apply
 `approve` signs the exact plan ID, repository, key identity, and expiry. Apply
 reauthorizes before every stage, commit, and compensating restore.
 
+## Status pages
+
 Render the read-only public matrix and machine-readable status from committed
 locks, ledgers, deployment receipts, and an optional current plan:
 
 ```sh
 go run ./cmd/snailmail render --output site
 ```
+
+## Build layout and binary size
 
 `plan` and `apply` build and stage under `.snailmail/stage` in the workspace
 rather than in `TMPDIR`, so artifacts hard-link from the local CAS instead of
@@ -376,6 +436,8 @@ go build -trimpath -ldflags="-s -w" -tags nos3 ./cmd/snailmail
 That drops the stripped binary from about 20.6 MB to 12.8 MB. S3 hosts and S3
 blob stores then report that the build has no S3 support; every other format,
 host, and command is unaffected. The default build keeps S3.
+
+## Container image and CI examples
 
 `Dockerfile` builds the runtime image. `examples/github-actions.yml` is a pinned
 workflow template to copy into your own workspace repository, with read-only PR
@@ -417,7 +479,7 @@ The short version:
 - **Verified.** Apply verifies staged bytes structurally and, unless explicitly
   disabled, with the ecosystem client before switching the local target.
 - **Local, S3, and Pages.** `snailmail setup` records deterministic local
-  targets, public/private S3-compatible PyPI, or public GitHub Pages PyPI with a
+  targets, public or private object storage, or public GitHub Pages with a
   separate preview site.
 - **Plan-resolved signing.** Debian signing keys remain outside Git; exact
   verified `InRelease` and `Release.gpg` responses are reviewed in the plan and

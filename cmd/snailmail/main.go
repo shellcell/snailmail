@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -849,7 +850,8 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		resolvedApprovalFile = filepath.Join(flags.Root(), resolvedApprovalFile)
 	}
 	result, err := engine.ApplyWorkspace(ctx, engine.ApplyWorkspaceRequest{
-		Root: flags.Root(), Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
+		Progress: applyProgress(stderr, flags.jsonRequested()),
+		Root:     flags.Root(), Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
 		DebianImage: *debianImage, HelmImage: *helmImage,
 		RPMImage: *rpmImage, APKImage: *apkImage, VerifyAllVersions: *verifyAllVersions,
 		MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
@@ -1346,7 +1348,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "Usage:")
 	fmt.Fprintln(output, "  snailmail init --name NAME")
 	fmt.Fprintln(output, "  snailmail setup <pypi|deb|helm|raw|rpm|apk> --name NAME --output DIR")
-	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail ci github [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
+	fmt.Fprintln(output, "  snailmail setup pypi --name NAME --host s3 --bucket BUCKET --base-url URL [--prefix PREFIX --region REGION]\n  snailmail site [--title TITLE] [--description TEXT] [--output PATH]\n  snailmail rollout [--repo NAME] [--package NAME] [--withdrawn]\n  snailmail ci <github|gitlab> [--snailmail-version vX.Y.Z] > .github/workflows/publish.yml")
 	fmt.Fprintln(output, "  snailmail add [--name NAME --version VERSION] REPOSITORY ARTIFACT...")
 	fmt.Fprintln(output, "  snailmail promote [--track stable] [--distro DISTRO] REPOSITORY PACKAGE VERSION")
 	fmt.Fprintln(output, "  snailmail yank (--track TRACK [--distro DISTRO] | --all) REPOSITORY PACKAGE VERSION")
@@ -1449,4 +1451,39 @@ type approvalKeyResult struct {
 type publishKeyResult struct {
 	Name        string `json:"name"`
 	Fingerprint string `json:"fingerprint"`
+}
+
+// applyProgress renders apply events as they happen.
+//
+// To stderr, so stdout carries only the result and --json stays machine-readable.
+// Suppressed under --json for the same reason a caller asked for JSON: it wants
+// one document, not a narration around it.
+//
+// Serialised, because repositories are prepared concurrently and two goroutines
+// writing a line each would interleave them.
+func applyProgress(stderr io.Writer, quiet bool) engine.ApplyProgress {
+	if quiet {
+		return nil
+	}
+	var mutex sync.Mutex
+	started := time.Now()
+	return func(event engine.ApplyEvent) {
+		mutex.Lock()
+		defer mutex.Unlock()
+		elapsed := time.Since(started).Round(time.Second)
+		where := event.Repository
+		if where == "" {
+			where = plural(event.Total, "repository", "repositories")
+			if event.Total != 0 {
+				where = fmt.Sprintf("%d %s", event.Total, where)
+			}
+		} else if event.Total > 1 {
+			where = fmt.Sprintf("%s (%d/%d)", where, event.Index, event.Total)
+		}
+		line := fmt.Sprintf("   %5s  %-9s %s", elapsed, event.Phase, where)
+		if event.Detail != "" {
+			line += "  " + event.Detail
+		}
+		fmt.Fprintln(stderr, line)
+	}
 }

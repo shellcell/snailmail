@@ -178,11 +178,14 @@ type ApplyWorkspaceRequest struct {
 	APKImage       string
 	// VerifyAllVersions installs every retained version with a real client
 	// rather than the newest and oldest of each package on each architecture.
-	VerifyAllVersions      bool
-	MaxWorkspaceBytes      int64
-	Hosts                  host.Resolver
-	Blobs                  blob.Resolver
-	Gates                  gate.Evaluator
+	VerifyAllVersions bool
+	MaxWorkspaceBytes int64
+	Hosts             host.Resolver
+	Blobs             blob.Resolver
+	Gates             gate.Evaluator
+	// Progress reports each step as it happens. Nil reports nothing, which is what
+	// a caller that only wants the result gets.
+	Progress               ApplyProgress
 	beforeDeploymentCommit func() error
 }
 
@@ -876,7 +879,11 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			_ = os.RemoveAll(item.stageRoot)
 		}
 	}()
-	for _, item := range prepared {
+	for index, item := range prepared {
+		preparation.report(ApplyEvent{
+			Phase: PhaseAuthorize, Repository: item.planned.Name,
+			Index: index + 1, Total: len(prepared), Detail: item.repository.Gate,
+		})
 		if err := preparation.authorize(item); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
@@ -902,10 +909,12 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 			}
 		}
 	}
+	preparation.report(ApplyEvent{Phase: PhaseRecord, Total: len(prepared)})
 	applyGitRevision, err := preparation.commitPublicationLedgers(prepared)
 	if err != nil {
 		return ApplyWorkspaceResult{}, err
 	}
+	preparation.report(ApplyEvent{Phase: PhasePublish, Total: len(prepared)})
 	return preparation.publishAndRecord(prepared, applyGitRevision)
 }
 
@@ -2155,8 +2164,18 @@ func (preparation *applyPreparation) stageOnHosts(prepared []applyRepository) er
 	for index := range prepared {
 		item := &prepared[index]
 		if item.current {
+			// Reported anyway: "already current" is information a reader wants, and
+			// its absence would look like a repository that had been skipped.
+			preparation.report(ApplyEvent{
+				Phase: PhaseStage, Repository: item.planned.Name,
+				Index: index + 1, Total: len(prepared), Detail: "already current",
+			})
 			continue
 		}
+		preparation.report(ApplyEvent{
+			Phase: PhaseStage, Repository: item.planned.Name,
+			Index: index + 1, Total: len(prepared), Detail: item.hostRepository.Type,
+		})
 		files, err := stagedHostFiles(item.stage, item.stagedManifest)
 		if err != nil {
 			return err
@@ -2264,6 +2283,20 @@ func (preparation *applyPreparation) prepareRepositories() ([]applyRepository, e
 			slots <- struct{}{}
 			defer func() { <-slots }()
 			prepared[index], failures[index] = preparation.prepareRepository(planned)
+			// Reported on completion rather than on start: repositories are prepared
+			// concurrently, so start order says nothing and finish order is what a
+			// reader can act on.
+			detail := "verified"
+			if preparation.request.StructuralOnly {
+				detail = "structure only"
+			}
+			if failures[index] != nil {
+				detail = "failed"
+			}
+			preparation.report(ApplyEvent{
+				Phase: PhasePrepare, Repository: planned.Name,
+				Index: index + 1, Total: len(prepared), Detail: detail,
+			})
 		}(index, planned)
 	}
 	preparing.Wait()

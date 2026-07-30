@@ -70,6 +70,13 @@ func (flags *commandFlags) emit(stdout io.Writer, result any) (bool, error) {
 	return true, encoder.Encode(result)
 }
 
+// jsonRequested reports whether machine-readable output was asked for, so a
+// command can suppress a narration that would sit around the one document a
+// caller wants.
+func (flags *commandFlags) jsonRequested() bool {
+	return flags.json != nil && *flags.json
+}
+
 // Root is the resolved workspace root, or "." for commands without the flag.
 func (flags *commandFlags) Root() string {
 	if flags.workspace == nil {
