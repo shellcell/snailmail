@@ -91,6 +91,8 @@ ul.repositories li { padding: .35rem 0; border-bottom: 1px solid var(--line); }
 }
 .badge.signed { color: var(--ok); }
 .badge.unsigned { color: var(--warn); }
+.windowed { margin-top: 1.5rem; padding: .6rem .8rem; font-size: .9rem;
+  color: var(--muted); border-left: 2px solid var(--warn); }
 footer { margin-top: 2.5rem; font-size: .85rem; color: var(--muted); }
 a { color: inherit; }
 /* On a narrow screen the digest is the first thing to go: it is the widest

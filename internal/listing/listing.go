@@ -63,6 +63,10 @@ type Page struct {
 	Endpoint string
 	// Install is the commands a user runs, in order.
 	Install []string
+	// Window caps how many artifacts the page renders. Zero means DefaultWindow.
+	// A repository of any size still produces a page a browser can open, and the
+	// footer reports the true total either way.
+	Window int
 	// Signing is nil when the repository is unsigned, which the page states
 	// plainly rather than leaving to be inferred from an absence.
 	Signing   *Signing
@@ -72,8 +76,42 @@ type Page struct {
 // Render produces the page. The same inputs always produce the same bytes:
 // a repository is content-addressed, and a listing that varied would change the
 // tree without anything having been published.
+// DefaultWindow is how many artifacts a page renders when the caller names no
+// limit.
+//
+// Measured rather than guessed: a rendered row costs about 610 bytes, so Alpine's
+// main/x86_64 at 5450 artifacts is a 3.3 MB page and Debian bookworm at 63,440 is
+// 38.6 MB — regenerated and re-uploaded on every publication, and unusable in a
+// browser when it arrives. Five hundred rows is about 0.3 MB, which is a page that
+// loads, and is far more than anyone scrolls. The complete list is the format's own
+// index, which is what clients read and which is never windowed.
+const DefaultWindow = 500
+
+// selectWindow keeps the most recently published artifacts, up to a limit.
+//
+// Selection is by publication time so the page shows what is current; display
+// order is left alphabetical by the caller's sort, because that is the order
+// someone looking for a particular package reads in. Artifacts locked before
+// publication time was recorded have a zero time and sort last — they are the
+// oldest thing in the repository, and treating an unknown time as the epoch is
+// right here even though it would not be elsewhere.
+func selectWindow(artifacts []Artifact, window int) []Artifact {
+	if window <= 0 {
+		window = DefaultWindow
+	}
+	selected := append([]Artifact(nil), artifacts...)
+	if len(selected) <= window {
+		return selected
+	}
+	sort.SliceStable(selected, func(left, right int) bool {
+		return selected[left].Published.After(selected[right].Published)
+	})
+	return selected[:window]
+}
+
 func Render(page Page) []byte {
-	artifacts := append([]Artifact(nil), page.Artifacts...)
+	artifacts := selectWindow(page.Artifacts, page.Window)
+	total := len(page.Artifacts)
 	// Newest version first within a package, which is the order someone
 	// scanning for "what is the current release" reads in.
 	sort.SliceStable(artifacts, func(left, right int) bool {
@@ -108,8 +146,16 @@ func Render(page Page) []byte {
 	// content-addressed tree, and a timestamp would change that tree every time
 	// the repository was rebuilt — a deployment with nothing published in it.
 	// When each artifact arrived is a fact about the artifact, and is in its row.
+	if len(artifacts) < total {
+		// Stated where it is read, not only in the footer: a visitor who cannot find
+		// a package needs to know the page is a window before concluding it is not
+		// published.
+		fmt.Fprintf(&document, "<p class=\"windowed\">Showing the %d most recently published of %d artifacts. "+
+			"The repository index is complete — this page is a summary for people.</p>\n",
+			len(artifacts), total)
+	}
 	fmt.Fprintf(&document, "<footer>%d %s. Every artifact is pinned by SHA-256 in a reviewed lock before publication.</footer>\n",
-		len(artifacts), plural(len(artifacts), "artifact", "artifacts"))
+		total, plural(total, "artifact", "artifacts"))
 	document.WriteString("<script>\n" + pageScript + "</script>\n</body>\n</html>\n")
 	return document.Bytes()
 }

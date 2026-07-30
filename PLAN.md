@@ -629,6 +629,51 @@ state file. Don't.
 stanzas sorted, one placement each, so git usually merges them; add
 retry-with-rebase and a documented Actions `concurrency:` group per repository.
 
+### 6.1 One workspace or many
+
+Everything lives in one workspace backed by one git repository. At fifty teams
+that reads like a choice between one review queue and fifty disconnected
+workspaces, and it is worth saying which is recommended before people build around
+a guess.
+
+**One workspace per organisation is the default.** The things that sound like they
+would contend mostly do not, and the reason in each case is structural rather than
+a matter of tuning.
+
+- **Locks are per repository.** Each is `repos/<name>.lock.toml`, so two teams
+  publishing to two repositories write to two files. Git merges them without
+  conflict. The only shared file is `snailmail.toml`, which changes when a
+  repository is configured, not when one is published to.
+- **Publication history is per repository too.** The ledger is derived from a
+  lock's git history rather than stored, so a shared workspace does not entangle
+  one team's record of what it published with another's.
+- **The gate is per repository.** `Repository.Gate` is configured per repository,
+  and review routes by path — fifty teams in one state repository is fifty review
+  paths, not one queue. A team owns the review of its own lock file.
+- **The workspace lock covers one checkout**, not one organisation. Two operations
+  in the same working copy are serialised; two CI runners with their own checkouts
+  are not. What actually orders concurrent publications is the host's conditional
+  commit, and that is a per-repository root object.
+- **Size limits are per lock.** A large organisation does not approach a
+  workspace-wide ceiling by adding repositories to it.
+
+**Split when there is a reason to, and there are two.** The first is the blob
+store: a plan binds `blob_store_identity_sha256`, so a workspace has exactly one,
+and a team that must keep its artifacts in its own bucket needs its own workspace.
+The second is access: a workspace is a git repository, so read access to it is
+all-or-nothing. A team whose package names are themselves confidential cannot share
+one.
+
+What splitting does not cost is the host. Separate workspaces can publish into one
+bucket under different prefixes, and a genuine collision is refused by the
+conditional commit rather than silently interleaved.
+
+What it does cost is the shared view. `snailmail site` reads one workspace's
+manifest, so N workspaces are N index pages and there is no single answer to *where
+is this package published?* That is the price of splitting, and it is the reason
+not to split by default.
+
+
 ## 7. `snailmail setup <format>`
 
 The wizard is the adoption surface, so it produces five things, not one:

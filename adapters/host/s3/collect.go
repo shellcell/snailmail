@@ -157,6 +157,13 @@ func (adapter *Adapter) collectOrphanedObjects(ctx context.Context, repository h
 			if referenced[object.Key] {
 				continue
 			}
+			// The browsable page is written canonically on purpose and named by no
+			// descriptor, so it looks exactly like an orphan. Collecting it would
+			// delete the page on every collection and leave the repository
+			// unbrowsable until the next publication.
+			if object.Key == browsablePageKey(repository) {
+				continue
+			}
 			result.Removed++
 			result.RemovedBytes += object.Size
 			if retention.DryRun {

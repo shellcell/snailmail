@@ -507,6 +507,7 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 		}
 		return host.CommitResult{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "commit S3 root metadata", EffectMayHaveOccurred: true, Err: err}
 	}
+	adapter.refreshBrowsablePage(ctx, repository, staged.ID)
 	revision := host.PublishedRevision{
 		NativeRevision: root.ETag, TreeSHA256: descriptor.TreeSHA256,
 		PlanID: descriptor.PlanID, ChangeID: descriptor.ChangeID, RestoreID: staged.ID,
@@ -516,6 +517,43 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 	accessReturned = true
 	return commitResult(repository, revision, access), nil
 }
+
+// refreshBrowsablePage copies the listing to the repository root so a person can
+// open the bucket in a browser.
+//
+// A bucket-hosted repository otherwise has no page anyone can visit. The listing is
+// regenerated for every revision, so it stays in the release directory where it is
+// covered by the publication's file set — writing it canonically instead would
+// leave the previous revision unverifiable after a rollback, because Observe checks
+// the whole set and would find newer bytes. This is a second copy rather than a
+// move, and it is deliberately **outside the publication's guarantees**: nothing
+// verifies it, Observe does not read it, and a rollback does not restore it. It is
+// a convenience for people, and the format's own index remains what clients read.
+//
+// Called after the root object is committed, so the page never advertises a
+// revision that did not become live. A failure here is not a failed publication —
+// the publication has already happened and is sound — so the error is deliberately
+// dropped and the page is simply left as the previous revision wrote it, to be
+// refreshed by the next commit.
+func (adapter *Adapter) refreshBrowsablePage(ctx context.Context, repository host.Repository, stageID string) {
+	content, _, err := adapter.client.Get(ctx, stageKey(repository, stageID, listing.Filename), maximumListingSize)
+	if err != nil {
+		return
+	}
+	_, _ = adapter.client.Put(ctx, PutRequest{
+		Key: browsablePageKey(repository), Body: bytes.NewReader(content), Size: int64(len(content)),
+		SHA256: digestBytes(content), ContentType: contentType(listing.Filename),
+	})
+}
+
+// browsablePageKey is where the unverified human-facing copy lives.
+func browsablePageKey(repository host.Repository) string {
+	return objectKey(repository, listing.Filename)
+}
+
+// maximumListingSize bounds the browsable copy. The listing is windowed to a few
+// hundred rows, so a page far past this is not a listing.
+const maximumListingSize = 16 << 20
 
 // Restore puts back the root object the failed publication replaced, or deletes it
 // if there was none.

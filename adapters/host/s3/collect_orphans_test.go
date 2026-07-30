@@ -178,8 +178,26 @@ func TestCollectLeavesAStagedRepositoryAlone(t *testing.T) {
 			canonical = append(canonical, object.Key)
 		}
 	}
-	if len(canonical) != 1 || !strings.HasSuffix(canonical[0], pypiRootPath) {
-		t.Errorf("canonical objects after collection = %v, want the rebound root alone", canonical)
+	// Two, and both are meant to be there: the rebound root a client fetches, and
+	// the browsable page a person opens. A staged repository keeps nothing else
+	// outside .snailmail, so nothing was invented to delete.
+	if len(canonical) != 2 {
+		t.Errorf("canonical objects after collection = %v, want the root and the browsable page", canonical)
+	}
+	var foundRoot, foundPage bool
+	for _, key := range canonical {
+		switch key {
+		case objectKey(repository, pypiRootPath):
+			foundRoot = true
+		case browsablePageKey(repository):
+			foundPage = true
+		}
+	}
+	if !foundRoot {
+		t.Error("the rebound root was collected")
+	}
+	if !foundPage {
+		t.Error("the browsable page was collected")
 	}
 	// The live revision is still readable, which is the thing a wrong collection
 	// here would break.

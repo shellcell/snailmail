@@ -345,6 +345,51 @@ storage — so the ceiling is index and lock size, not repository size. Generate
 indexes are held whole, which for Debian and yum is the binding constraint at
 around a million package-versions.
 
+## One workspace, or one per team
+
+Use one workspace for the whole organisation unless you have a reason not to.
+
+It sounds like fifty teams would contend on one review queue and one lock, and
+they do not. Each repository has its own lock file, so two teams publishing to two
+repositories touch two different files and git merges them; `snailmail.toml` is the
+only shared file, and it changes when a repository is configured rather than when
+one is published to. Point CODEOWNERS at `repos/<name>.lock.toml` and each team
+reviews its own publications. The workspace lock covers a single checkout, so CI
+runners with their own checkouts never wait on each other — what orders two
+concurrent publications is the host refusing the second, per repository.
+
+Split when one of these is true:
+
+- **A team needs its own blob store.** A plan is bound to one, so a workspace has
+  exactly one.
+- **A team cannot share read access** to the state repository, because a workspace
+  is a git repository and access to it is all-or-nothing.
+
+Separate workspaces can still publish into the same bucket under different
+prefixes. What you lose is the shared view: `snailmail site` describes one
+workspace, so splitting means several index pages and no single answer to where a
+package is published.
+
+## Browsing a bucket-hosted repository
+
+A repository published to object storage serves `index.html` at its root, so
+`https://packages.example/apt/` opens in a browser and shows what is published,
+how to install it, and each artifact's digest.
+
+That page is a **convenience copy and is not covered by the publication's
+guarantees**. Nothing verifies it, `observe` does not read it, and a rollback does
+not restore it — it is refreshed by the next publication. The verified copy lives
+inside the release directory, because it is regenerated for every revision and
+writing it canonically would leave the previous revision unverifiable after a
+rollback. Clients are unaffected either way: they read `simple/`, `index.yaml`,
+`repodata/` or `SHA256SUMS`, and those are the complete, verified answer.
+
+The page shows the 500 most recently published artifacts and says so when there
+are more. A rendered row costs about 610 bytes, so a Debian suite of 63,440
+artifacts would otherwise be a 38 MB page rebuilt and re-uploaded on every
+publication. Set it with `Window` if you want a different size; the footer always
+reports the repository's true total.
+
 ## Collecting superseded releases
 
 An object store keeps every revision it has ever published: a publication writes a
