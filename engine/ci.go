@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/shellcell/snailmail/forge"
 	"github.com/shellcell/snailmail/internal/app"
 	"github.com/shellcell/snailmail/internal/state"
 )
@@ -13,13 +14,16 @@ import (
 // CIWorkflowRequest asks for a starting point for continuous publication.
 type CIWorkflowRequest struct {
 	Root string
+	// Provider is the CI system to render for. Empty means GitHub Actions, which
+	// was the only template before there was a choice.
+	Provider string
 	// Version is the snailmail release the workflow installs. Empty leaves a
 	// placeholder, because a workflow that pinned whatever version generated it
 	// would silently pin the wrong one the moment it was regenerated.
 	Version string
 }
 
-// CIWorkflow writes a GitHub Actions workflow that publishes this workspace.
+// CIWorkflow writes a pipeline definition that publishes this workspace.
 //
 // To stdout, never to a file. A workflow carries decisions this cannot make —
 // which registry to pull verification images through, which secret names a
@@ -44,10 +48,35 @@ func CIWorkflow(request CIWorkflowRequest) ([]byte, error) {
 	if version == "" {
 		version = "vX.Y.Z"
 	}
+	facts := ciFacts{
+		manifest: manifest, version: version,
+		keys:        signingKeyNames(manifest),
+		emulated:    emulatedArchitectures(manifest),
+		directories: directoryHosts(manifest),
+	}
+	switch request.Provider {
+	case "", forge.ProviderGitHub:
+		return githubWorkflow(facts), nil
+	case forge.ProviderGitLab:
+		return gitlabPipeline(facts), nil
+	}
+	return nil, fmt.Errorf("no continuous-publication template for %q", request.Provider)
+}
 
-	keys := signingKeyNames(manifest)
-	emulated := emulatedArchitectures(manifest)
-	directories := directoryHosts(manifest)
+// ciFacts is what both templates derive from the workspace. The derivation is
+// shared and only the rendering differs, so a workspace cannot be described one
+// way to one CI system and another way to another.
+type ciFacts struct {
+	manifest    state.Manifest
+	version     string
+	keys        []string
+	emulated    []string
+	directories []string
+}
+
+func githubWorkflow(facts ciFacts) []byte {
+	manifest, version := facts.manifest, facts.version
+	keys, emulated, directories := facts.keys, facts.emulated, facts.directories
 
 	var out bytes.Buffer
 	fmt.Fprintf(&out, `# Publishes every repository in the %s workspace.
@@ -191,7 +220,7 @@ jobs:
           fi
           git push origin HEAD:main
 `)
-	return out.Bytes(), nil
+	return out.Bytes()
 }
 
 func ciKeyStep(keys []string) string {

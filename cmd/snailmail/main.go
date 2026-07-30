@@ -551,7 +551,7 @@ func runSite(ctx context.Context, args []string, stdout, stderr io.Writer) error
 
 func runCI(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: snailmail ci github [--workspace DIR] [--snailmail-version vX.Y.Z]")
+		return errors.New("usage: snailmail ci <github|gitlab> [--workspace DIR] [--snailmail-version vX.Y.Z]")
 	}
 	provider := args[0]
 	flags := newCommandFlags("ci "+provider, stderr).withWorkspace()
@@ -560,14 +560,15 @@ func runCI(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	if flags.NArg() != 0 {
-		return errors.New("usage: snailmail ci github [--workspace DIR] [--snailmail-version vX.Y.Z]")
-	}
-	if provider != "github" {
-		return fmt.Errorf("no continuous-publication template for %q", provider)
+		return errors.New("usage: snailmail ci <github|gitlab> [--workspace DIR] [--snailmail-version vX.Y.Z]")
 	}
 	// To stdout, so the operator redirects it, reviews it, and owns it. A file
-	// this wrote would be a file it would later overwrite.
-	workflow, err := engine.CIWorkflow(engine.CIWorkflowRequest{Root: flags.Root(), Version: *version})
+	// this wrote would be a file it would later overwrite. Which file it belongs
+	// in differs per provider, which is another reason not to guess: .github/
+	// workflows/publish.yml for Actions, .gitlab-ci.yml at the root for GitLab.
+	workflow, err := engine.CIWorkflow(engine.CIWorkflowRequest{
+		Root: flags.Root(), Version: *version, Provider: provider,
+	})
 	if err != nil {
 		return err
 	}
