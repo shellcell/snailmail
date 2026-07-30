@@ -1250,8 +1250,9 @@ S3 beyond PyPI turned out not to be a declaration. The adapter no longer
 hardcodes `simple/index.html`: `host.Repository` carries `CommitPaths`, filled
 from the format, so the adapter is told how many paths make a revision live and
 refuses a format needing more than one. That admits yum and Helm on path count.
-What still blocks them is the rewrite described below — the mechanism is
-general, the rewrite is per-format, and only the PyPI one exists.
+What was thought to block them was the root rewrite described below. Measuring
+the formats showed the opposite: rpm and Helm need no rewrite at all, and for rpm
+one would be wrong. See §16.
 
 A Pages repository needs a companion preview site only where a gate waits for a
 human to review one. Under an `auto` gate the preview is optional, and its
@@ -1361,15 +1362,28 @@ Still open:
   returns its generated files as bytes. Streaming them changes `domain.File`,
   the build graph, and materialisation — and it gates the scale at which any of
   the sharding above matters.
-- **Can an object store publish Debian atomically?** Partly answered by doing
-  it for PyPI. The adapter writes the whole tree under
-  `.snailmail/releases/<tree>/` and then PUTs one root object whose references
-  are rewritten to resolve inside that immutable directory, so a single PUT
-  makes a revision live with no window. That works for any format where one path
-  is the entry point — yum's `repodata/repomd.xml`, Helm's `index.yaml` — and the
-  rewrite is the only per-format part: `href=` for a simple index, `<location
-  href=>` for repomd, `urls:` for an index. It does not work for Debian, which
-  needs a `Release` and its detached signature live together, nor Alpine with an
-  index per architecture, nor raw with a listing and a `SHA256SUMS`. For those
-  the choice is still a two-phase switch through a pointer object or an admitted
-  window — but the question is now about the multi-path formats only.
+- **Can an object store publish Debian atomically?** Narrowed, and a wrong
+  assumption removed on the way.
+
+  A revision goes live by putting one object. That is sufficient on its own when
+  every other published path holds bytes fixed by the path — then a new
+  revision's files cannot disturb the live one, and switching the root commits.
+  rpm and Helm are both in that position: repodata is
+  `<sha256>-<kind>.xml.gz`, a chart is stored under its own digest, and both
+  builders refuse to let different bytes occupy one path. So neither needs the
+  staging directory, and for rpm it would actively break the repository:
+  `repodata/repomd.xml.asc` is a detached signature over `repomd.xml`, so
+  rebinding that document leaves a signature that does not verify.
+
+  PyPI is the exception, and the reason the staging directory exists at all.
+  `simple/<project>/index.html` is at a fixed path and gains a line whenever a
+  version is added, so writing the new revision would change what the live one
+  serves. It is therefore staged under `.snailmail/releases/<tree>/` with its
+  root rebound to point inside — now `formats.RootRewriter`, declared by PyPI
+  alone.
+
+  Debian, Alpine and raw remain out for the original reason, which is path count
+  rather than rewriting: a `Release` and its detached signature have to become
+  live together, Alpine has an index per architecture, raw has a listing and a
+  `SHA256SUMS`. For those the choice is still a two-phase switch through a
+  pointer object or an admitted window.

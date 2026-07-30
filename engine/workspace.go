@@ -1504,13 +1504,16 @@ func toHostRepository(root, workspaceID, hostIdentity, name string, repository s
 	if selected, err := formats.For(repository.Format); err == nil {
 		commitPaths = selected.CommitPaths(formatRepositoryWithKeys(repository, name, nil))
 	}
+	// Nil for a format with no rewrite; a host that needs one refuses, naming the
+	// format, rather than being handed something that cannot work.
+	rootRewriter, _ := formats.RootRewriterFor(repository.Format)
 	canonicalEndpoint := repository.Host.CanonicalEndpoint
 	if repository.Host.Type == "local" {
 		canonicalEndpoint = repository.Host.Path
 	}
 	return host.Repository{
 		Name: name, WorkspaceID: workspaceID, HostIdentity: hostIdentity, Format: repository.Format,
-		CommitPaths: commitPaths, Type: repository.Host.Type,
+		CommitPaths: commitPaths, RootRewriter: rootRewriter, Type: repository.Host.Type,
 		Visibility: repository.Visibility, WorkspaceRoot: root, Path: repository.Host.Path,
 		Bucket: repository.Host.Bucket, Prefix: repository.Host.Prefix, Region: repository.Host.Region,
 		Endpoint: repository.Host.Endpoint, CanonicalEndpoint: canonicalEndpoint,

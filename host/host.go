@@ -53,7 +53,13 @@ type Repository struct {
 	// shape of a publication without knowing anything about ecosystems: an
 	// object store, for instance, can commit one such path atomically and no
 	// more.
-	CommitPaths       []string
+	CommitPaths []string
+	// RootRewriter rebinds the root document's references so they resolve inside
+	// a directory holding only this revision. Set only for a format that needs
+	// it: one whose non-root paths are rewritten between revisions, so a new
+	// revision cannot simply be written alongside the live one. Nil otherwise,
+	// including for formats that need no staging at all.
+	RootRewriter      RootRewriter
 	Type              string
 	Visibility        string
 	WorkspaceRoot     string
@@ -194,4 +200,16 @@ func (err *Error) Unwrap() error {
 func IsKind(err error, kind ErrorKind) bool {
 	var hostError *Error
 	return errors.As(err, &hostError) && hostError.Kind == kind
+}
+
+// RootRewriter rebinds a root document's references to an immutable release
+// directory and records a host's publication binding in it.
+//
+// Declared here rather than read from the format registry, so a host adapter
+// goes on knowing nothing about ecosystems: it is handed the rewrite the same
+// way it is handed CommitPaths. The result must be a pure function of its
+// inputs, because a host recomputes the root it expects and compares it byte for
+// byte against what it published.
+type RootRewriter interface {
+	RewriteRoot(content []byte, releaseDirectory, annotation string) ([]byte, error)
 }

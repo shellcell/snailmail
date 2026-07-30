@@ -169,7 +169,7 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 		}
 		return host.PublishedRevision{}, infrastructure("read immutable S3 root", err)
 	}
-	expectedRoot, err := rewritePyPIRoot(releaseRoot, rootBindingFromRevision(revision))
+	expectedRoot, err := rewriteRoot(repository, releaseRoot, revision.TreeSHA256, bindingAnnotation(rootBindingFromRevision(revision)))
 	if err != nil {
 		return host.PublishedRevision{}, err
 	}
@@ -178,7 +178,7 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 		return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 root", Err: errors.New("canonical root bytes do not match immutable release")}
 	}
 	if !bytes.Equal(canonicalRoot, expectedRoot) {
-		legacyRoot, legacyErr := rewriteLegacyPyPIRoot(releaseRoot, revision.TreeSHA256, revision.PlanID, revision.ChangeID)
+		legacyRoot, legacyErr := rewriteRoot(repository, releaseRoot, revision.TreeSHA256, legacyBindingAnnotation(revision.PlanID, revision.ChangeID))
 		if legacyErr == nil && bytes.Equal(canonicalRoot, legacyRoot) {
 			// Force a same-tree update so the next reviewed plan migrates the root
 			// to body-bound publication metadata.
@@ -215,7 +215,7 @@ func (adapter *Adapter) ReadAccess(ctx context.Context, repository host.Reposito
 	if err != nil {
 		return host.ClientAccess{}, infrastructure("read immutable S3 root", err)
 	}
-	canonicalRoot, err := rewritePyPIRoot(releaseRoot, rootBindingFromRevision(revision))
+	canonicalRoot, err := rewriteRoot(repository, releaseRoot, revision.TreeSHA256, bindingAnnotation(rootBindingFromRevision(revision)))
 	if err != nil {
 		return host.ClientAccess{}, err
 	}
@@ -444,7 +444,7 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 		ReleaseSHA256: releaseDigest, ManifestSHA256: manifestDigest, RestoreID: staged.ID,
 		RestoreSHA256: restoreDigest, RestoreRootSHA256: restoreRootDigest,
 	}
-	rootContent, err = rewritePyPIRoot(rootContent, binding)
+	rootContent, err = rewriteRoot(repository, rootContent, binding.TreeSHA256, bindingAnnotation(binding))
 	if err != nil {
 		return host.CommitResult{}, err
 	}
@@ -1109,27 +1109,48 @@ func validateFile(file host.File) error {
 	return nil
 }
 
-func rewritePyPIRoot(content []byte, binding rootBinding) ([]byte, error) {
-	text := string(content)
-	if !strings.Contains(text, `<a href="`) {
-		return nil, &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "rewrite PyPI root", Err: errors.New("root index has no project links")}
+// rewriteRoot rebinds a release's root document so its references resolve inside
+// the immutable release directory, and records the binding in it. One PUT of the
+// result makes the revision live.
+//
+// The rewrite belongs to the format and arrives on the repository, so this knows
+// only that a root has one. A format without one publishes through more than one
+// path and never reaches here — singleRootPath refuses it first — but a nil
+// rewriter is still reported rather than dereferenced, because a repository
+// assembled by something other than the engine would otherwise panic during a
+// publication.
+func rewriteRoot(repository host.Repository, content []byte, treeSHA256, annotation string) ([]byte, error) {
+	if repository.RootRewriter == nil {
+		return nil, &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "rewrite S3 root",
+			Err: fmt.Errorf("format %q does not say how to rebind its root document to a release directory", repository.Format)}
 	}
-	prefix := `href="../.snailmail/releases/` + binding.TreeSHA256 + `/simple/`
-	rewritten := strings.ReplaceAll(text, `href="`, prefix)
-	rewritten += "\n<!-- snailmail tree=" + binding.TreeSHA256 + " plan=" + binding.PlanID + " change=" + binding.ChangeID +
-		" release=" + binding.ReleaseSHA256 + " manifest=" + binding.ManifestSHA256 + " restore=" + binding.RestoreID +
-		" restore-descriptor=" + binding.RestoreSHA256 + " restore-root=" + binding.RestoreRootSHA256 + " -->\n"
-	return []byte(rewritten), nil
+	rewritten, err := repository.RootRewriter.RewriteRoot(content, releaseDirectory(treeSHA256), annotation)
+	if err != nil {
+		return nil, &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "rewrite S3 root", Err: err}
+	}
+	return rewritten, nil
 }
 
-func rewriteLegacyPyPIRoot(content []byte, treeSHA256, planID, changeID string) ([]byte, error) {
-	text := string(content)
-	if !strings.Contains(text, `<a href="`) {
-		return nil, errors.New("root index has no project links")
-	}
-	rewritten := strings.ReplaceAll(text, `href="`, `href="../.snailmail/releases/`+treeSHA256+`/simple/`)
-	rewritten += "\n<!-- snailmail plan=" + planID + " change=" + changeID + " -->\n"
-	return []byte(rewritten), nil
+// releaseDirectory is where a release's whole tree is written, relative to the
+// repository root. Everything a root names lives under it, at a path that never
+// changes once written.
+func releaseDirectory(treeSHA256 string) string {
+	return ".snailmail/releases/" + treeSHA256 + "/"
+}
+
+// bindingAnnotation is what the host records in the published root so it can
+// read its own publication binding back out of the bytes it wrote.
+func bindingAnnotation(binding rootBinding) string {
+	return "snailmail tree=" + binding.TreeSHA256 + " plan=" + binding.PlanID + " change=" + binding.ChangeID +
+		" release=" + binding.ReleaseSHA256 + " manifest=" + binding.ManifestSHA256 + " restore=" + binding.RestoreID +
+		" restore-descriptor=" + binding.RestoreSHA256 + " restore-root=" + binding.RestoreRootSHA256
+}
+
+// legacyBindingAnnotation is the shorter binding written before the root carried
+// its release, manifest and restore identities. Roots published then are still
+// live, and Observe recognises one so the next reviewed plan can migrate it.
+func legacyBindingAnnotation(planID, changeID string) string {
+	return "snailmail plan=" + planID + " change=" + changeID
 }
 
 func rootBindingFromRevision(revision host.PublishedRevision) rootBinding {
@@ -1334,7 +1355,7 @@ func (adapter *Adapter) validateRestoreTarget(ctx context.Context, repository ho
 	if err != nil {
 		return infrastructure("read retained immutable S3 root", err)
 	}
-	expectedRoot, err := rewritePyPIRoot(immutableRoot, rootBindingFromRevision(revision))
+	expectedRoot, err := rewriteRoot(repository, immutableRoot, revision.TreeSHA256, bindingAnnotation(rootBindingFromRevision(revision)))
 	if err != nil {
 		return err
 	}
