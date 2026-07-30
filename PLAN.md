@@ -458,13 +458,20 @@ provenance is a field beside the origin, with the levels ordered:
 | `computed` | snailmail hashed what it downloaded | apk, and a last resort |
 | `operator` | a person supplied it to `adopt` | all |
 
-PyPI, Helm, Debian and yum are read today. Debian and yum walk a chain and so
+All five readable formats are read today. Debian and yum walk a chain and so
 record `index-chain`, where PyPI and Helm record `index-stated`. `import` defaults to the
 strongest level a format supports without extra
 configuration — `index-chain` for deb and rpm, `index-stated` for pypi and helm —
-and takes a key to reach `signed-index`. A minimum acceptable level is a flag, so a
-workspace that will not accept unauthenticated bytes can say so once rather than
-per artifact.
+and takes a key to reach `signed-index`. `import --min-provenance` is that floor, so a
+workspace that will not accept unauthenticated bytes says so once rather than per
+artifact; it is checked before each fetch, since an artifact that would be refused
+is not worth downloading.
+
+The one place this bends `adopt`'s contract is deliberate and narrow: `adopt`
+accepts a missing digest **only** when the caller names `computed` as the
+provenance. A forgotten digest is still refused, and so is a missing one under any
+level that claims an index stated something — so a lock can never hold a computed
+pin that nothing recorded as computed.
 
 Alpine records `computed` and says so. That is the honest answer rather than an
 exception made quietly: its index authenticates a control section, not a file, so

@@ -20,6 +20,7 @@ import (
 	httpsource "github.com/shellcell/snailmail/adapters/source/http"
 	"github.com/shellcell/snailmail/engine"
 	"github.com/shellcell/snailmail/gate"
+	"github.com/shellcell/snailmail/internal/state"
 	"github.com/shellcell/snailmail/internal/version"
 	"github.com/shellcell/snailmail/internal/wire"
 	"github.com/shellcell/snailmail/signer"
@@ -1642,6 +1643,8 @@ func runImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	track := flags.String("track", "", "track to place imported versions on")
 	distro := flags.String("distro", "", "distribution to place imported versions on")
 	limit := flags.Int("limit", 0, "import at most this many artifacts")
+	minProvenance := flags.String("min-provenance", "",
+		"refuse artifacts whose digest was established more weakly than this: signed-index, index-chain, index-stated, or computed")
 	dryRun := flags.Bool("dry-run", false, "report what would be imported without recording it")
 	publicOrigin := flags.Bool("public-origin", false,
 		"confirm the recorded origin URLs are public and contain no secrets")
@@ -1650,11 +1653,16 @@ func runImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if err != nil {
 		return err
 	}
+	if *minProvenance != "" && !state.ValidProvenance(state.DigestProvenance(*minProvenance)) {
+		return fmt.Errorf("unknown --min-provenance %q: use signed-index, index-chain, index-stated, or computed",
+			*minProvenance)
+	}
 	result, err := engine.ImportRepository(ctx, engine.ImportRepositoryRequest{
 		Root: flags.Root(), Repository: positional[0], URL: positional[1],
 		Project: *project, Suite: *suite, Component: *component, Architecture: *architecture,
 		Track: *track, Distro: *distro, Limit: *limit,
-		DryRun: *dryRun, PublicOrigin: *publicOrigin, Fetcher: httpsource.New(),
+		MinimumProvenance: state.DigestProvenance(*minProvenance),
+		DryRun:            *dryRun, PublicOrigin: *publicOrigin, Fetcher: httpsource.New(),
 	})
 	if err != nil {
 		return err

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/shellcell/snailmail/formats/apk"
 	"github.com/shellcell/snailmail/formats/deb"
 	"github.com/shellcell/snailmail/formats/helm"
 	"github.com/shellcell/snailmail/formats/pypi"
@@ -31,6 +32,11 @@ type ImportRepositoryRequest struct {
 	Repository string
 	// URL is the published repository to read.
 	URL string
+	// MinimumProvenance refuses any artifact whose digest was established more
+	// weakly than this. Empty accepts whatever the format's index supports, which is
+	// the strongest that format offers.
+	MinimumProvenance state.DigestProvenance
+
 	// Suite, Component and Architecture select which Debian index to read. Each
 	// defaults to what the repository's Release names first, which is what apt
 	// would pick given the same URL.
@@ -101,6 +107,7 @@ var importEnumerators = map[string]importEnumerator{
 	"helm": importHelmFiles,
 	"deb":  importDebFiles,
 	"rpm":  importRPMFiles,
+	"apk":  importAPKFiles,
 }
 
 // ImportSkipped is one artifact the index named that was not imported, with the
@@ -179,10 +186,21 @@ func ImportRepository(ctx context.Context, request ImportRepositoryRequest) (Imp
 			})
 			continue
 		}
-		if file.SHA256 == "" {
+		if file.SHA256 == "" && file.Provenance != state.ProvenanceComputed {
 			result.Skipped = append(result.Skipped, ImportSkipped{
 				Filename: file.Filename,
 				Reason:   "the index publishes no SHA-256, so the artifact cannot be pinned to a stated digest",
+			})
+			continue
+		}
+		// The floor, so a workspace that will not accept unauthenticated bytes says so
+		// once rather than inspecting each artifact after the fact. Checked before the
+		// fetch: an artifact that would be refused is not worth downloading.
+		if request.MinimumProvenance != "" && !file.Provenance.AtLeast(request.MinimumProvenance) {
+			result.Skipped = append(result.Skipped, ImportSkipped{
+				Filename: file.Filename,
+				Reason: fmt.Sprintf("this index establishes its digest as %s, below the required %s",
+					file.Provenance, request.MinimumProvenance),
 			})
 			continue
 		}
@@ -539,6 +557,53 @@ func importRPMFiles(ctx context.Context, request ImportRepositoryRequest) ([]imp
 	}
 	sort.Slice(importable, func(left, right int) bool { return importable[left].Filename < importable[right].Filename })
 	return importable, primaryURL.String(), nil
+}
+
+// importAPKFiles reads an Alpine repository's APKINDEX.tar.gz.
+//
+// Alone among the formats read here, this one cannot produce a pinned digest. The
+// index states C:Q1<base64>, which is the SHA-1 of a package's control section
+// rather than of the file — verified against Alpine's own archive, where the two
+// disagree for every package because they are digests of different things. So each
+// artifact is marked ProvenanceComputed and its SHA-256 is taken from the bytes
+// that arrive, which is the honest description of what the pin is worth.
+func importAPKFiles(ctx context.Context, request ImportRepositoryRequest) ([]importableFile, string, error) {
+	base, err := parseDoctorURL(request.URL)
+	if err != nil {
+		return nil, "", err
+	}
+	if !strings.HasSuffix(base.Path, "/") {
+		base.Path += "/"
+	}
+	indexURL, err := resolveDoctorReference(base.String(), "APKINDEX.tar.gz")
+	if err != nil {
+		return nil, "", err
+	}
+	response, err := request.Fetcher.Fetch(ctx, indexURL.String(), apk.MaximumIndexBytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", indexURL, err)
+	}
+	packages, err := apk.ParseIndex(response.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", indexURL, err)
+	}
+	importable := make([]importableFile, 0, len(packages))
+	for _, entry := range packages {
+		// APKINDEX does not state a filename; apk derives it from the name and
+		// version, which is why both are refused above if they could build a path.
+		artifactURL, err := resolveDoctorReference(base.String(), entry.Filename())
+		if err != nil {
+			continue
+		}
+		importable = append(importable, importableFile{
+			Filename:   entry.Filename(),
+			URLs:       []string{artifactURL.String()},
+			Provenance: state.ProvenanceComputed,
+			Ambiguous:  entry.Ambiguous,
+		})
+	}
+	sort.Slice(importable, func(left, right int) bool { return importable[left].Filename < importable[right].Filename })
+	return importable, indexURL.String(), nil
 }
 
 // findReleaseFile locates a Packages entry, trying each compression Release may

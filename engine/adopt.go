@@ -59,9 +59,18 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	if !request.PublicOrigin {
 		return AdoptArtifactResult{}, errors.New("adopt requires confirmation that the persisted origin URL is public and contains no secrets")
 	}
-	decoded, err := hex.DecodeString(request.SHA256)
-	if err != nil || len(decoded) != sha256.Size || request.SHA256 != strings.ToLower(request.SHA256) {
-		return AdoptArtifactResult{}, errors.New("adopt requires a lowercase SHA-256 pin")
+	// A digest is required, with one exception, and it is stated rather than
+	// inferred: the caller may omit it only by declaring the pin computed. That is
+	// for a format whose index cannot state one at all — Alpine, whose C: field
+	// digests a control section rather than a file. Making the exception a
+	// consequence of the provenance the caller asked for means a lock can never
+	// hold a computed pin that nothing recorded as computed.
+	computing := request.SHA256 == "" && request.Provenance == state.ProvenanceComputed
+	if !computing {
+		decoded, err := hex.DecodeString(request.SHA256)
+		if err != nil || len(decoded) != sha256.Size || request.SHA256 != strings.ToLower(request.SHA256) {
+			return AdoptArtifactResult{}, errors.New("adopt requires a lowercase SHA-256 pin")
+		}
 	}
 	originURL, err := url.Parse(request.URL)
 	if err != nil || source.ValidatePublicURL(originURL) != nil {
@@ -136,7 +145,10 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 		}
 	}
 	actualDigest := sha256.Sum256(response.Body)
-	if hex.EncodeToString(actualDigest[:]) != request.SHA256 {
+	// When computing, there is nothing to compare against: the digest recorded is of
+	// the bytes that arrived, which is exactly what ProvenanceComputed says and no
+	// more. Everywhere else the stated digest is the gate.
+	if !computing && hex.EncodeToString(actualDigest[:]) != request.SHA256 {
 		return AdoptArtifactResult{}, errors.New("adopted artifact does not match the required SHA-256")
 	}
 	blob, err := state.InspectArtifactBytes(repository.Format, filename, response.Body, adoptIdentity(repository.Format, request))

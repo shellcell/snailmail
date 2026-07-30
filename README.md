@@ -221,7 +221,29 @@ Multilib is preserved: `i686` and `x86_64` builds of one name-version are two
 artifacts, recorded as two blobs under the same package version rather than one
 overwriting the other.
 
-Alpine is not read yet.
+And Alpine, which is the honest exception:
+
+```sh
+snailmail import --public-origin --dry-run alpine https://dl-cdn.alpinelinux.org/alpine/v3.19/main/x86_64
+```
+
+An `APKINDEX` entry carries `C:Q1…`, which decodes to a SHA-1 of the package's
+*control section* — not of the file. Checked against Alpine's own archive: the
+index states `6026787b…` for `7zip-23.01-r0.apk`, whose actual SHA-1 is
+`76a96042…`. They differ because they are digests of different things. So there is
+nothing in an Alpine index to pin an artifact to, and an imported apk records
+`computed`: a digest of the bytes snailmail downloaded, and nothing more.
+
+That is allowed but never hidden. If your workspace will not accept
+unauthenticated bytes, say so once:
+
+```sh
+snailmail import --public-origin --min-provenance index-stated alpine https://…
+```
+
+Every artifact then reports why it was refused, rather than being pinned to
+something weaker than you asked for. The floor works for any format — a Debian
+import establishes `index-chain`, so it passes an `index-stated` floor.
 
 ## Adopting an artifact from a URL
 
