@@ -24,10 +24,38 @@ func newCommandFlags(name string, stderr io.Writer) *commandFlags {
 	return &commandFlags{set: set}
 }
 
-// withWorkspace declares the shared workspace root flag.
+// withWorkspace declares the shared workspace root flag, under both names it is
+// reasonably called.
+//
+// --workspace is the documented one. --root is accepted because it is what the
+// engine calls the same thing everywhere — workspaceRoot, Request.Root,
+// flags.Root — so anyone who has read the source guesses it, as does anyone
+// thinking of a workspace as a directory. A flag error is a poor thing to spend a
+// reader's attention on when the intent was unambiguous.
+//
+// Both write to one variable, so either may be given and the last wins.
 func (flags *commandFlags) withWorkspace() *commandFlags {
-	flags.workspace = flags.set.String("workspace", ".", "workspace root")
+	root := "."
+	flags.workspace = &root
+	flags.set.Var(&stringFlag{target: &root}, "workspace", "workspace root")
+	flags.set.Var(&stringFlag{target: &root}, "root", "workspace root (alias for --workspace)")
 	return flags
+}
+
+// stringFlag lets two flag names share one destination. The flag package prints
+// usage by calling String on a zero value, so it has to tolerate no target.
+type stringFlag struct{ target *string }
+
+func (value *stringFlag) String() string {
+	if value == nil || value.target == nil {
+		return ""
+	}
+	return *value.target
+}
+
+func (value *stringFlag) Set(given string) error {
+	*value.target = given
+	return nil
 }
 
 func (flags *commandFlags) String(name, value, usage string) *string {

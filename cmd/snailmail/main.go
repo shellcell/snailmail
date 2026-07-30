@@ -812,6 +812,7 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	flags := newCommandFlags("apply", stderr).withWorkspace().withJSON()
 	plan := flags.String("plan", "snailmail.snailmail-plan.json", "reviewed plan file")
 	structuralOnly := flags.Bool("structural-only", false, "skip ecosystem client verification")
+	dryRun := flags.Bool("dry-run", false, "build, verify and check gates, then stop before writing to any host")
 	python := flags.String("python", "python3", "Python executable for PyPI verification")
 	runner := flags.String("runner", "podman", "OCI runner for Debian and Helm verification")
 	debianImage := flags.String("debian-image", engine.DefaultDebianVerificationImage, "digest-pinned Debian image")
@@ -851,7 +852,8 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	result, err := engine.ApplyWorkspace(ctx, engine.ApplyWorkspaceRequest{
 		Progress: applyProgress(stderr, flags.jsonRequested()),
-		Root:     flags.Root(), Plan: *plan, StructuralOnly: *structuralOnly, Python: *python, Runner: *runner,
+		Root:     flags.Root(), Plan: *plan, StructuralOnly: *structuralOnly, DryRun: *dryRun,
+		Python: *python, Runner: *runner,
 		DebianImage: *debianImage, HelmImage: *helmImage,
 		RPMImage: *rpmImage, APKImage: *apkImage, VerifyAllVersions: *verifyAllVersions,
 		MaxWorkspaceBytes: *maxWorkspaceMiB << 20,
@@ -873,11 +875,20 @@ func runApply(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		return err
 	}
 	printBrand(stdout)
-	fmt.Fprintf(stdout, "📦  applied %d repository %s", result.Applied, plural(result.Applied, "change", "changes"))
+	verb := "applied"
+	if result.DryRun {
+		// Said plainly, because the number that follows answers a different
+		// question and a reader skimming would otherwise take it for a publication.
+		verb = "would apply"
+	}
+	fmt.Fprintf(stdout, "📦  %s %d repository %s", verb, result.Applied, plural(result.Applied, "change", "changes"))
 	if result.Current != 0 {
 		fmt.Fprintf(stdout, " (%d already current)", result.Current)
 	}
 	fmt.Fprintln(stdout)
+	if result.DryRun {
+		fmt.Fprintln(stdout, "✉️   dry run: nothing was staged, recorded or published")
+	}
 	fmt.Fprintf(stdout, "✉️   plan sha256:%s\n", result.PlanID)
 	return nil
 }
@@ -1368,7 +1379,7 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  snailmail keys audit")
 	fmt.Fprintln(output, "  snailmail approve --plan PLAN --repository NAME --key FILE --yes")
 	fmt.Fprintln(output, "  snailmail render [--output site]")
-	fmt.Fprintln(output, "  snailmail apply [--plan snailmail.snailmail-plan.json]")
+	fmt.Fprintln(output, "  snailmail apply [--plan snailmail.snailmail-plan.json] [--dry-run]")
 	fmt.Fprintln(output, "  snailmail build pypi --input DIR --output DIR")
 	fmt.Fprintln(output, "  snailmail build deb --input DIR --output DIR [--suite stable --architectures amd64]")
 	fmt.Fprintln(output, "  snailmail build helm --input DIR --output DIR")

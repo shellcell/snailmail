@@ -183,6 +183,14 @@ type ApplyWorkspaceRequest struct {
 	Hosts             host.Resolver
 	Blobs             blob.Resolver
 	Gates             gate.Evaluator
+	// DryRun builds and verifies every repository and checks every gate, then stops
+	// before anything is written to a host.
+	//
+	// Distinct from StructuralOnly, which only lowers verification depth and still
+	// publishes. A dry run reaches no further than reads — Observe is read-only and
+	// a review gate only reads its forge — so nothing is staged, no ledger is
+	// committed, and no revision is switched.
+	DryRun bool
 	// Progress reports each step as it happens. Nil reports nothing, which is what
 	// a caller that only wants the result gets.
 	Progress               ApplyProgress
@@ -193,6 +201,9 @@ type ApplyWorkspaceResult struct {
 	PlanID  string `json:"plan_id"`
 	Applied int    `json:"applied"`
 	Current int    `json:"current"`
+	// DryRun reports that nothing was published. Applied then counts what would
+	// have been, so a caller reading the number knows which question it answers.
+	DryRun bool `json:"dry_run,omitempty"`
 }
 
 func InitWorkspace(request InitWorkspaceRequest) error {
@@ -887,6 +898,25 @@ func ApplyWorkspace(ctx context.Context, request ApplyWorkspaceRequest) (ApplyWo
 		if err := preparation.authorize(item); err != nil {
 			return ApplyWorkspaceResult{}, err
 		}
+	}
+	if preparation.request.DryRun {
+		// Stopped here deliberately: everything above is a read or a local build,
+		// and the next phase is the first that writes to a host. Reporting what
+		// would happen is worth less than the guarantee that asking did not change
+		// anything.
+		wouldApply := 0
+		for _, item := range prepared {
+			if !item.current {
+				wouldApply++
+			}
+		}
+		// No publish event: reporting the phase that did not happen, however it is
+		// labelled, reads as though it did. The result says nothing was published,
+		// and that is where a reader looks for the outcome.
+		return ApplyWorkspaceResult{
+			PlanID: preparation.plan.PlanID, Applied: wouldApply,
+			Current: len(prepared) - wouldApply, DryRun: true,
+		}, nil
 	}
 	defer func() {
 		for _, item := range prepared {

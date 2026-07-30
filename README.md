@@ -38,6 +38,16 @@ go run ./cmd/snailmail apply --plan snailmail.snailmail-plan.json
 `plan` writes what it intends to do; `apply` does it and records a publication
 ledger entry. Nothing reaches a host until a plan has been applied.
 
+`apply` reports each phase as it runs — a publication takes minutes, most of it
+building and running a real client per format — and writes that narration to
+stderr, so `--json` still emits exactly one document on stdout.
+
+`apply --dry-run` builds, verifies and checks every gate, then stops before
+writing anything to a host. It is not the same as `--structural-only`, which only
+skips client verification and still publishes.
+
+Every command that takes `--workspace` also accepts `--root`.
+
 ## What runs where
 
 | Host | pypi | deb | rpm | apk | helm | raw |

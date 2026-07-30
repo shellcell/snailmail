@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -156,5 +157,57 @@ func TestPhasesAreReportedInOrder(t *testing.T) {
 		if at > highest {
 			highest = at
 		}
+	}
+}
+
+// A dry run reaches no further than reads: nothing staged, no ledger committed,
+// no revision switched. StructuralOnly does not do this — it only lowers
+// verification depth and still publishes — so the two must not be confused.
+func TestDryRunWritesNothingToTheHost(t *testing.T) {
+	root := multiRepositoryWorkspace(t, "pypi")
+	planName := filepath.Join(root, "plan.json")
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: planName, ExpiresIn: time.Hour, VerificationMode: "structural",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	log := &progressLog{}
+	result, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, StructuralOnly: true, DryRun: true, Progress: log.record,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.DryRun {
+		t.Error("the result does not say it was a dry run, so Applied reads as published")
+	}
+	if result.Applied != 1 {
+		t.Errorf("would apply %d, want 1", result.Applied)
+	}
+	// The host is a directory in the fixture, so its absence is the proof.
+	if entries, err := os.ReadDir(filepath.Join(root, "public", "pypi")); err == nil && len(entries) != 0 {
+		t.Errorf("a dry run wrote %d entries under public/", len(entries))
+	}
+	// It stops before staging, and says so by not claiming to have staged.
+	for _, event := range log.snapshot() {
+		if event.Phase == PhaseStage || event.Phase == PhaseRecord || event.Phase == PhasePublish {
+			t.Errorf("a dry run reported phase %q", event.Phase)
+		}
+	}
+	// And a real apply afterwards still publishes, so a dry run leaves nothing
+	// behind that blocks the thing it was previewing.
+	if _, err := PlanWorkspace(context.Background(), PlanWorkspaceRequest{
+		Root: root, Output: planName, ExpiresIn: time.Hour, VerificationMode: "structural",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	applied, err := ApplyWorkspace(context.Background(), ApplyWorkspaceRequest{
+		Root: root, Plan: planName, StructuralOnly: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied.DryRun || applied.Applied != 1 {
+		t.Errorf("the apply after a dry run gave %+v", applied)
 	}
 }
