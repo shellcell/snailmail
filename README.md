@@ -151,6 +151,12 @@ signatures, or historical snailmail publication.
 
 ## Inspecting a workspace
 
+`snailmail status` also reports size: each repository's lock in bytes, the count
+and total size of the distinct artifacts it binds, and the workspace's lock total
+with the largest repository named. The lock is parsed whole on every plan and
+every apply, so its size is the number that predicts where a workspace stops
+being comfortable — and which repository to split when it does.
+
 `snailmail status` reports committed workspace evidence without contacting
 hosts or providers. Human output summarizes visible and retained versions,
 visible publication-binding completeness, and whether a managed deployment

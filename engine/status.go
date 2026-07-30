@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"os"
 	"sort"
 
 	"github.com/shellcell/snailmail/internal/state"
@@ -14,25 +16,42 @@ type StatusWorkspaceRequest struct {
 }
 
 type StatusWorkspaceResult struct {
-	SchemaVersion    int                `json:"schema_version"`
-	Workspace        string             `json:"workspace"`
-	GitRevision      string             `json:"git_revision"`
-	ObservationScope string             `json:"observation_scope"`
-	Repositories     []StatusRepository `json:"repositories"`
+	SchemaVersion    int    `json:"schema_version"`
+	Workspace        string `json:"workspace"`
+	GitRevision      string `json:"git_revision"`
+	ObservationScope string `json:"observation_scope"`
+	// LockBytes is every repository's lock added up, which is what a single git
+	// operation has to carry.
+	LockBytes    int64              `json:"lock_bytes"`
+	Repositories []StatusRepository `json:"repositories"`
 }
 
 type StatusRepository struct {
-	Name                    string           `json:"name"`
-	Format                  string           `json:"format"`
-	Track                   string           `json:"track"`
-	Suite                   string           `json:"suite,omitempty"`
-	Visibility              string           `json:"visibility"`
-	GatePolicy              string           `json:"gate_policy"`
-	RetainedPackageVersions int              `json:"retained_package_versions"`
-	VisiblePackageVersions  int              `json:"visible_package_versions"`
-	VisibleBindingState     string           `json:"visible_binding_state"`
-	VisiblePackages         []StatusPackage  `json:"visible_packages"`
-	Deployment              StatusDeployment `json:"deployment"`
+	Name                    string `json:"name"`
+	Format                  string `json:"format"`
+	Track                   string `json:"track"`
+	Suite                   string `json:"suite,omitempty"`
+	Visibility              string `json:"visibility"`
+	GatePolicy              string `json:"gate_policy"`
+	RetainedPackageVersions int    `json:"retained_package_versions"`
+	VisiblePackageVersions  int    `json:"visible_package_versions"`
+	// LockBytes is the size of this repository's lock file.
+	//
+	// Reported because it is the number that predicts where a workspace stops
+	// working. A lock is parsed whole on every plan and every apply, so its size
+	// sets both the time that takes and the memory it needs — and at around 385
+	// bytes per package-version, a repository large enough to be slow is large
+	// enough to be worth splitting. Without this an operator has no way to see
+	// which repository is responsible, or that they are approaching anything.
+	LockBytes int64 `json:"lock_bytes"`
+	// Artifacts is how many distinct blobs this repository's retained versions
+	// bind, and ArtifactBytes their total size. A package-version can bind several
+	// — one per architecture — so the count is not the version count.
+	Artifacts           int              `json:"artifacts"`
+	ArtifactBytes       int64            `json:"artifact_bytes"`
+	VisibleBindingState string           `json:"visible_binding_state"`
+	VisiblePackages     []StatusPackage  `json:"visible_packages"`
+	Deployment          StatusDeployment `json:"deployment"`
 }
 
 type StatusPackage struct {
@@ -103,7 +122,14 @@ func StatusWorkspace(ctx context.Context, request StatusWorkspaceRequest) (Statu
 		for _, binding := range missing {
 			missingBindings[binding.Package+"\x00"+binding.Version] = true
 		}
+		lockBytes, err := lockFileBytes(root, repository)
+		if err != nil {
+			return StatusWorkspaceResult{}, err
+		}
+		result.LockBytes += lockBytes
+		artifacts, artifactBytes := retainedArtifacts(lock)
 		statusRepository := StatusRepository{
+			LockBytes: lockBytes, Artifacts: artifacts, ArtifactBytes: artifactBytes,
 			Name: name, Format: repository.Format, Track: repository.Track, Suite: repository.Suite,
 			Visibility: repository.Visibility, GatePolicy: repository.Gate,
 			RetainedPackageVersions: len(lock.PackageVersion), VisiblePackageVersions: len(visible), VisibleBindingState: "complete",
@@ -154,4 +180,44 @@ func StatusWorkspace(ctx context.Context, request StatusWorkspaceRequest) (Statu
 		return StatusWorkspaceResult{}, err
 	}
 	return result, nil
+}
+
+// lockFileBytes is how large a repository's lock is on disk.
+//
+// Measured rather than estimated from the version count, because the whole point
+// is to report the thing that actually gets parsed. A lock that has not been
+// written yet is zero rather than an error: a configured repository with no
+// packages is an ordinary state.
+func lockFileBytes(root string, repository state.Repository) (int64, error) {
+	name, err := state.WorkspacePath(root, repository.Lock)
+	if err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+// retainedArtifacts counts the distinct blobs a lock binds, and their total size.
+//
+// Distinct by digest, because a package-version binds one blob per architecture
+// and the same blob can be bound by several versions — counting bindings would
+// report storage that is not consumed twice.
+func retainedArtifacts(lock state.RepositoryLock) (int, int64) {
+	seen := make(map[string]int64)
+	for _, packageVersion := range lock.PackageVersion {
+		for _, blob := range packageVersion.Blobs {
+			seen[blob.SHA256] = blob.Size
+		}
+	}
+	var total int64
+	for _, size := range seen {
+		total += size
+	}
+	return len(seen), total
 }

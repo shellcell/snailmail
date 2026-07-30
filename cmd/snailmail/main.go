@@ -638,6 +638,15 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		fmt.Fprintf(stdout, "✉️   %s: %d visible, %d retained; visible bindings %s; deployment %s\n",
 			repository.Name, repository.VisiblePackageVersions, repository.RetainedPackageVersions, repository.VisibleBindingState, repository.Deployment.State)
 	}
+	// The lock is what every plan and apply parses whole, so its size is the
+	// number that predicts where a workspace stops being comfortable. Reported for
+	// the workspace rather than per repository, with the largest named, because
+	// that is the pair an operator can act on.
+	if result.LockBytes != 0 {
+		fmt.Fprintf(stdout, "📦  %s of lock across %d %s%s\n",
+			humanBytes(result.LockBytes), len(result.Repositories),
+			plural(len(result.Repositories), "repository", "repositories"), largestLockSuffix(result))
+	}
 	fmt.Fprintln(stdout, "✉️   live hosts, upstream releases, foreign remotes, gate completion, and apply failures were not observed")
 	return nil
 }
@@ -1497,4 +1506,37 @@ func applyProgress(stderr io.Writer, quiet bool) engine.ApplyProgress {
 		}
 		fmt.Fprintln(stderr, line)
 	}
+}
+
+// humanBytes renders a size the way an operator reads one. Deliberately coarse:
+// the question this answers is "is this getting large", not "exactly how large".
+func humanBytes(bytes int64) string {
+	switch {
+	case bytes >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(bytes)/(1<<30))
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(bytes)/(1<<20))
+	case bytes >= 1<<10:
+		return fmt.Sprintf("%.0f KiB", float64(bytes)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+// largestLockSuffix names the biggest lock when there is more than one, because
+// "3 GiB across ten repositories" does not say which one to split.
+func largestLockSuffix(result engine.StatusWorkspaceResult) string {
+	if len(result.Repositories) < 2 {
+		return ""
+	}
+	largest := result.Repositories[0]
+	for _, repository := range result.Repositories[1:] {
+		if repository.LockBytes > largest.LockBytes {
+			largest = repository
+		}
+	}
+	if largest.LockBytes == 0 {
+		return ""
+	}
+	return fmt.Sprintf(", largest %s at %s", largest.Name, humanBytes(largest.LockBytes))
 }
