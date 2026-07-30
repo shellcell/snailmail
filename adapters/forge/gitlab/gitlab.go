@@ -1,5 +1,10 @@
-// Package gitlabforge reads review evidence from GitLab through the glab CLI,
-// which owns authentication and host resolution.
+// Package gitlabforge reads review evidence from GitLab.
+//
+// Through the glab CLI where it is installed, because then the vendor tool owns
+// authentication and host resolution and snailmail never handles a token. Where it
+// is not, the same endpoints are read over HTTP with a token from a broker, so a
+// runner without glab can still run a PR gate. The transport is chosen once, at
+// construction.
 //
 // GitLab answers the port's three questions more directly than GitHub does. The
 // merge_base endpoint returns the common ancestor itself, so containment and
@@ -16,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os/exec"
 	"strings"
 
 	"github.com/shellcell/snailmail/adapters/forge/forgeio"
@@ -25,17 +31,34 @@ import (
 // Adapter reads GitLab review evidence.
 type Adapter struct {
 	hostname string
+	cli      bool
+	broker   forge.TokenBroker
+	// baseURL is where the REST API lives, resolved once alongside the transport.
+	baseURL string
 }
 
 // New returns an adapter for gitlab.com.
-func New() *Adapter { return &Adapter{hostname: forge.DefaultHost(forge.ProviderGitLab)} }
+//
+// broker supplies a token for the HTTP path and is unused when glab is installed.
+// Nil is legitimate: a public project is readable without one.
+func New(broker forge.TokenBroker) *Adapter {
+	host := forge.DefaultHost(forge.ProviderGitLab)
+	return &Adapter{hostname: host, cli: haveCLI(), broker: broker, baseURL: apiBaseFor(host)}
+}
 
 // NewForHost returns an adapter for a self-hosted GitLab instance.
-func NewForHost(hostname string) (*Adapter, error) {
+func NewForHost(hostname string, broker forge.TokenBroker) (*Adapter, error) {
 	if !forge.ValidHost(hostname) {
 		return nil, fmt.Errorf("GitLab hostname %q is invalid", hostname)
 	}
-	return &Adapter{hostname: hostname}, nil
+	return &Adapter{hostname: hostname, cli: haveCLI(), broker: broker, baseURL: apiBaseFor(hostname)}, nil
+}
+
+// haveCLI is resolved once per adapter rather than per request, so a glab that
+// appears or disappears mid-operation cannot change transport halfway through.
+func haveCLI() bool {
+	_, err := exec.LookPath("glab")
+	return err == nil
 }
 
 func (adapter *Adapter) Name() string { return forge.ProviderGitLab }
@@ -129,19 +152,36 @@ func validRevision(revision string) bool {
 }
 
 func (adapter *Adapter) api(ctx context.Context, repository forge.Repository, target any, endpoint string) error {
-	return forgeio.ReadJSON(ctx, forgeio.Request{
-		Binary:           "glab",
-		Arguments:        []string{"api", "--hostname", adapter.hostname, endpoint},
-		WorkingDirectory: repository.WorkingDirectory,
-		Endpoint:         endpoint,
-	}, target)
+	if adapter.cli {
+		return forgeio.ReadJSON(ctx, forgeio.Request{
+			Binary:           "glab",
+			Arguments:        []string{"api", "--hostname", adapter.hostname, endpoint},
+			WorkingDirectory: repository.WorkingDirectory,
+			Endpoint:         endpoint,
+		}, target)
+	}
+	return forgeio.HTTPClient{
+		BaseURL: adapter.baseURL,
+		Broker:  adapter.broker,
+		Scope: forge.TokenScope{
+			Provider: forge.ProviderGitLab, Host: adapter.hostname, Repository: repository.Name,
+		},
+	}.Get(ctx, endpoint, target)
 }
+
+// apiBaseFor resolves the API root. Every instance serves v4 under itself; there
+// is no separate API host the way github.com has one.
+func apiBaseFor(hostname string) string { return "https://" + hostname + "/api/v4" }
+
+// UsesCLI reports which transport was chosen, for tests and for a diagnostic that
+// can tell a missing glab from an unreachable GitLab.
+func (adapter *Adapter) UsesCLI() bool { return adapter.cli }
 
 // Resolver selects this adapter for every repository.
 type Resolver struct{ adapter *Adapter }
 
 // NewResolver returns a resolver bound to gitlab.com.
-func NewResolver() *Resolver { return &Resolver{adapter: New()} }
+func NewResolver() *Resolver { return &Resolver{adapter: New(nil)} }
 
 func (resolver *Resolver) Resolve(context.Context, forge.Repository) (forge.Forge, error) {
 	return resolver.adapter, nil

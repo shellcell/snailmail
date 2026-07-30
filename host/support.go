@@ -54,12 +54,15 @@ var formatSupport = map[string]map[string]FormatSupport{
 	// Release and its detached signature together, Alpine has one index per
 	// architecture, and raw has a listing and a SHA256SUMS.
 	//
-	// Only PyPI is declared because qualifying is necessary and not sufficient.
-	// The adapter makes a revision live by writing the whole tree under
-	// .snailmail/releases/<tree>/ and then putting one root object whose
-	// references are rewritten to resolve inside it. That rewrite is format
-	// knowledge — href= for a simple index, <location href=> for repomd.xml,
-	// urls: for index.yaml — and the adapter has only the PyPI one. See PLAN.md.
+	// The adapter has both publication shapes: PyPI staged under
+	// .snailmail/releases/<tree>/ with a rebound root, and a canonical-path shape
+	// for formats whose non-root files hold bytes fixed by their path. Only PyPI is
+	// declared because the second shape has one question left. A published tree
+	// contains snailmail's own generated files as well as the format's — a
+	// browsable index.html and the build-graph manifest — and both sit at fixed
+	// paths that change every revision. No client reads them, but Observe verifies
+	// the whole file set, so overwriting them in place leaves a previous revision
+	// unverifiable after a rollback. See PLAN.md §16.
 	"s3": {
 		"pypi": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 	},

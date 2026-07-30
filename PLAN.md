@@ -1005,11 +1005,22 @@ is the same proposition as `merge_base(revision, branch) == revision` — report
 as the revision when empty, and left empty otherwise so it cannot satisfy the
 gate's check by accident.
 
-Remaining: the CLI-absent fallback, so GitHub and GitLab use the same HTTP path
-when gh or glab is not installed — today a runner without one cannot run a gate at
-all, and fails as though the forge were unreachable. Bitbucket has no merge-base
-endpoint and no reverse-comparison equivalent, which is the one question the gate
-cannot do without, so it may stay unsupported.
+All three adapters now choose a transport once, at construction: the vendor CLI
+where it is installed, HTTP otherwise. A runner with neither gh nor glab can run a
+gate, where before it failed as though the forge were unreachable. Both transports
+are held to the same conformance suite, because a second route to the same
+authorization must not be a weaker one — and holding the HTTP path to it turned up
+that GitHub had never validated its repository reference, which matters once a
+name is interpolated into a URL path rather than handed to gh.
+
+Bitbucket has no merge-base endpoint and no reverse-comparison equivalent, which
+is the one question the gate cannot do without, so it may stay unsupported.
+
+One thing not yet established: the Authorization header form is verified only for
+the unauthenticated case. Forgejo documents `token <t>` and accepts Bearer,
+GitLab accepts Bearer for personal access tokens, GitHub takes Bearer — the
+scheme is configurable per adapter for that reason, but no authenticated read has
+been made against a real instance, because that needs a credential.
 
 ### 11.5 Automation: the container image is the integration point
 
@@ -1399,12 +1410,34 @@ Still open:
   `repodata/repomd.xml.asc` is a detached signature over `repomd.xml`, so
   rebinding that document leaves a signature that does not verify.
 
+  But signing narrows it further, which was missed until the commit paths were
+  read again. That signature lives at a *fixed* path and its bytes change with
+  every revision, so a signed yum repository has two objects that must become
+  live together — the same position as Debian, for the same reason. `rpm` on an
+  object store is therefore possible only unsigned. `rpmFormat.CommitPaths` now
+  says so, the way `debFormat` already did; before, it reported one path whatever
+  the configuration, so a host would have accepted a signed repository and
+  published a torn revision. Helm is unaffected either way: provenance sits beside
+  each chart at a path fixed by that chart's version.
+
   PyPI is the exception, and the reason the staging directory exists at all.
   `simple/<project>/index.html` is at a fixed path and gains a line whenever a
   version is added, so writing the new revision would change what the live one
   serves. It is therefore staged under `.snailmail/releases/<tree>/` with its
   root rebound to point inside — now `formats.RootRewriter`, declared by PyPI
   alone.
+
+  One question remains before either is declared, and testing found it rather than
+  reading. A published tree is not only the format's files: snailmail also writes a
+  browsable `index.html` and the build-graph manifest, both at fixed paths that
+  change with every revision. No client reads either, and neither is what `Observe`
+  reads its own state from — the manifest it verifies is digest-addressed
+  elsewhere. But `Observe` does check the whole descriptor file set, so writing
+  those two in place makes the *previous* revision unverifiable after a rollback.
+  The choice is to keep them in the release directory and lose the browsable page
+  at its canonical path, to exclude them from verification, or to count them as
+  commit paths and refuse the shape. That is a decision about what a publication
+  guarantees, not an implementation detail.
 
   Debian, Alpine and raw remain out for the original reason, which is path count
   rather than rewriting: a `Release` and its detached signature have to become

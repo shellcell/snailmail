@@ -122,7 +122,7 @@ func arrangeGH(fixtures string) func(*testing.T, forgetest.Scenario) {
 
 func TestGitHubConformsToTheForgePort(t *testing.T) {
 	fixtures := installFakeGH(t)
-	forgetest.Conformance(t, New(), arrangeGH(fixtures))
+	forgetest.Conformance(t, New(nil), arrangeGH(fixtures))
 }
 
 // The compare status is the whole of the containment answer, and only two of the
@@ -131,7 +131,7 @@ func TestGitHubConformsToTheForgePort(t *testing.T) {
 // contained would authorize a revision that was never merged.
 func TestGitHubMapsEveryCompareStatus(t *testing.T) {
 	fixtures := installFakeGH(t)
-	adapter := New()
+	adapter := New(nil)
 	target := forge.Repository{Name: forgetest.Repository, WorkingDirectory: t.TempDir()}
 	for status, contained := range map[string]bool{
 		"ahead":     true,
@@ -164,7 +164,7 @@ func TestGitHubTreatsAnEmptyMergeTimeAsUnmerged(t *testing.T) {
 			writeFixture(t, fixtures, "pulls.json", []map[string]any{
 				{"number": 12, "merged_at": mergedAt, "base": map[string]any{"ref": "main"}},
 			})
-			pullRequests, err := New().PullRequestsForRevision(context.Background(),
+			pullRequests, err := New(nil).PullRequestsForRevision(context.Background(),
 				forge.Repository{Name: forgetest.Repository, WorkingDirectory: t.TempDir()}, forgetest.Revision)
 			if err != nil {
 				t.Fatal(err)
@@ -181,7 +181,7 @@ func TestGitHubTreatsAnEmptyMergeTimeAsUnmerged(t *testing.T) {
 func TestGitHubRefusesARepositoryWithNoDefaultBranch(t *testing.T) {
 	fixtures := installFakeGH(t)
 	writeFixture(t, fixtures, "repo.json", map[string]any{"full_name": forgetest.Repository, "default_branch": ""})
-	_, err := New().Repository(context.Background(),
+	_, err := New(nil).Repository(context.Background(),
 		forge.Repository{Name: forgetest.Repository, WorkingDirectory: t.TempDir()})
 	if !errors.Is(err, forge.ErrUnavailable) {
 		t.Errorf("error = %v, want ErrUnavailable", err)
@@ -205,7 +205,7 @@ func TestGitHubRefusesAResponseItCannotAccountFor(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(fixtures, "repo.json"), []byte(body), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := New().Repository(context.Background(), target); !errors.Is(err, forge.ErrUnavailable) {
+			if _, err := New(nil).Repository(context.Background(), target); !errors.Is(err, forge.ErrUnavailable) {
 				t.Errorf("error = %v, want ErrUnavailable", err)
 			}
 		})
@@ -217,15 +217,17 @@ func TestGitHubRefusesAResponseItCannotAccountFor(t *testing.T) {
 // argument or a path, so it is rejected rather than passed through.
 func TestGitHubHostnameIsCheckedBeforeItReachesTheCLI(t *testing.T) {
 	for _, hostname := range []string{"", " ", "github.example.com/api", "a b", "host\nname", "host\tname"} {
-		if _, err := NewForHost(hostname); err == nil {
+		if _, err := NewForHost(hostname, nil); err == nil {
 			t.Errorf("hostname %q was accepted", hostname)
 		}
 	}
-	adapter, err := NewForHost("github.example.com")
+	// The fake goes on PATH first: the transport is chosen at construction, so an
+	// adapter built before it would pick HTTP on a machine with no real gh.
+	fixtures := installFakeGH(t)
+	adapter, err := NewForHost("github.example.com", nil)
 	if err != nil {
 		t.Fatalf("a valid Enterprise hostname was refused: %v", err)
 	}
-	fixtures := installFakeGH(t)
 	arrangeGH(fixtures)(t, forgetest.Reviewed())
 	if _, err := adapter.Repository(context.Background(),
 		forge.Repository{Name: forgetest.Repository, WorkingDirectory: t.TempDir()}); err != nil {
@@ -263,7 +265,7 @@ func TestFakeGHRefusesAnUnexpectedEndpoint(t *testing.T) {
 	if err := os.Remove(filepath.Join(fixtures, "repo.json")); err != nil {
 		t.Fatal(err)
 	}
-	_, err := New().Repository(context.Background(),
+	_, err := New(nil).Repository(context.Background(),
 		forge.Repository{Name: forgetest.Repository, WorkingDirectory: t.TempDir()})
 	if err == nil {
 		t.Fatal("a missing fixture was reported as a successful read")

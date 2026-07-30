@@ -48,6 +48,9 @@ func TestASelfHostedGitLabReachesTheAdapter(t *testing.T) {
 	if selected.Name() != forge.ProviderGitLab {
 		t.Errorf("resolved %q, want gitlab", selected.Name())
 	}
+	// Naming gitlab.com is the same as omitting it. Adapters are built per
+	// resolution now that each carries a broker, so this compares what they do
+	// rather than whether they are the same pointer.
 	explicit, err := shared.Resolve(context.Background(),
 		forge.Repository{Name: "acme/state", Provider: forge.ProviderGitLab, Host: "gitlab.com"})
 	if err != nil {
@@ -58,8 +61,8 @@ func TestASelfHostedGitLabReachesTheAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if explicit != implicit {
-		t.Error("naming gitlab.com explicitly built a different adapter than omitting it")
+	if explicit.Name() != implicit.Name() {
+		t.Errorf("naming gitlab.com gave %q, omitting it gave %q", explicit.Name(), implicit.Name())
 	}
 	if _, err := shared.Resolve(context.Background(), forge.Repository{
 		Name: "acme/state", Provider: forge.ProviderGitLab, Host: "git acme/api"}); err == nil {
@@ -146,8 +149,8 @@ func TestAnEnterpriseHostReachesTheAdapter(t *testing.T) {
 	if selected.Name() != "github" {
 		t.Errorf("resolved %q, want github", selected.Name())
 	}
-	// github.com itself is not an Enterprise instance, and must resolve to the
-	// shared adapter rather than a second one built per call.
+	// github.com is not an Enterprise instance, so naming it is the same as
+	// omitting it.
 	shared := NewForgeResolver()
 	first, err := shared.Resolve(context.Background(),
 		forge.Repository{Name: "acme/state", Provider: forge.ProviderGitHub, Host: "github.com"})
@@ -159,8 +162,8 @@ func TestAnEnterpriseHostReachesTheAdapter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first != second {
-		t.Error("naming github.com explicitly built a different adapter than omitting it")
+	if first.Name() != second.Name() {
+		t.Errorf("naming github.com gave %q, omitting it gave %q", first.Name(), second.Name())
 	}
 }
 

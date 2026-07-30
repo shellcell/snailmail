@@ -23,9 +23,7 @@ import (
 // it. Selection is now on the declared provider, so an unreadable forge and an
 // unimplemented one are different errors.
 type ForgeResolver struct {
-	github *githubforge.Adapter
-	gitlab *gitlabforge.Adapter
-	plain  *plainforge.Adapter
+	plain *plainforge.Adapter
 	// The token broker snapshots a helper program, so it is opened once and
 	// shared rather than per resolution.
 	once      sync.Once
@@ -34,7 +32,7 @@ type ForgeResolver struct {
 }
 
 func NewForgeResolver() *ForgeResolver {
-	return &ForgeResolver{github: githubforge.New(), gitlab: gitlabforge.New(), plain: plainforge.New()}
+	return &ForgeResolver{plain: plainforge.New()}
 }
 
 func (resolver *ForgeResolver) Resolve(_ context.Context, repository forge.Repository) (forge.Forge, error) {
@@ -44,28 +42,36 @@ func (resolver *ForgeResolver) Resolve(_ context.Context, repository forge.Repos
 	}
 	switch provider {
 	case forge.ProviderGitHub:
+		broker, err := resolver.forgeToken()
+		if err != nil {
+			return nil, err
+		}
 		// An Enterprise instance is reached by hostname. The default is the
 		// adapter's own, so a workspace that names no host is unaffected.
 		if host := repository.Host; host != "" && host != forge.DefaultHost(forge.ProviderGitHub) {
 			// Returned explicitly rather than forwarded: a *Adapter typed nil
 			// assigned to a forge.Forge is a non-nil interface holding nil, which
 			// passes a nil check and panics on the first read.
-			adapter, err := githubforge.NewForHost(host)
+			adapter, err := githubforge.NewForHost(host, broker)
 			if err != nil {
 				return nil, err
 			}
 			return adapter, nil
 		}
-		return resolver.github, nil
+		return githubforge.New(broker), nil
 	case forge.ProviderGitLab:
+		broker, err := resolver.forgeToken()
+		if err != nil {
+			return nil, err
+		}
 		if host := repository.Host; host != "" && host != forge.DefaultHost(forge.ProviderGitLab) {
-			adapter, err := gitlabforge.NewForHost(host)
+			adapter, err := gitlabforge.NewForHost(host, broker)
 			if err != nil {
 				return nil, err
 			}
 			return adapter, nil
 		}
-		return resolver.gitlab, nil
+		return gitlabforge.New(broker), nil
 	case forge.ProviderForgejo, forge.ProviderGitea:
 		// No vendor CLI to delegate to, so this speaks HTTP and needs a token —
 		// except against a public repository, where reading without one is

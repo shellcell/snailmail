@@ -446,8 +446,18 @@ func (rpmFormat) RequiresLegacyDigests() bool { return false }
 
 func (rpmFormat) SigningAlgorithm() string { return signer.AlgorithmOpenPGPRSA4096 }
 
-func (rpmFormat) ImplementsSigning() bool         { return true }
-func (rpmFormat) CommitPaths(Repository) []string { return []string{"repodata/repomd.xml"} }
+func (rpmFormat) ImplementsSigning() bool { return true }
+
+// A signed repository additionally switches repomd.xml.asc, which is a detached
+// signature over that revision's repomd.xml and so has to become live with it. A
+// client running repo_gpgcheck reads both, and one of them belonging to a
+// different revision is a repository it refuses.
+func (rpmFormat) CommitPaths(repository Repository) []string {
+	if repository.Signed {
+		return []string{rpm.RepomdPath, rpm.SignaturePath}
+	}
+	return []string{rpm.RepomdPath}
+}
 func (rpmFormat) Build(blobs []domain.Blob, options BuildOptions) (domain.RepositoryArtifact, error) {
 	artifact, err := rpm.Build(blobs, rpm.BuildOptions{GeneratedAt: options.GeneratedAt})
 	if err != nil {

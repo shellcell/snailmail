@@ -106,7 +106,7 @@ func arrangeGlab(fixtures string) func(*testing.T, forgetest.Scenario) {
 
 func TestGitLabConformsToTheForgePort(t *testing.T) {
 	fixtures := installFakeGlab(t)
-	forgetest.Conformance(t, New(), arrangeGlab(fixtures))
+	forgetest.Conformance(t, New(nil), arrangeGlab(fixtures))
 }
 
 // A merge request is known by its per-project iid. The global id is a different
@@ -117,7 +117,7 @@ func TestGitLabReportsThePerProjectNumber(t *testing.T) {
 	writeFixture(t, fixtures, "merge_requests.json", []map[string]any{
 		{"iid": 12, "id": 98765, "state": "merged", "target_branch": "main"},
 	})
-	pullRequests, err := New().PullRequestsForRevision(context.Background(),
+	pullRequests, err := New(nil).PullRequestsForRevision(context.Background(),
 		forge.Repository{Name: forgetest.Repository, WorkingDirectory: t.TempDir()}, forgetest.Revision)
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +139,7 @@ func TestGitLabMapsEveryMergeRequestState(t *testing.T) {
 			writeFixture(t, fixtures, "merge_requests.json", []map[string]any{
 				{"iid": 12, "state": state, "target_branch": "main"},
 			})
-			pullRequests, err := New().PullRequestsForRevision(context.Background(), target, forgetest.Revision)
+			pullRequests, err := New(nil).PullRequestsForRevision(context.Background(), target, forgetest.Revision)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -159,7 +159,7 @@ func TestGitLabDerivesContainmentFromTheMergeBase(t *testing.T) {
 	for name, base := range map[string]string{"the revision": forgetest.Revision, "an ancestor": ancestor} {
 		t.Run(name, func(t *testing.T) {
 			writeFixture(t, fixtures, "merge_base.json", map[string]any{"id": base})
-			ancestry, err := New().RevisionAncestry(context.Background(), target, forgetest.Revision, "main")
+			ancestry, err := New(nil).RevisionAncestry(context.Background(), target, forgetest.Revision, "main")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -171,7 +171,7 @@ func TestGitLabDerivesContainmentFromTheMergeBase(t *testing.T) {
 	// Two branches with no common history have no merge base. That is not "not
 	// contained" — it is a question the answer does not fit, so it is unknown.
 	writeFixture(t, fixtures, "merge_base.json", map[string]any{"id": ""})
-	if _, err := New().RevisionAncestry(context.Background(), target, forgetest.Revision, "main"); !errors.Is(err, forge.ErrUnavailable) {
+	if _, err := New(nil).RevisionAncestry(context.Background(), target, forgetest.Revision, "main"); !errors.Is(err, forge.ErrUnavailable) {
 		t.Errorf("an absent merge base gave %v, want ErrUnavailable", err)
 	}
 }
@@ -184,7 +184,7 @@ func TestGitLabAddressesANestedProjectByItsEncodedPath(t *testing.T) {
 	writeFixture(t, fixtures, "project.json", map[string]any{
 		"path_with_namespace": nested, "default_branch": "main",
 	})
-	info, err := New().Repository(context.Background(),
+	info, err := New(nil).Repository(context.Background(),
 		forge.Repository{Name: nested, WorkingDirectory: t.TempDir()})
 	if err != nil {
 		t.Fatalf("a nested project was refused: %v", err)
@@ -208,7 +208,7 @@ func TestGitLabRefusesAProjectThatAnsweredAboutAnotherPath(t *testing.T) {
 	writeFixture(t, fixtures, "project.json", map[string]any{
 		"path_with_namespace": "acme/state-renamed", "default_branch": "main",
 	})
-	_, err := New().Repository(context.Background(),
+	_, err := New(nil).Repository(context.Background(),
 		forge.Repository{Name: "acme/state", WorkingDirectory: t.TempDir()})
 	if !errors.Is(err, forge.ErrUnavailable) {
 		t.Errorf("error = %v, want ErrUnavailable", err)
@@ -221,16 +221,16 @@ func TestGitLabRefusesSomethingThatIsNotARevision(t *testing.T) {
 	installFakeGlab(t)
 	target := forge.Repository{Name: forgetest.Repository, WorkingDirectory: t.TempDir()}
 	for _, revision := range []string{"", "main", "../../projects", "a", strings.Repeat("a", 65), "HEAD~1"} {
-		if _, err := New().PullRequestsForRevision(context.Background(), target, revision); err == nil {
+		if _, err := New(nil).PullRequestsForRevision(context.Background(), target, revision); err == nil {
 			t.Errorf("revision %q reached the API", revision)
 		}
-		if _, err := New().RevisionAncestry(context.Background(), target, revision, "main"); err == nil {
+		if _, err := New(nil).RevisionAncestry(context.Background(), target, revision, "main"); err == nil {
 			t.Errorf("revision %q reached the API", revision)
 		}
 	}
 	// And a branch has to be sayable as one argument.
 	for _, branch := range []string{"", "ma in", "main\n"} {
-		if _, err := New().RevisionAncestry(context.Background(), target, forgetest.Revision, branch); err == nil {
+		if _, err := New(nil).RevisionAncestry(context.Background(), target, forgetest.Revision, branch); err == nil {
 			t.Errorf("branch %q reached the API", branch)
 		}
 	}
@@ -249,7 +249,7 @@ func TestGitLabRefusesAResponseItCannotAccountFor(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(fixtures, "project.json"), []byte(body), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := New().Repository(context.Background(), target); !errors.Is(err, forge.ErrUnavailable) {
+			if _, err := New(nil).Repository(context.Background(), target); !errors.Is(err, forge.ErrUnavailable) {
 				t.Errorf("error = %v, want ErrUnavailable", err)
 			}
 		})
@@ -258,15 +258,17 @@ func TestGitLabRefusesAResponseItCannotAccountFor(t *testing.T) {
 
 func TestGitLabHostnameIsCheckedBeforeItReachesTheCLI(t *testing.T) {
 	for _, hostname := range []string{"", " ", "git.acme.example/api", "a b", "host\nname"} {
-		if _, err := NewForHost(hostname); err == nil {
+		if _, err := NewForHost(hostname, nil); err == nil {
 			t.Errorf("hostname %q was accepted", hostname)
 		}
 	}
-	adapter, err := NewForHost("git.acme.example")
+	// The fake goes on PATH first: the transport is chosen at construction, so an
+	// adapter built before it would pick HTTP on a machine with no real glab.
+	fixtures := installFakeGlab(t)
+	adapter, err := NewForHost("git.acme.example", nil)
 	if err != nil {
 		t.Fatalf("a valid self-hosted hostname was refused: %v", err)
 	}
-	fixtures := installFakeGlab(t)
 	arrangeGlab(fixtures)(t, forgetest.Reviewed())
 	if _, err := adapter.Repository(context.Background(),
 		forge.Repository{Name: forgetest.Repository, WorkingDirectory: t.TempDir()}); err != nil {

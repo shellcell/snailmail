@@ -16,13 +16,15 @@ func TestSupportsDeniesUnknownPairs(t *testing.T) {
 		// An object store commits one object, so a format qualifies only if one
 		// path makes a revision live: Debian needs a Release and its detached
 		// signature together, Alpine has an index per architecture, raw has a
-		// listing and a SHA256SUMS. Helm and yum do qualify, but the adapter
-		// rewrites only a PyPI root to point into the immutable release tree.
+		// listing and a SHA256SUMS. A signed yum repository is in the same
+		// position and would be refused by the adapter's path count. Helm and
+		// unsigned yum qualify on path count and are still undeclared, for the
+		// reason recorded in support.go.
+		{"s3", "helm"},
+		{"s3", "rpm"},
 		{"s3", "deb"},
 		{"s3", "apk"},
 		{"s3", "raw"},
-		{"s3", "helm"},
-		{"s3", "rpm"},
 	} {
 		support := Supports(pair[0], pair[1])
 		if support.Publish || support.RemoteClientVerification || support.InstallDocument {

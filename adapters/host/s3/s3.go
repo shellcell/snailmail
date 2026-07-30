@@ -119,7 +119,7 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 		return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 manifest", Err: errors.New("publication manifest is missing or corrupt")}
 	}
 	var manifest buildgraph.RepositoryManifest
-	if err := json.Unmarshal(manifestContent, &manifest); err != nil || validatePublishedManifest(manifestContent, manifest, descriptor) != nil {
+	if err := json.Unmarshal(manifestContent, &manifest); err != nil || validatePublishedManifest(repository, manifestContent, manifest, descriptor) != nil {
 		return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 manifest", Err: errors.New("publication manifest does not match root tree")}
 	}
 	restoreDescriptor, restoreDigest, err := adapter.loadRestore(ctx, repository, revision.RestoreID)
@@ -148,7 +148,7 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 	}
 	if err := forEachObject(ctx, len(descriptor.Files), func(ctx context.Context, index int) error {
 		file := descriptor.Files[index]
-		info, err := adapter.client.Head(ctx, releaseKey(repository, revision.TreeSHA256, file.Path))
+		info, err := adapter.client.Head(ctx, publishedFileKey(repository, revision.TreeSHA256, rootPath, file.Path))
 		if errors.Is(err, ErrNotFound) {
 			return &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 release", Err: fmt.Errorf("release object %q is missing or corrupt", file.Path)}
 		}
@@ -219,14 +219,15 @@ func (adapter *Adapter) ReadAccess(ctx context.Context, repository host.Reposito
 	if err != nil {
 		return host.ClientAccess{}, err
 	}
-	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, revision.TreeSHA256, rootPath, descriptor.Files, canonicalRoot)
+	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, revision.TreeSHA256, rootPath,
+		repository.RootRewriter != nil, descriptor.Files, canonicalRoot)
 	if err != nil {
 		return host.ClientAccess{}, err
 	}
 	return adapter.issueAccess(ctx, repository, host.ReadScope{
 		WorkspaceID: repository.WorkspaceID, Repository: repository.Name, HostIdentity: repository.HostIdentity,
 		Bucket: repository.Bucket, Endpoint: repository.CanonicalEndpoint, PlanID: revision.PlanID, ChangeID: revision.ChangeID, TreeSHA256: revision.TreeSHA256,
-		Prefixes: []string{objectKey(repository, rootPath), releaseKey(repository, revision.TreeSHA256, "")},
+		Prefixes: readPrefixes(repository, revision.TreeSHA256, rootPath),
 	}, routes)
 }
 
@@ -315,8 +316,9 @@ func (adapter *Adapter) Stage(ctx context.Context, repository host.Repository, r
 		return host.StagedPublication{}, err
 	}
 	manifest, err := app.VerifyRepository(request.Directory)
-	if err != nil || manifest.Format != pypi.FormatID || manifest.TreeSHA256 != request.TreeSHA256 {
-		return host.StagedPublication{}, &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "stage S3 repository", Err: errors.New("staged repository is not a valid PyPI publication")}
+	if err != nil || !manifestFormatIs(manifest.Format, repository.Format) || manifest.TreeSHA256 != request.TreeSHA256 {
+		return host.StagedPublication{}, &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "stage S3 repository",
+			Err: fmt.Errorf("staged repository is not a valid %s publication", repository.Format)}
 	}
 	descriptorKey := stageDescriptorKey(repository, identifier)
 	uploaded = append(uploaded, descriptorKey)
@@ -448,14 +450,15 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 	if err != nil {
 		return host.CommitResult{}, err
 	}
-	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, descriptor.TreeSHA256, rootPath, descriptor.Files, rootContent)
+	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, descriptor.TreeSHA256, rootPath,
+		repository.RootRewriter != nil, descriptor.Files, rootContent)
 	if err != nil {
 		return host.CommitResult{}, err
 	}
 	access, err := adapter.issueAccess(ctx, repository, host.ReadScope{
 		WorkspaceID: repository.WorkspaceID, Repository: repository.Name, HostIdentity: repository.HostIdentity,
 		Bucket: repository.Bucket, Endpoint: repository.CanonicalEndpoint, PlanID: descriptor.PlanID, ChangeID: descriptor.ChangeID, TreeSHA256: descriptor.TreeSHA256,
-		Prefixes: []string{objectKey(repository, rootPath), releaseKey(repository, descriptor.TreeSHA256, "")},
+		Prefixes: readPrefixes(repository, descriptor.TreeSHA256, rootPath),
 	}, routes)
 	if err != nil {
 		return host.CommitResult{}, err
@@ -505,6 +508,21 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 	return commitResult(repository, revision, access), nil
 }
 
+// Restore puts back the root object the failed publication replaced, or deletes it
+// if there was none.
+//
+// It touches nothing else, and that is sufficient for both publication shapes. A
+// staged tree's files live in a release directory the restored root does not point
+// at. A canonically published tree's files sit at paths whose bytes are fixed by
+// the path, so the failed revision never overwrote anything the previous one
+// serves — restoring its root makes it whole again, with every file it names still
+// present.
+//
+// What the failed revision leaves behind is unreferenced either way. For a
+// canonical publication that debris is in the repository's own namespace rather
+// than under .snailmail/releases, which is something lifecycle cleanup has to know;
+// it is not a correctness problem, because nothing reaches it without a root that
+// names it.
 func (adapter *Adapter) Restore(ctx context.Context, repository host.Repository, restore host.RestoreRef, expected host.ExpectedRevision) (host.PublishedRevision, error) {
 	rootPath, err := singleRootPath(repository)
 	if err != nil {
@@ -752,10 +770,14 @@ func descriptorFromRequest(repository host.Repository, request host.StageRequest
 }
 
 func (adapter *Adapter) materializeRelease(ctx context.Context, repository host.Repository, stageID string, publication publicationDescriptor) (string, error) {
+	rootPath, err := singleRootPath(repository)
+	if err != nil {
+		return "", err
+	}
 	descriptor := releaseDescriptorFromPublication(publication)
 	if err := forEachObject(ctx, len(descriptor.Files), func(ctx context.Context, index int) error {
 		file := descriptor.Files[index]
-		destination := releaseKey(repository, descriptor.TreeSHA256, file.Path)
+		destination := publishedFileKey(repository, descriptor.TreeSHA256, rootPath, file.Path)
 		stored, err := adapter.client.CopyCreate(ctx, stageKey(repository, stageID, file.Path), destination, file.Size, file.SHA256)
 		if errors.Is(err, ErrPrecondition) {
 			stored, err = adapter.client.Head(ctx, destination)
@@ -777,9 +799,9 @@ func (adapter *Adapter) materializeRelease(ctx context.Context, repository host.
 	}); err != nil {
 		return "", err
 	}
-	content, err := json.Marshal(descriptor)
-	if err != nil {
-		return "", err
+	content, marshalErr := json.Marshal(descriptor)
+	if marshalErr != nil {
+		return "", marshalErr
 	}
 	descriptorDigest := digestBytes(content)
 	key := releaseDescriptorKey(repository, descriptor.TreeSHA256)
@@ -821,7 +843,7 @@ func (adapter *Adapter) materializePublicationManifest(ctx context.Context, repo
 	}
 	var decoded buildgraph.RepositoryManifest
 	if info.Size != manifest.Size || info.SHA256 != manifest.SHA256 || digestBytes(content) != manifest.SHA256 || json.Unmarshal(content, &decoded) != nil ||
-		validatePublishedManifest(content, decoded, releaseDescriptorFromPublication(descriptor)) != nil {
+		validatePublishedManifest(repository, content, decoded, releaseDescriptorFromPublication(descriptor)) != nil {
 		return "", &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "materialize S3 manifest", Err: errors.New("staged publication manifest is invalid")}
 	}
 	destination := publicationManifestKey(repository, manifest.SHA256)
@@ -1121,8 +1143,12 @@ func validateFile(file host.File) error {
 // publication.
 func rewriteRoot(repository host.Repository, content []byte, treeSHA256, annotation string) ([]byte, error) {
 	if repository.RootRewriter == nil {
-		return nil, &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "rewrite S3 root",
-			Err: fmt.Errorf("format %q does not say how to rebind its root document to a release directory", repository.Format)}
+		// Published as built. Everything this root names is already at a path
+		// whose bytes are fixed, so there is nothing to rebind — and for a yum
+		// repository rebinding would invalidate the signature over these exact
+		// bytes. The binding is carried in the object's metadata instead, which is
+		// where Observe reads it from for every format.
+		return append([]byte(nil), content...), nil
 	}
 	rewritten, err := repository.RootRewriter.RewriteRoot(content, releaseDirectory(treeSHA256), annotation)
 	if err != nil {
@@ -1185,15 +1211,85 @@ func publicationDigestBindings(publication publicationDescriptor) (string, strin
 	return "", "", &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "bind S3 publication", Err: errors.New("stage has no management manifest")}
 }
 
-func validatePublishedManifest(content []byte, manifest buildgraph.RepositoryManifest, descriptor releaseDescriptor) error {
-	if !buildgraph.SupportedManifestSchema(manifest.SchemaVersion) || manifest.Format != pypi.FormatID || manifest.TreeSHA256 != descriptor.TreeSHA256 {
+// validatePublishedManifest checks that the published manifest describes the
+// release it is bound to.
+//
+// The manifest's digest is already recorded in the root object's metadata and
+// verified against its bytes, and its file set is compared against the descriptor
+// below, so this is defence in depth rather than the only tie between them. What
+// is checked for every format is structural: the schema, the identity, a canonical
+// generation time, the file set, and canonical encoding.
+//
+// PyPI additionally has its install specification and its per-project verification
+// cases asserted, which is how it has always been validated and is not weakened
+// here. Another format gets the structural checks and a generic reading of its
+// verification cases, because what a case names differs — a project for PyPI, a
+// package elsewhere — and asserting PyPI's shape would refuse a correct
+// publication. Lifting the format-specific part into a capability, the way the
+// root rewrite was, is the follow-up.
+// manifestFormatIs reports whether a manifest's format identity belongs to the
+// repository's format.
+//
+// A manifest records a versioned identity — "pypi/v1" — while a repository is
+// configured with the bare name. Comparing them directly looked right and refused
+// every publication: the two are related by prefix, not equal. The version is not
+// checked here because SupportedManifestSchema already decides which manifests this
+// adapter understands.
+func manifestFormatIs(manifestFormat, repositoryFormat string) bool {
+	return repositoryFormat != "" && strings.HasPrefix(manifestFormat, repositoryFormat+"/")
+}
+
+// validateGenericVerificationCases reads verification cases without assuming what
+// they name.
+//
+// A case has to identify something and a version, carry no control characters, and
+// come in canonical order — the manifest is content-addressed, so a set that could
+// be written two ways would produce two digests for one publication. What it must
+// not do is require a project the way PyPI does: a yum or Helm case names a
+// package, and demanding otherwise would refuse a correct publication.
+func validateGenericVerificationCases(content []byte, manifest buildgraph.RepositoryManifest) error {
+	if len(manifest.VerificationCases) == 0 {
+		return errors.New("manifest verifies nothing")
+	}
+	for index, verification := range manifest.VerificationCases {
+		named := verification.Package
+		if named == "" {
+			named = verification.Project
+		}
+		if named == "" || verification.Version == "" || hasControl(named) || hasControl(verification.Version) ||
+			hasControl(verification.Architecture) {
+			return errors.New("manifest verification case is invalid")
+		}
+		if index == 0 {
+			continue
+		}
+		previous := manifest.VerificationCases[index-1]
+		previousName := previous.Package
+		if previousName == "" {
+			previousName = previous.Project
+		}
+		if previousName > named || (previousName == named && previous.Version >= verification.Version) {
+			return errors.New("manifest verification cases are not canonical")
+		}
+	}
+	return requireCanonicalManifest(content, manifest)
+}
+
+func validatePublishedManifest(repository host.Repository, content []byte, manifest buildgraph.RepositoryManifest, descriptor releaseDescriptor) error {
+	if !buildgraph.SupportedManifestSchema(manifest.SchemaVersion) || !manifestFormatIs(manifest.Format, repository.Format) ||
+		manifest.TreeSHA256 != descriptor.TreeSHA256 {
 		return errors.New("manifest identity does not match release")
 	}
 	generatedAt, err := time.Parse(time.RFC3339, manifest.GeneratedAt)
 	if err != nil || generatedAt.UTC().Format(time.RFC3339) != manifest.GeneratedAt {
 		return errors.New("manifest generation time is invalid")
 	}
-	if manifest.Install.Kind != "pypi" || manifest.Install.IndexPath != "simple/" || manifest.Install.Suite != "" || manifest.Install.Component != "" || len(manifest.Install.Architectures) != 0 {
+	if manifest.Install.Kind != repository.Format || manifest.Install.IndexPath == "" {
+		return errors.New("manifest install specification is invalid")
+	}
+	if repository.Format == pypi.FormatID &&
+		(manifest.Install.IndexPath != "simple/" || manifest.Install.Suite != "" ||
+			manifest.Install.Component != "" || len(manifest.Install.Architectures) != 0) {
 		return errors.New("manifest install specification is invalid")
 	}
 	if len(manifest.Files) != len(descriptor.Files) {
@@ -1204,6 +1300,9 @@ func validatePublishedManifest(content []byte, manifest buildgraph.RepositoryMan
 		if file.Path != described.Path || file.Size != described.Size || file.SHA256 != described.SHA256 {
 			return errors.New("manifest file set does not match release")
 		}
+	}
+	if repository.Format != pypi.FormatID {
+		return validateGenericVerificationCases(content, manifest)
 	}
 	paths := make(map[string]bool, len(descriptor.Files))
 	projects := make(map[string]bool)
@@ -1231,6 +1330,13 @@ func validatePublishedManifest(content []byte, manifest buildgraph.RepositoryMan
 	if len(projects) == 0 || !reflect.DeepEqual(projects, verifiedProjects) {
 		return errors.New("manifest verification cases do not cover every project")
 	}
+	return requireCanonicalManifest(content, manifest)
+}
+
+// requireCanonicalManifest checks the published bytes are the one encoding of this
+// manifest. It is content-addressed, so a manifest that could be written two ways
+// would give one publication two identities.
+func requireCanonicalManifest(content []byte, manifest buildgraph.RepositoryManifest) error {
 	canonical, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return err
@@ -1336,11 +1442,11 @@ func (adapter *Adapter) validateRestoreTarget(ctx context.Context, repository ho
 	}
 	var manifest buildgraph.RepositoryManifest
 	if manifestInfo.SHA256 != revision.ManifestSHA256 || digestBytes(manifestContent) != revision.ManifestSHA256 ||
-		json.Unmarshal(manifestContent, &manifest) != nil || validatePublishedManifest(manifestContent, manifest, release) != nil {
+		json.Unmarshal(manifestContent, &manifest) != nil || validatePublishedManifest(repository, manifestContent, manifest, release) != nil {
 		return &host.Error{Kind: host.ErrorIndeterminate, Operation: "validate S3 restore target", Err: errors.New("retained publication manifest is corrupt")}
 	}
 	for _, file := range release.Files {
-		info, err := adapter.client.Head(ctx, releaseKey(repository, revision.TreeSHA256, file.Path))
+		info, err := adapter.client.Head(ctx, publishedFileKey(repository, revision.TreeSHA256, rootPath, file.Path))
 		if errors.Is(err, ErrNotFound) || (err == nil && (info.Size != file.Size || info.SHA256 != file.SHA256 || info.Metadata["sha256"] != file.SHA256)) {
 			return &host.Error{Kind: host.ErrorIndeterminate, Operation: "validate S3 restore target", Err: fmt.Errorf("retained release object %q is missing or corrupt", file.Path)}
 		}
@@ -1460,7 +1566,17 @@ func (adapter *Adapter) issueAccess(ctx context.Context, repository host.Reposit
 // root is served from the canonical endpoint, because that is the object a
 // commit switched; every other file is read from its immutable release, which
 // nothing rewrites.
-func canonicalClientRoutes(endpoint, treeSHA256, rootPath string, files []host.File, rootContent []byte) ([]host.ClientRoute, error) {
+// canonicalClientRoutes are the URLs a client fetches a live revision from.
+//
+// Where the tree is staged, everything but the root is reached inside the release
+// directory, which is what the rebound root points at. Where it is published at
+// canonical paths, every file is at the endpoint itself — so the routes a client
+// is given match where the objects were actually written, and a verification run
+// exercises the same URLs a user would.
+func canonicalClientRoutes(endpoint, treeSHA256, rootPath string, staged bool, files []host.File, rootContent []byte) ([]host.ClientRoute, error) {
+	if !staged {
+		return clientRoutes(endpoint, rootPath, files, rootContent)
+	}
 	releaseEndpoint := strings.TrimSuffix(endpoint, "/") + "/.snailmail/releases/" + treeSHA256
 	routes := make([]host.ClientRoute, 0, len(files))
 	for _, file := range files {
@@ -1532,6 +1648,44 @@ func stageDescriptorKey(repository host.Repository, identifier string) string {
 
 func stagePointerKey(repository host.Repository, effectID string) string {
 	return objectKey(repository, path.Join(".snailmail", "stages", "effects", effectID+".json"))
+}
+
+// readPrefixes are the key prefixes a client needs to fetch a revision.
+//
+// For a format staged in a release directory this is narrow: the root object and
+// that one directory. For a format published at canonical paths it is the
+// repository, because that is where its packages and metadata are — a wider grant,
+// and a stated consequence of publishing without the indirection rather than an
+// oversight. It is still scoped to this repository's prefix, and still issued per
+// publication with a lifetime of minutes.
+func readPrefixes(repository host.Repository, treeSHA256, rootPath string) []string {
+	if repository.RootRewriter != nil {
+		return []string{objectKey(repository, rootPath), releaseKey(repository, treeSHA256, "")}
+	}
+	return []string{objectKey(repository, ""), releaseKey(repository, treeSHA256, "")}
+}
+
+// publishedFileKey is where one file of a revision is written.
+//
+// Two shapes, decided by whether the format needs its root rebound:
+//
+// A format that does — PyPI, whose per-project indexes are rewritten between
+// revisions — has its whole tree staged under the release directory, and only its
+// rebound root appears at a canonical path. Writing such a tree canonically would
+// change what the live revision serves before the new one was committed.
+//
+// A format that does not — Helm, unsigned yum — has its non-root files written at
+// canonical paths, because each of those paths holds bytes fixed by the path and
+// so cannot collide with what the live revision serves. Its root is still copied
+// into the release directory, as the immutable record Observe compares the live
+// root against. Only the root is duplicated: copying the packages too would double
+// the storage for no further guarantee, since the descriptor already pins their
+// digests.
+func publishedFileKey(repository host.Repository, treeSHA256, rootPath, name string) string {
+	if repository.RootRewriter != nil || name == rootPath {
+		return releaseKey(repository, treeSHA256, name)
+	}
+	return objectKey(repository, name)
 }
 
 func releaseKey(repository host.Repository, treeSHA256, name string) string {

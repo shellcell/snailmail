@@ -43,6 +43,15 @@ type HTTPClient struct {
 	Broker forge.TokenBroker
 	// Scope identifies what the token is for.
 	Scope forge.TokenScope
+	// AuthScheme prefixes the token in the Authorization header. Empty means
+	// "Bearer". Forgejo documents "token" and accepts either; GitHub and GitLab
+	// take Bearer. It is configurable because getting it wrong is an
+	// authentication failure that looks like a permission problem.
+	AuthScheme string
+	// Headers are sent with the request. A provider that wants a version or a
+	// media type declared says so here rather than this package knowing which
+	// provider wants what.
+	Headers map[string]string
 	// Client is the transport. Nil uses a bounded default.
 	Client *http.Client
 }
@@ -65,6 +74,14 @@ func (client HTTPClient) Get(ctx context.Context, endpoint string, target any) e
 		return fmt.Errorf("%w: %s", forge.ErrUnavailable, endpoint)
 	}
 	request.Header.Set("Accept", "application/json")
+	for name, value := range client.Headers {
+		// Set rather than Add, and the value is checked, because a header carrying
+		// a newline would let a caller append a second one.
+		if strings.ContainsAny(value, "\r\n") || strings.ContainsAny(name, "\r\n") {
+			return fmt.Errorf("%w: header %q cannot be sent", forge.ErrUnavailable, name)
+		}
+		request.Header.Set(name, value)
+	}
 	if client.Broker != nil {
 		token, err := client.Broker.Token(requestCtx, client.Scope)
 		if err != nil {
@@ -75,7 +92,11 @@ func (client HTTPClient) Get(ctx context.Context, endpoint string, target any) e
 		if err != nil {
 			return fmt.Errorf("%w: no token for %s: %w", forge.ErrUnavailable, client.Scope.Host, err)
 		}
-		request.Header.Set("Authorization", "Bearer "+bearer)
+		scheme := client.AuthScheme
+		if scheme == "" {
+			scheme = "Bearer"
+		}
+		request.Header.Set("Authorization", scheme+" "+bearer)
 	}
 	transport := client.Client
 	if transport == nil {
