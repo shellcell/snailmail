@@ -159,7 +159,20 @@ snailmail import --project six --public-origin python https://pypi.org/
 
 Each artifact goes through the same path as `adopt`: fetched, checked against the
 digest its index published, and recorded with its origin URL so it can be refetched
-later. Anything the index names but does not publish a SHA-256 for is skipped and
+later.
+
+What a recorded digest is worth depends on where it came from — an index someone
+signed is not the same as one served over TLS alone — so the lock records that
+beside it, and `status --json` reports the counts:
+
+```
+  python -> {"index-stated": 2}
+```
+
+`index-stated` means the index published the digest and the fetched bytes matched,
+which is the strongest a simple index supports. Artifacts recorded by `adopt` read
+as `operator`, including in locks written before this field existed. PLAN.md §3.8
+has the full set and what each level is worth. Anything the index names but does not publish a SHA-256 for is skipped and
 reported — a locked artifact is pinned to a digest someone stated in advance, and
 one computed from the bytes a download happened to return would prove only that the
 download was self-consistent.

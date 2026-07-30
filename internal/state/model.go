@@ -131,6 +131,80 @@ type LockedBlob struct {
 type ArtifactOrigin struct {
 	Kind string `toml:"kind"`
 	URL  string `toml:"url"`
+	// Provenance is how this artifact's SHA-256 was established.
+	//
+	// A digest is only worth what its source is worth, and a lock that cannot tell
+	// one verified against a signed Release from one computed off bytes a mirror
+	// happened to return is not the reviewable evidence the rest of this design
+	// rests on. See PLAN.md §3.8.
+	//
+	// Empty in a lock written before this existed, which reads as ProvenanceOperator:
+	// the only way to record an origin then was adopt, where a person supplied the
+	// digest.
+	Provenance DigestProvenance `toml:"provenance,omitempty"`
+}
+
+// DigestProvenance says how a recorded SHA-256 was established. The values are
+// ordered by strength, so a workspace can state a floor rather than inspecting
+// each artifact.
+type DigestProvenance string
+
+const (
+	// ProvenanceSignedIndex means an index signature verified against a key the
+	// operator supplied, and the digest came from within that signed document's
+	// chain. Available where a format signs its index: deb and rpm.
+	ProvenanceSignedIndex DigestProvenance = "signed-index"
+	// ProvenanceIndexChain means the digest came from a document whose own digest
+	// was stated by a root document — Packages named by Release, primary.xml named
+	// by repomd.xml. Nothing is authenticated, but one document is the root of
+	// trust instead of every entry, and truncation or corruption is caught.
+	ProvenanceIndexChain DigestProvenance = "index-chain"
+	// ProvenanceIndexStated means an index stated the digest and the fetched bytes
+	// matched it. This is pip's model over HTTPS, and the strongest a PyPI or Helm
+	// index supports.
+	ProvenanceIndexStated DigestProvenance = "index-stated"
+	// ProvenanceComputed means snailmail hashed what it downloaded and nobody
+	// stated the digest in advance. It proves the download was self-consistent and
+	// no more. Alpine needs it, because APKINDEX states a SHA-1 of a package's
+	// control section rather than a digest of the file.
+	ProvenanceComputed DigestProvenance = "computed"
+	// ProvenanceOperator means a person supplied the digest, which is what adopt
+	// has always required.
+	ProvenanceOperator DigestProvenance = "operator"
+)
+
+// provenanceStrength orders the levels. Higher is stronger, so a minimum floor is
+// a comparison rather than a set membership test.
+var provenanceStrength = map[DigestProvenance]int{
+	ProvenanceComputed:    1,
+	ProvenanceIndexStated: 2,
+	ProvenanceIndexChain:  3,
+	ProvenanceOperator:    4,
+	ProvenanceSignedIndex: 5,
+}
+
+// ValidProvenance reports whether a value is one snailmail records.
+func ValidProvenance(provenance DigestProvenance) bool {
+	_, known := provenanceStrength[provenance]
+	return known
+}
+
+// AtLeast reports whether this provenance meets a floor.
+func (provenance DigestProvenance) AtLeast(floor DigestProvenance) bool {
+	return provenanceStrength[provenance] >= provenanceStrength[floor]
+}
+
+// DigestProvenanceOf reads how a blob's digest was established.
+//
+// An artifact with no origin was handed to snailmail directly, and one recorded
+// before this field existed came through adopt, where a person supplied the
+// digest. Both are ProvenanceOperator, so a lock always has an answer rather than
+// a gap a reader has to interpret.
+func DigestProvenanceOf(blob LockedBlob) DigestProvenance {
+	if blob.Origin == nil || blob.Origin.Provenance == "" {
+		return ProvenanceOperator
+	}
+	return blob.Origin.Provenance
 }
 
 type Placement struct {

@@ -1424,6 +1424,12 @@ func ValidateArtifactOrigin(origin ArtifactOrigin) error {
 	if origin.Kind != "https" || err != nil || source.ValidatePublicURL(parsed) != nil {
 		return errors.New("invalid artifact origin")
 	}
+	// Checked because a lock is reviewed and hand-editable, and a provenance
+	// nobody recognises would otherwise read as the weakest level or the
+	// strongest depending on where it was compared.
+	if origin.Provenance != "" && !ValidProvenance(origin.Provenance) {
+		return fmt.Errorf("artifact origin records digest provenance %q, which is not one snailmail knows", origin.Provenance)
+	}
 	return nil
 }
 

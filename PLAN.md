@@ -425,6 +425,53 @@ encoding as preflight checks rather than discovering later:
 tag is a supply-chain signal**, and pinning is what turns it from invisible into
 a failing check.
 
+#### What a pinned digest means
+
+A lock records `sha256:` for every artifact, and `check` re-fetches and compares.
+That is only as strong as where the digest came from, and until `import` landed
+there was one answer: an operator typed it. Importing a published repository makes
+the digest come from an index instead, and the four formats differ in what an
+index can be trusted to say.
+
+- **PyPI** states a SHA-256 per file in the simple page. Trusting it over HTTPS is
+  exactly pip's model.
+- **Debian** states a SHA-256 per artifact in `Packages`, whose digest is in
+  `Release`, which `InRelease` or `Release.gpg` signs. A full chain exists, and apt
+  refuses an unsigned repository by default.
+- **yum** has the same shape: `primary.xml` digests each package, `repomd.xml`
+  digests `primary.xml`, and `repomd.xml.asc` signs `repomd.xml`.
+- **Alpine** states `C:Q1…`, which is base64 of the SHA-1 of a package's *control
+  section* — not a digest of the file. There is nothing there to pin an artifact
+  to.
+
+So the decision is not one trust level but a recorded one. **The lock records how
+each digest was established**, because a lock that cannot distinguish a digest
+verified against a signed `Release` from one computed off bytes a mirror happened
+to return is not the reviewable evidence the rest of this design depends on. The
+provenance is a field beside the origin, with the levels ordered:
+
+| Level | Means | Available |
+|---|---|---|
+| `signed-index` | an index signature verified against a supplied key | deb, rpm |
+| `index-chain` | the leaf digest matched a root document's digest of it | deb, rpm |
+| `index-stated` | the index stated it and the bytes matched | pypi, helm, deb, rpm |
+| `computed` | snailmail hashed what it downloaded | apk, and a last resort |
+| `operator` | a person supplied it to `adopt` | all |
+
+`import` defaults to the strongest level a format supports without extra
+configuration — `index-chain` for deb and rpm, `index-stated` for pypi and helm —
+and takes a key to reach `signed-index`. A minimum acceptable level is a flag, so a
+workspace that will not accept unauthenticated bytes can say so once rather than
+per artifact.
+
+Alpine records `computed` and says so. That is the honest answer rather than an
+exception made quietly: its index authenticates a control section, not a file, so
+an imported Alpine artifact is pinned to bytes snailmail saw and nothing more. The
+point of recording it is that the weakness is then visible in the same place
+everything else about the artifact is, and answerable later — *which of my
+artifacts came from an index nobody signed?* is a question a lock should be able
+to answer.
+
 **`proxy` only works for some formats**, and the reason is mechanical: can the
 index name an absolute URL somewhere else?
 

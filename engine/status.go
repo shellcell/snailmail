@@ -47,8 +47,12 @@ type StatusRepository struct {
 	// Artifacts is how many distinct blobs this repository's retained versions
 	// bind, and ArtifactBytes their total size. A package-version can bind several
 	// — one per architecture — so the count is not the version count.
-	Artifacts           int              `json:"artifacts"`
-	ArtifactBytes       int64            `json:"artifact_bytes"`
+	Artifacts     int   `json:"artifacts"`
+	ArtifactBytes int64 `json:"artifact_bytes"`
+	// DigestProvenance counts artifacts by how their SHA-256 was established, so
+	// "which of these came from an index nobody signed" is answerable without
+	// reading the lock. Keyed by level; absent levels are simply not present.
+	DigestProvenance    map[string]int   `json:"digest_provenance,omitempty"`
 	VisibleBindingState string           `json:"visible_binding_state"`
 	VisiblePackages     []StatusPackage  `json:"visible_packages"`
 	Deployment          StatusDeployment `json:"deployment"`
@@ -130,7 +134,8 @@ func StatusWorkspace(ctx context.Context, request StatusWorkspaceRequest) (Statu
 		artifacts, artifactBytes := retainedArtifacts(lock)
 		statusRepository := StatusRepository{
 			LockBytes: lockBytes, Artifacts: artifacts, ArtifactBytes: artifactBytes,
-			Name: name, Format: repository.Format, Track: repository.Track, Suite: repository.Suite,
+			DigestProvenance: digestProvenanceCounts(lock),
+			Name:             name, Format: repository.Format, Track: repository.Track, Suite: repository.Suite,
 			Visibility: repository.Visibility, GatePolicy: repository.Gate,
 			RetainedPackageVersions: len(lock.PackageVersion), VisiblePackageVersions: len(visible), VisibleBindingState: "complete",
 			VisiblePackages: make([]StatusPackage, 0, len(visible)), Deployment: StatusDeployment{State: "unrecorded"},
@@ -220,4 +225,27 @@ func retainedArtifacts(lock state.RepositoryLock) (int, int64) {
 		total += size
 	}
 	return len(seen), total
+}
+
+// digestProvenanceCounts counts distinct artifacts by how their digest was
+// established.
+//
+// Distinct by SHA-256 for the same reason retainedArtifacts is: one blob bound by
+// several versions is one artifact, and counting bindings would report a workspace
+// as holding more unauthenticated bytes than it does.
+func digestProvenanceCounts(lock state.RepositoryLock) map[string]int {
+	seen := make(map[string]state.DigestProvenance)
+	for _, packageVersion := range lock.PackageVersion {
+		for _, blob := range packageVersion.Blobs {
+			seen[blob.SHA256] = state.DigestProvenanceOf(blob)
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	counts := make(map[string]int, len(seen))
+	for _, provenance := range seen {
+		counts[string(provenance)]++
+	}
+	return counts
 }

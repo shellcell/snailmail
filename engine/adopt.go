@@ -34,7 +34,11 @@ type AdoptArtifactRequest struct {
 	Distro       string
 	DryRun       bool
 	PublicOrigin bool
-	Fetcher      source.Fetcher
+	// Provenance is how the caller established SHA256. Empty means the operator
+	// supplied it, which is what adopt has always required of a person and what
+	// every lock written before this field recorded.
+	Provenance state.DigestProvenance
+	Fetcher    source.Fetcher
 }
 
 type AdoptArtifactResult struct {
@@ -152,7 +156,14 @@ func AdoptArtifact(ctx context.Context, request AdoptArtifactRequest) (AdoptArti
 	// Stamped when the artifact is adopted, not when it is published: a lock is
 	// reviewed and applied later, and re-applying it must not move the date.
 	locked.Added = state.LockTime(time.Now())
-	locked.Origin = &state.ArtifactOrigin{Kind: "https", URL: originURL.String()}
+	provenance := request.Provenance
+	if provenance == "" {
+		provenance = state.ProvenanceOperator
+	}
+	if !state.ValidProvenance(provenance) {
+		return AdoptArtifactResult{}, fmt.Errorf("digest provenance %q is not one snailmail records", provenance)
+	}
+	locked.Origin = &state.ArtifactOrigin{Kind: "https", URL: originURL.String(), Provenance: provenance}
 	added, err := state.AddBlob(&lock, repository.Format, track, distro, locked, packageName, blob.Facts.Version)
 	if err != nil {
 		return AdoptArtifactResult{}, err

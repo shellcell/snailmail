@@ -146,7 +146,11 @@ func ImportRepository(ctx context.Context, request ImportRepositoryRequest) (Imp
 			Root: root, Repository: request.Repository, URL: artifactURL.String(),
 			SHA256: file.SHA256, Filename: file.Filename, Track: request.Track,
 			Distro: request.Distro, DryRun: request.DryRun, PublicOrigin: true,
-			Fetcher: request.Fetcher,
+			// The index stated this digest and adopt checks the bytes against it,
+			// which is the strongest a simple index supports: there is nothing here
+			// to verify a signature against, and no root document naming the page.
+			Provenance: state.ProvenanceIndexStated,
+			Fetcher:    request.Fetcher,
 		})
 		if err != nil {
 			// One artifact failing does not abandon the rest. A repository being
