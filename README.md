@@ -465,6 +465,32 @@ artifacts would otherwise be a 38 MB page rebuilt and re-uploaded on every
 publication. Set it with `Window` if you want a different size; the footer always
 reports the repository's true total.
 
+## Undoing a publication
+
+When a publication succeeded and turned out to be wrong:
+
+```sh
+snailmail rollback apt            # report what would be restored
+snailmail rollback apt --yes      # restore the previous publication
+```
+
+**One step, deliberately.** A published revision carries a reference to the root it
+replaced, and collection protects that target for exactly this reason — so going
+back one publication is something the host can still verify. Going back further is
+not offered: nothing keeps a chain of restore references, and the older releases
+may have been collected. A rollback whose target cannot be checked is not a
+rollback.
+
+**Not every host can do it.** A local directory and an ssh host both decline,
+because neither can establish that the release it would point back at is intact.
+There the answer is to revert the lock in git and publish forward, and `rollback`
+says so rather than failing obscurely.
+
+**Your lock still describes what you rolled back from.** That is deliberate — the
+rollback changed what is served, not what your workspace wants — but it means the
+next `apply` will republish what you just undid unless you revert or amend the lock
+first. The command says this every time it runs.
+
 ## Collecting superseded releases
 
 An object store keeps every revision it has ever published: a publication writes a

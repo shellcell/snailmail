@@ -68,6 +68,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runRollout(ctx, args[1:], stdout, stderr)
 	case "collect":
 		return runCollect(ctx, args[1:], stdout, stderr)
+	case "rollback":
+		return runRollback(ctx, args[1:], stdout, stderr)
 	case "import":
 		return runImport(ctx, args[1:], stdout, stderr)
 	case "ci":
@@ -1427,6 +1429,7 @@ func printUsage(output io.Writer) {
 			"prune REPOSITORY --keep N",
 			"rollout [--repo NAME] [--package NAME] [--withdrawn]",
 			"collect [--repo NAME] [--keep N] [--yes]",
+			"rollback REPOSITORY [--yes]",
 		}},
 		{"Taking on an existing repository", []string{
 			"import --public-origin [--project NAME|--suite NAME] [--min-provenance LEVEL] [--dry-run --limit N] REPOSITORY URL",
@@ -1611,6 +1614,50 @@ func largestLockSuffix(result engine.StatusWorkspaceResult) string {
 // otherwise. Named because a next-step hint has to agree with it, and three flags
 // repeated the literal.
 const defaultPlanFile = "snailmail.snailmail-plan.json"
+
+func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := newCommandFlags("rollback", stderr).withWorkspace().withJSON()
+	dryRun := flags.Bool("dry-run", false, "report what would be restored without restoring it")
+	// Undoing a publication is destructive in the same sense collect is: it changes
+	// what the world is being served. So it asks, the way collect and yank do.
+	yes := flags.Bool("yes", false, "confirm the rollback; without it this reports what would happen")
+	positional, err := flags.parseWithArguments(args, 1, "usage: snailmail rollback [options] REPOSITORY")
+	if err != nil {
+		return err
+	}
+	hosts := wire.NewHostResolver()
+	defer hosts.Close()
+	result, err := engine.RollbackRepository(ctx, engine.RollbackRepositoryRequest{
+		Root: flags.Root(), Repository: positional[0], DryRun: *dryRun || !*yes, Hosts: hosts,
+	})
+	if err != nil {
+		return err
+	}
+	if done, err := flags.emit(stdout, result); done || err != nil {
+		return err
+	}
+	printBrand(stdout)
+	if result.DryRun {
+		fmt.Fprintf(stdout, "\U0001F4E6  would roll %s back from %s\n", result.Repository, shortDigest(result.From))
+		fmt.Fprintf(stdout, "\u2192   next: snailmail rollback --yes %s   (actually restore the previous publication)\n", result.Repository)
+		return nil
+	}
+	fmt.Fprintf(stdout, "\U0001F4E6  rolled %s back from %s to %s\n",
+		result.Repository, shortDigest(result.From), shortDigest(result.To))
+	if result.Note != "" {
+		fmt.Fprintf(stdout, "\u26A0\uFE0F   %s\n", result.Note)
+	}
+	return nil
+}
+
+// shortDigest is a tree digest abbreviated for reading, since a rollback message
+// is about which of two revisions is live rather than about their full identity.
+func shortDigest(digest string) string {
+	if len(digest) <= 12 {
+		return digest
+	}
+	return digest[:12]
+}
 
 func runCollect(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := newCommandFlags("collect", stderr).withWorkspace().withJSON()
