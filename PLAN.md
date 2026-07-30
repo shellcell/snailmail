@@ -927,6 +927,49 @@ theoretical one.
 The wizard detects the forge from the git remote and never asks unless it
 cannot tell.
 
+**Status, and what first-class now means.** The review-gate port is the narrow
+one and it is done: `forge.Forge` asks three read-only questions — default
+branch, which pull requests contain a revision, is that revision an ancestor of
+the branch — and nothing in it writes, because review evidence is observed
+rather than produced. A GitLab merge request answers all three (`GET
+/projects/:id` for the branch, `.../repository/commits/:sha/merge_requests` for
+the reviews, `.../repository/merge_base` for the ancestry, which is a more direct
+answer than GitHub's comparison status). That the port needed no change to
+accommodate a second provider is the evidence that it is drawn in the right
+place.
+
+First-class is defined by `forge/forgetest`, the conformance suite an adapter has
+to pass: it reads a default branch, refuses a provider answering about a
+different repository, distinguishes closed from merged, reads containment and
+merge base separately, reports no review as none rather than as an error, and
+renders every unreachable read as `ErrUnavailable`. The GitHub adapter passes it
+and the plain adapter deliberately fails it, answering nothing — both at 100%
+statement coverage, from nothing.
+
+Two things block a second forge, and neither is the port:
+
+- **Resolution is name-shaped, not remote-shaped.** `internal/wire.ForgeResolver`
+  treats every `owner/name` as github.com, so a GitLab `group/project` is queried
+  against GitHub. It is not exploitable — a revision is a SHA and cannot collide
+  across providers, so the gate refuses — but it refuses with the wrong reason,
+  and no configuration can make it right. The manifest has to be able to name the
+  provider and its hostname, which is also what GitHub Enterprise needs: the
+  adapter already takes a hostname that nothing can set. Detecting from the git
+  remote, per the paragraph above, is the inference; the manifest is the record.
+- **GitLab Pages is not a variant of the Pages host.** GitHub Pages is atomic
+  because a revision goes live by moving a ref to an orphan commit of the whole
+  tree. GitLab Pages publishes a job artifact, so that mechanism does not
+  transfer and the table row above understates the difference. First-class GitLab
+  therefore means the review gate and a CI template first, with S3 or rsync as
+  the host — not a Pages adapter.
+
+Order: the manifest's forge declaration, then GitLab's gate adapter against the
+conformance suite, then a `snailmail ci gitlab` template, then Forgejo/Gitea —
+whose API is GitHub-shaped but whose per-commit pull-request and compare
+endpoints vary by version, so it needs its support floor pinned to a version
+rather than assumed. Bitbucket is last and may stay unsupported: it has no
+merge-base endpoint, which is the one question the gate cannot do without.
+
 ### 11.5 Automation: the container image is the integration point
 
 The primary automation artifact is **a multi-arch OCI image containing the
