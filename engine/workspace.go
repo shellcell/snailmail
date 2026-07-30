@@ -1495,12 +1495,17 @@ func (localHostResolver) Resolve(_ context.Context, repository host.Repository) 
 }
 
 func toHostRepository(root, workspaceID, hostIdentity, name string, repository state.Repository) host.Repository {
+	var commitPaths []string
+	if selected, err := formats.For(repository.Format); err == nil {
+		commitPaths = selected.CommitPaths(formatRepositoryWithKeys(repository, name, nil))
+	}
 	canonicalEndpoint := repository.Host.CanonicalEndpoint
 	if repository.Host.Type == "local" {
 		canonicalEndpoint = repository.Host.Path
 	}
 	return host.Repository{
-		Name: name, WorkspaceID: workspaceID, HostIdentity: hostIdentity, Format: repository.Format, Type: repository.Host.Type,
+		Name: name, WorkspaceID: workspaceID, HostIdentity: hostIdentity, Format: repository.Format,
+		CommitPaths: commitPaths, Type: repository.Host.Type,
 		Visibility: repository.Visibility, WorkspaceRoot: root, Path: repository.Host.Path,
 		Bucket: repository.Host.Bucket, Prefix: repository.Host.Prefix, Region: repository.Host.Region,
 		Endpoint: repository.Host.Endpoint, CanonicalEndpoint: canonicalEndpoint,

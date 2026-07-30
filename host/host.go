@@ -44,10 +44,16 @@ type CredentialBroker interface {
 }
 
 type Repository struct {
-	Name              string
-	WorkspaceID       string
-	HostIdentity      string
-	Format            string
+	Name         string
+	WorkspaceID  string
+	HostIdentity string
+	Format       string
+	// CommitPaths are the files whose switch makes a new revision live. The
+	// engine fills them from the format, so a host adapter can reason about the
+	// shape of a publication without knowing anything about ecosystems: an
+	// object store, for instance, can commit one such path atomically and no
+	// more.
+	CommitPaths       []string
 	Type              string
 	Visibility        string
 	WorkspaceRoot     string

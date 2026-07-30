@@ -1180,11 +1180,18 @@ chart, each verified by running the real client. Signing lives behind a
 either satisfies it or does not.
 
 The format-and-host coupling that this phase owed is closed for its first
-cases: GitHub Pages serves signed Debian, rpm, apk and raw alongside PyPI. The
-matrix itself is declared in `host/support.go` rather than inferred, so the gaps
-that remain are readable rather than discovered. Remaining: Helm on Pages, S3
-beyond PyPI, additional key backends, `import`, and the TUI. The next formats
-are nix cache, cargo, go, and maven, in that order.
+cases: GitHub Pages serves signed Debian, rpm, apk, raw and Helm alongside PyPI.
+The matrix itself is declared in `host/support.go` rather than inferred, so the
+gaps that remain are readable rather than discovered — and each undeclared pair
+records why. Remaining: S3 beyond PyPI, additional key backends, `import`, and
+the TUI. The next formats are nix cache, cargo, go, and maven, in that order.
+
+S3 beyond PyPI turned out not to be a declaration. The adapter no longer
+hardcodes `simple/index.html`: `host.Repository` carries `CommitPaths`, filled
+from the format, so the adapter is told how many paths make a revision live and
+refuses a format needing more than one. That admits yum and Helm on path count.
+What still blocks them is the rewrite described below — the mechanism is
+general, the rewrite is per-format, and only the PyPI one exists.
 
 A Pages repository needs a companion preview site only where a gate waits for a
 human to review one. Under an `auto` gate the preview is optional, and its
@@ -1294,8 +1301,15 @@ Still open:
   returns its generated files as bytes. Streaming them changes `domain.File`,
   the build graph, and materialisation — and it gates the scale at which any of
   the sharding above matters.
-- **Can an object store publish Debian atomically?** A suite's `Release` must
-  become live with its `Packages` and pool. Pages does it by moving one ref;
-  S3 has no ordered multi-object commit. Either a two-phase switch through a
-  pointer object, or an admitted window where a client sees a `Release` that
-  disagrees with its indexes.
+- **Can an object store publish Debian atomically?** Partly answered by doing
+  it for PyPI. The adapter writes the whole tree under
+  `.snailmail/releases/<tree>/` and then PUTs one root object whose references
+  are rewritten to resolve inside that immutable directory, so a single PUT
+  makes a revision live with no window. That works for any format where one path
+  is the entry point — yum's `repodata/repomd.xml`, Helm's `index.yaml` — and the
+  rewrite is the only per-format part: `href=` for a simple index, `<location
+  href=>` for repomd, `urls:` for an index. It does not work for Debian, which
+  needs a `Release` and its detached signature live together, nor Alpine with an
+  index per architecture, nor raw with a listing and a `SHA256SUMS`. For those
+  the choice is still a two-phase switch through a pointer object or an admitted
+  window — but the question is now about the multi-path formats only.

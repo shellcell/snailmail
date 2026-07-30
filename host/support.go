@@ -47,6 +47,19 @@ var formatSupport = map[string]map[string]FormatSupport{
 	// The first remote slice is PyPI. Extending a host to another format means
 	// its commit paths, install document, and endpoint client probe, so the two
 	// flags move together per pair rather than per host.
+	// An object store commits one object atomically and offers no ordered
+	// multi-object commit, so it can serve a format only if a single path makes a
+	// revision live. PyPI, yum and Helm all qualify on that count — one of
+	// simple/index.html, repodata/repomd.xml or index.yaml — while Debian needs a
+	// Release and its detached signature together, Alpine has one index per
+	// architecture, and raw has a listing and a SHA256SUMS.
+	//
+	// Only PyPI is declared because qualifying is necessary and not sufficient.
+	// The adapter makes a revision live by writing the whole tree under
+	// .snailmail/releases/<tree>/ and then putting one root object whose
+	// references are rewritten to resolve inside it. That rewrite is format
+	// knowledge — href= for a simple index, <location href=> for repomd.xml,
+	// urls: for index.yaml — and the adapter has only the PyPI one. See PLAN.md.
 	"s3": {
 		"pypi": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 	},

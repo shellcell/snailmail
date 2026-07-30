@@ -27,13 +27,18 @@ import (
 	"github.com/shellcell/snailmail/internal/testutil"
 )
 
+// pypiRootPath is what a PyPI repository commits. Restated here because the
+// adapter no longer hardcodes any format's path: it is told which paths make a
+// revision live, and refuses a format that needs more than one.
+const pypiRootPath = "simple/index.html"
+
 func TestS3HostStageCommitRestoreContract(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	server := httptest.NewServer(http.HandlerFunc(objects.serveHTTP))
 	defer server.Close()
 	repository := host.Repository{
-		Name: "python", Format: "pypi", Type: "s3", Visibility: "public",
+		Name: "python", Format: "pypi", CommitPaths: []string{pypiRootPath}, Type: "s3", Visibility: "public",
 		Bucket: "packages", Prefix: "repo", CanonicalEndpoint: server.URL + "/repo",
 	}
 	adapter := New(objects)
@@ -103,7 +108,7 @@ func TestS3HostRejectsStaleCommitAndRestore(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	repository := host.Repository{
-		Name: "python", Format: "pypi", Type: "s3", Visibility: "public",
+		Name: "python", Format: "pypi", CommitPaths: []string{pypiRootPath}, Type: "s3", Visibility: "public",
 		Bucket: "packages", Prefix: "repo", CanonicalEndpoint: "https://packages.example/repo",
 	}
 	adapter := New(objects)
@@ -149,7 +154,7 @@ func TestS3HostRejectsRestoreToIncompletePriorRelease(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	repository := host.Repository{
-		Name: "python", Format: "pypi", Type: "s3", Visibility: "public",
+		Name: "python", Format: "pypi", CommitPaths: []string{pypiRootPath}, Type: "s3", Visibility: "public",
 		Bucket: "packages", Prefix: "repo", CanonicalEndpoint: "https://packages.example/repo",
 	}
 	adapter := New(objects)
@@ -187,7 +192,7 @@ func TestS3HostAbortMarksSharedStageForLifecycleCleanup(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	repository := host.Repository{
-		Name: "python", Format: "pypi", Type: "s3", Visibility: "public",
+		Name: "python", Format: "pypi", CommitPaths: []string{pypiRootPath}, Type: "s3", Visibility: "public",
 		Bucket: "packages", Prefix: "repo", CanonicalEndpoint: "https://packages.example/repo",
 	}
 	adapter := New(objects)
@@ -215,7 +220,7 @@ func TestS3HostFailedReleaseMaterializationLeavesCanonicalRoot(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	repository := host.Repository{
-		Name: "python", Format: "pypi", Type: "s3", Visibility: "public",
+		Name: "python", Format: "pypi", CommitPaths: []string{pypiRootPath}, Type: "s3", Visibility: "public",
 		Bucket: "packages", Prefix: "repo", CanonicalEndpoint: "https://packages.example/repo",
 	}
 	adapter := New(objects)
@@ -255,7 +260,7 @@ func TestS3HostDetectsImmutableReleaseDrift(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	repository := host.Repository{
-		Name: "python", Format: "pypi", Type: "s3", Visibility: "public",
+		Name: "python", Format: "pypi", CommitPaths: []string{pypiRootPath}, Type: "s3", Visibility: "public",
 		Bucket: "packages", Prefix: "repo", CanonicalEndpoint: "https://packages.example/repo",
 	}
 	adapter := New(objects)
@@ -292,17 +297,22 @@ func TestS3HostRejectsFileChangedBeforeStage(t *testing.T) {
 	if err := os.WriteFile(root, content, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	if _, err := New(newMemoryObjects()).Stage(context.Background(), repository, request); !host.IsKind(err, host.ErrorStale) {
 		t.Fatalf("changed stage file error = %v", err)
 	}
 }
 
-func TestS3HostRejectsPrivateAndNonPyPI(t *testing.T) {
+// An object store serves a format exactly when one object makes a revision
+// live. Debian needs a suite's Release and its detached signature together, so
+// it is refused here however it is configured — and a private repository still
+// needs a credential broker whatever it serves.
+func TestS3HostRejectsPrivateWithoutBrokerAndMultiPathFormats(t *testing.T) {
 	adapter := New(newMemoryObjects())
 	for _, repository := range []host.Repository{
-		{Type: "s3", Format: "pypi", Visibility: "private", Bucket: "b", CanonicalEndpoint: "https://example.test"},
-		{Type: "s3", Format: "helm", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"},
+		{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "private", Bucket: "b", CanonicalEndpoint: "https://example.test"},
+		{Type: "s3", Format: "deb", CommitPaths: []string{"dists/stable/InRelease", "dists/stable/Release.gpg"},
+			Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"},
 	} {
 		if _, err := adapter.Capabilities(context.Background(), repository); !host.IsKind(err, host.ErrorInvalidConfiguration) {
 			t.Fatalf("configuration error = %v", err)
@@ -315,7 +325,7 @@ func TestS3HostIssuesScopedPrivateReadCredentials(t *testing.T) {
 	objects := newMemoryObjects()
 	broker := &recordingCredentialBroker{}
 	repository := host.Repository{
-		Name: "python", Format: "pypi", Type: "s3", Visibility: "private", Bucket: "packages", Prefix: "repo",
+		Name: "python", Format: "pypi", CommitPaths: []string{pypiRootPath}, Type: "s3", Visibility: "private", Bucket: "packages", Prefix: "repo",
 		CanonicalEndpoint: "https://packages.example/repo", ReadAuth: "basic", CredentialBroker: "default",
 		WorkspaceID: strings.Repeat("b", 64), HostIdentity: strings.Repeat("c", 64),
 	}
@@ -378,7 +388,7 @@ func TestS3HostCredentialFailureDoesNotPublishEffectPointer(t *testing.T) {
 	objects := newMemoryObjects()
 	broker := &recordingCredentialBroker{issueErr: errors.New("temporary broker failure")}
 	repository := host.Repository{
-		Name: "python", Format: "pypi", Type: "s3", Visibility: "private", Bucket: "packages", Prefix: "repo",
+		Name: "python", Format: "pypi", CommitPaths: []string{pypiRootPath}, Type: "s3", Visibility: "private", Bucket: "packages", Prefix: "repo",
 		CanonicalEndpoint: "https://packages.example/repo", ReadAuth: "basic", CredentialBroker: "default",
 		WorkspaceID: strings.Repeat("b", 64), HostIdentity: strings.Repeat("c", 64),
 	}
@@ -404,7 +414,7 @@ func TestS3HostAdoptsAndRestoresUnmanagedRoot(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
 	repository := host.Repository{
-		Name: "python", Format: "pypi", Type: "s3", Visibility: "public",
+		Name: "python", Format: "pypi", CommitPaths: []string{pypiRootPath}, Type: "s3", Visibility: "public",
 		Bucket: "packages", Prefix: "repo", CanonicalEndpoint: "https://packages.example/repo",
 	}
 	unmanaged := []byte(`<a href="legacy/">legacy</a>`)
@@ -448,7 +458,7 @@ func TestS3HostAdoptsAndRestoresUnmanagedRoot(t *testing.T) {
 func TestS3HostRejectsTreeDigestOutsideDescriptor(t *testing.T) {
 	request := stageFixture(t, "invalid-tree", "", "", `<a href="demo/">content</a>`)
 	request.TreeSHA256 = strings.Repeat("9", 64)
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	if _, err := New(newMemoryObjects()).Stage(context.Background(), repository, request); !host.IsKind(err, host.ErrorInvalidConfiguration) {
 		t.Fatalf("tree mismatch error = %v", err)
 	}
@@ -457,7 +467,7 @@ func TestS3HostRejectsTreeDigestOutsideDescriptor(t *testing.T) {
 func TestS3HostRejectsTamperedRestoreBytes(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	adapter := New(objects)
 	firstRequest := stageFixture(t, "restore-first", "", "", `<a href="demo/">first</a>`)
 	firstStage, err := adapter.Stage(ctx, repository, firstRequest)
@@ -493,7 +503,7 @@ func TestS3HostRejectsTamperedRestoreBytes(t *testing.T) {
 func TestS3HostRecoversAmbiguousStagePointerWrite(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	request := stageFixture(t, "ambiguous-stage", "", "", `<a href="demo/">content</a>`)
 	objects.ambiguousPutKey = stagePointerKey(repository, effectIdentifier(request.PlanID, request.ChangeID))
 	adapter := New(objects)
@@ -510,7 +520,7 @@ func TestS3HostRecoversAmbiguousStagePointerWrite(t *testing.T) {
 func TestS3HostRootBodyBindsPublicationManifest(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	adapter := New(objects)
 	firstRequest := stageFixture(t, "binding-first", "", "", `<a href="demo/">content</a>`)
 	firstStage, err := adapter.Stage(ctx, repository, firstRequest)
@@ -547,7 +557,7 @@ func TestS3HostRootBodyBindsPublicationManifest(t *testing.T) {
 func TestS3HostCreateOnlyPromotionRejectsImmutableConflict(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	adapter := New(objects)
 	request := stageFixture(t, "immutable-conflict", "", "", `<a href="demo/">content</a>`)
 	staged, err := adapter.Stage(ctx, repository, request)
@@ -574,7 +584,7 @@ func TestS3HostCreateOnlyPromotionRejectsImmutableConflict(t *testing.T) {
 func TestS3HostRejectsSemanticallyInvalidPublicationManifest(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	adapter := New(objects)
 	request := stageFixture(t, "invalid-manifest", "", "", `<a href="demo/">content</a>`)
 	manifestName := filepath.Join(request.Directory, buildgraph.ManifestFilename)
@@ -613,7 +623,7 @@ func TestS3HostRejectsSemanticallyInvalidPublicationManifest(t *testing.T) {
 func TestS3HostMissingBoundReleaseIsIndeterminate(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	adapter := New(objects)
 	request := stageFixture(t, "missing-release", "", "", `<a href="demo/">content</a>`)
 	staged, err := adapter.Stage(ctx, repository, request)
@@ -633,7 +643,7 @@ func TestS3HostMissingBoundReleaseIsIndeterminate(t *testing.T) {
 
 func TestS3HostRejectsInvalidDirectConfiguration(t *testing.T) {
 	adapter := New(newMemoryObjects())
-	valid := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	valid := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	for _, mutate := range []func(*host.Repository){
 		func(repository *host.Repository) { repository.Path = "local" },
 		func(repository *host.Repository) { repository.Prefix = "/absolute" },
@@ -655,7 +665,7 @@ func TestS3HostRejectsInvalidDirectConfiguration(t *testing.T) {
 func TestS3HostMigratesLegacyManagedRootOnNextCommit(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	adapter := New(objects)
 	request := stageFixture(t, "legacy-first", "", "", `<a href="demo/">content</a>`)
 	staged, err := adapter.Stage(ctx, repository, request)
@@ -708,7 +718,7 @@ func TestS3HostMigratesLegacyManagedRootOnNextCommit(t *testing.T) {
 func TestS3HostRecoversAmbiguousRestoreAndExactRetry(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	adapter := New(objects)
 	firstRequest := stageFixture(t, "ambiguous-restore-first", "", "", `<a href="demo/">first</a>`)
 	firstStage, err := adapter.Stage(ctx, repository, firstRequest)
@@ -743,7 +753,7 @@ func TestS3HostRecoversAmbiguousRestoreAndExactRetry(t *testing.T) {
 func TestS3HostDoesNotRebindPublishedEffectToNewRestoreState(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	adapter := New(objects)
 	request := stageFixture(t, "fixed-effect", "", "", `<a href="demo/">content</a>`)
 	firstStage, err := adapter.Stage(ctx, repository, request)
@@ -776,7 +786,7 @@ func TestS3HostDoesNotRebindPublishedEffectToNewRestoreState(t *testing.T) {
 func TestS3HostRejectsPartialReservedRootMetadata(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	content := []byte(`<a href="demo/">content</a>`)
 	if _, err := objects.Put(ctx, PutRequest{
 		Key: objectKey(repository, pypiRootPath), Body: bytes.NewReader(content), Size: int64(len(content)), SHA256: digestBytes(content),
@@ -792,7 +802,7 @@ func TestS3HostRejectsPartialReservedRootMetadata(t *testing.T) {
 func TestS3HostRejectsInvalidRestoreBeforeIdentity(t *testing.T) {
 	ctx := context.Background()
 	objects := newMemoryObjects()
-	repository := host.Repository{Type: "s3", Format: "pypi", Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
+	repository := host.Repository{Type: "s3", Format: "pypi", CommitPaths: []string{pypiRootPath}, Visibility: "public", Bucket: "b", CanonicalEndpoint: "https://example.test"}
 	identifier := strings.Repeat("1", 64)
 	descriptor := restoreDescriptor{
 		PlanID: strings.Repeat("2", 64), ChangeID: "python:000000000000", AfterTreeSHA256: strings.Repeat("3", 64),

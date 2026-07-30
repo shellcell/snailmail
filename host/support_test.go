@@ -10,13 +10,19 @@ import (
 func TestSupportsDeniesUnknownPairs(t *testing.T) {
 	for _, pair := range [][2]string{
 		{"", ""},
-		{"s3", "rpm"},
 		{"rsync", "pypi"},
 		// cargo has no format implementation, so no host can serve it.
 		{"local", "cargo"},
-		// Helm on S3: an object store cannot switch index.yaml and the charts
-		// it names in one commit.
+		// An object store commits one object, so a format qualifies only if one
+		// path makes a revision live: Debian needs a Release and its detached
+		// signature together, Alpine has an index per architecture, raw has a
+		// listing and a SHA256SUMS. Helm and yum do qualify, but the adapter
+		// rewrites only a PyPI root to point into the immutable release tree.
+		{"s3", "deb"},
+		{"s3", "apk"},
+		{"s3", "raw"},
 		{"s3", "helm"},
+		{"s3", "rpm"},
 	} {
 		support := Supports(pair[0], pair[1])
 		if support.Publish || support.RemoteClientVerification || support.InstallDocument {

@@ -32,7 +32,6 @@ import (
 var changeIDPattern = regexp.MustCompile(`^[a-z][a-z0-9-]*:[a-f0-9]{12}$`)
 
 const (
-	pypiRootPath        = "simple/index.html"
 	maximumMetadataSize = 16 << 20
 	maximumFiles        = 20_000
 	maximumTreeBytes    = 4 << 30
@@ -63,10 +62,14 @@ func (adapter *Adapter) Capabilities(_ context.Context, repository host.Reposito
 }
 
 func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository) (host.PublishedRevision, error) {
+	rootPath, err := singleRootPath(repository)
+	if err != nil {
+		return host.PublishedRevision{}, err
+	}
 	if err := adapter.validateRepository(repository); err != nil {
 		return host.PublishedRevision{}, err
 	}
-	root, err := adapter.client.Head(ctx, objectKey(repository, pypiRootPath))
+	root, err := adapter.client.Head(ctx, objectKey(repository, rootPath))
 	if errors.Is(err, ErrNotFound) {
 		return host.PublishedRevision{}, nil
 	}
@@ -159,7 +162,7 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 	}); err != nil {
 		return host.PublishedRevision{}, err
 	}
-	releaseRoot, _, err := adapter.client.Get(ctx, releaseKey(repository, revision.TreeSHA256, pypiRootPath), maximumMetadataSize)
+	releaseRoot, _, err := adapter.client.Get(ctx, releaseKey(repository, revision.TreeSHA256, rootPath), maximumMetadataSize)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "read immutable S3 root", Err: errors.New("bound immutable root is missing")}
@@ -170,7 +173,7 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 	if err != nil {
 		return host.PublishedRevision{}, err
 	}
-	canonicalRoot, canonicalInfo, err := adapter.client.Get(ctx, objectKey(repository, pypiRootPath), maximumMetadataSize)
+	canonicalRoot, canonicalInfo, err := adapter.client.Get(ctx, objectKey(repository, rootPath), maximumMetadataSize)
 	if err != nil || canonicalInfo.ETag != root.ETag || !reflect.DeepEqual(canonicalInfo.Metadata, root.Metadata) {
 		return host.PublishedRevision{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: "observe S3 root", Err: errors.New("canonical root bytes do not match immutable release")}
 	}
@@ -187,6 +190,10 @@ func (adapter *Adapter) Observe(ctx context.Context, repository host.Repository)
 }
 
 func (adapter *Adapter) ReadAccess(ctx context.Context, repository host.Repository, revision host.PublishedRevision) (host.ClientAccess, error) {
+	rootPath, err := singleRootPath(repository)
+	if err != nil {
+		return host.ClientAccess{}, err
+	}
 	if err := adapter.validateRepository(repository); err != nil {
 		return host.ClientAccess{}, err
 	}
@@ -204,7 +211,7 @@ func (adapter *Adapter) ReadAccess(ctx context.Context, repository host.Reposito
 	if err != nil {
 		return host.ClientAccess{}, err
 	}
-	releaseRoot, _, err := adapter.client.Get(ctx, releaseKey(repository, revision.TreeSHA256, pypiRootPath), maximumMetadataSize)
+	releaseRoot, _, err := adapter.client.Get(ctx, releaseKey(repository, revision.TreeSHA256, rootPath), maximumMetadataSize)
 	if err != nil {
 		return host.ClientAccess{}, infrastructure("read immutable S3 root", err)
 	}
@@ -212,14 +219,14 @@ func (adapter *Adapter) ReadAccess(ctx context.Context, repository host.Reposito
 	if err != nil {
 		return host.ClientAccess{}, err
 	}
-	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, revision.TreeSHA256, descriptor.Files, canonicalRoot)
+	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, revision.TreeSHA256, rootPath, descriptor.Files, canonicalRoot)
 	if err != nil {
 		return host.ClientAccess{}, err
 	}
 	return adapter.issueAccess(ctx, repository, host.ReadScope{
 		WorkspaceID: repository.WorkspaceID, Repository: repository.Name, HostIdentity: repository.HostIdentity,
 		Bucket: repository.Bucket, Endpoint: repository.CanonicalEndpoint, PlanID: revision.PlanID, ChangeID: revision.ChangeID, TreeSHA256: revision.TreeSHA256,
-		Prefixes: []string{objectKey(repository, pypiRootPath), releaseKey(repository, revision.TreeSHA256, "")},
+		Prefixes: []string{objectKey(repository, rootPath), releaseKey(repository, revision.TreeSHA256, "")},
 	}, routes)
 }
 
@@ -227,7 +234,7 @@ func (adapter *Adapter) Stage(ctx context.Context, repository host.Repository, r
 	if err := adapter.validateRepository(repository); err != nil {
 		return host.StagedPublication{}, err
 	}
-	descriptor, _, err := descriptorFromRequest(request)
+	descriptor, _, err := descriptorFromRequest(repository, request)
 	if err != nil {
 		return host.StagedPublication{}, err
 	}
@@ -374,6 +381,10 @@ func (adapter *Adapter) Stage(ctx context.Context, repository host.Repository, r
 }
 
 func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, staged host.StagedPublication, expected host.ExpectedRevision) (host.CommitResult, error) {
+	rootPath, err := singleRootPath(repository)
+	if err != nil {
+		return host.CommitResult{}, err
+	}
 	if err := adapter.validateRepository(repository); err != nil {
 		return host.CommitResult{}, err
 	}
@@ -424,7 +435,7 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 	if err != nil {
 		return host.CommitResult{}, err
 	}
-	rootContent, _, err := adapter.client.Get(ctx, stageKey(repository, staged.ID, pypiRootPath), maximumMetadataSize)
+	rootContent, _, err := adapter.client.Get(ctx, stageKey(repository, staged.ID, rootPath), maximumMetadataSize)
 	if err != nil {
 		return host.CommitResult{}, infrastructure("read staged S3 root metadata", err)
 	}
@@ -437,14 +448,14 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 	if err != nil {
 		return host.CommitResult{}, err
 	}
-	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, descriptor.TreeSHA256, descriptor.Files, rootContent)
+	routes, err := canonicalClientRoutes(repository.CanonicalEndpoint, descriptor.TreeSHA256, rootPath, descriptor.Files, rootContent)
 	if err != nil {
 		return host.CommitResult{}, err
 	}
 	access, err := adapter.issueAccess(ctx, repository, host.ReadScope{
 		WorkspaceID: repository.WorkspaceID, Repository: repository.Name, HostIdentity: repository.HostIdentity,
 		Bucket: repository.Bucket, Endpoint: repository.CanonicalEndpoint, PlanID: descriptor.PlanID, ChangeID: descriptor.ChangeID, TreeSHA256: descriptor.TreeSHA256,
-		Prefixes: []string{objectKey(repository, pypiRootPath), releaseKey(repository, descriptor.TreeSHA256, "")},
+		Prefixes: []string{objectKey(repository, rootPath), releaseKey(repository, descriptor.TreeSHA256, "")},
 	}, routes)
 	if err != nil {
 		return host.CommitResult{}, err
@@ -466,8 +477,8 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 		rootMetadata["restore-root-sha256"] = restoreRootDigest
 	}
 	root, err := adapter.client.Put(ctx, PutRequest{
-		Key: objectKey(repository, pypiRootPath), Body: bytes.NewReader(rootContent), Size: int64(len(rootContent)),
-		SHA256: digestBytes(rootContent), ContentType: contentType(pypiRootPath), Conditions: conditions,
+		Key: objectKey(repository, rootPath), Body: bytes.NewReader(rootContent), Size: int64(len(rootContent)),
+		SHA256: digestBytes(rootContent), ContentType: contentType(rootPath), Conditions: conditions,
 		Metadata: rootMetadata,
 	})
 	if err != nil {
@@ -495,6 +506,10 @@ func (adapter *Adapter) Commit(ctx context.Context, repository host.Repository, 
 }
 
 func (adapter *Adapter) Restore(ctx context.Context, repository host.Repository, restore host.RestoreRef, expected host.ExpectedRevision) (host.PublishedRevision, error) {
+	rootPath, err := singleRootPath(repository)
+	if err != nil {
+		return host.PublishedRevision{}, err
+	}
 	if err := adapter.validateRepository(repository); err != nil {
 		return host.PublishedRevision{}, err
 	}
@@ -530,7 +545,7 @@ func (adapter *Adapter) Restore(ctx context.Context, repository host.Repository,
 		observed.RestoreID != restore.ID || observed.RestoreSHA256 != restore.DescriptorSHA256 || observed.RestoreRootSHA256 != restore.RootSHA256 {
 		return host.PublishedRevision{}, stale("restore S3 repository", expected, observed)
 	}
-	rootKey := objectKey(repository, pypiRootPath)
+	rootKey := objectKey(repository, rootPath)
 	if !descriptor.RootExisted {
 		if err := adapter.client.Delete(ctx, rootKey, Conditions{IfMatch: expected.NativeRevision}); err != nil {
 			if restored, revision, postconditionErr := adapter.restorePostcondition(ctx, repository, descriptor, restore); postconditionErr == nil && restored {
@@ -560,7 +575,7 @@ func (adapter *Adapter) Restore(ctx context.Context, repository host.Repository,
 	}
 	root, err := adapter.client.Put(ctx, PutRequest{
 		Key: rootKey, Body: bytes.NewReader(content), Size: int64(len(content)), SHA256: digestBytes(content),
-		ContentType: contentType(pypiRootPath), Metadata: descriptor.BeforeMetadata,
+		ContentType: contentType(rootPath), Metadata: descriptor.BeforeMetadata,
 		Conditions: Conditions{IfMatch: expected.NativeRevision},
 	})
 	if err != nil {
@@ -660,12 +675,38 @@ type restoreDescriptor struct {
 	BeforeMetadata   map[string]string `json:"before_metadata,omitempty"`
 }
 
-func descriptorFromRequest(request host.StageRequest) (publicationDescriptor, string, error) {
+// singleRootPath is the one object whose switch makes a revision live here.
+//
+// An object store has no ordered multi-object commit; what it offers is one
+// atomic PUT. So a format can be published to one exactly when its liveness
+// hangs on a single path — PyPI's simple/index.html, a yum repodata/repomd.xml,
+// a Helm index.yaml. Everything else is written first, at paths either
+// content-addressed or not yet referenced, and the last PUT publishes them all.
+//
+// Debian needs a suite's Release and its detached signature to become live
+// together, Alpine one index per architecture, raw its listing and SHA256SUMS.
+// Those are what this refuses, and the reason is the store rather than the
+// format — which is why the paths are given rather than inferred.
+func singleRootPath(repository host.Repository) (string, error) {
+	if len(repository.CommitPaths) != 1 {
+		return "", &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "resolve S3 commit path",
+			Err: fmt.Errorf("format %q makes a revision live by switching %d paths, and an object store commits one",
+				repository.Format, len(repository.CommitPaths))}
+	}
+	return repository.CommitPaths[0], nil
+}
+
+func descriptorFromRequest(repository host.Repository, request host.StageRequest) (publicationDescriptor, string, error) {
+	rootPath, err := singleRootPath(repository)
+	if err != nil {
+		return publicationDescriptor{}, "", err
+	}
 	if !hexdigest.ValidSHA256(request.TreeSHA256) || !hexdigest.ValidSHA256(request.PlanID) || !changeIDPattern.MatchString(request.ChangeID) {
 		return publicationDescriptor{}, "", &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "stage S3 repository", Err: errors.New("stage identity or tree digest is invalid")}
 	}
-	if len(request.CommitPaths) != 1 || request.CommitPaths[0] != pypiRootPath {
-		return publicationDescriptor{}, "", &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "stage S3 repository", Err: errors.New("PyPI requires simple/index.html as its only commit path")}
+	if len(request.CommitPaths) != 1 || request.CommitPaths[0] != rootPath {
+		return publicationDescriptor{}, "", &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "stage S3 repository",
+			Err: fmt.Errorf("format %q must commit %q and nothing else", repository.Format, rootPath)}
 	}
 	files := append([]host.File(nil), request.Files...)
 	sort.Slice(files, func(left, right int) bool { return files[left].Path < files[right].Path })
@@ -685,7 +726,7 @@ func descriptorFromRequest(request host.StageRequest) (publicationDescriptor, st
 			return publicationDescriptor{}, "", &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "stage S3 repository", Err: errors.New("stage exceeds tree size limit")}
 		}
 		total += file.Size
-		rootFound = rootFound || file.Path == pypiRootPath
+		rootFound = rootFound || file.Path == rootPath
 	}
 	if !rootFound {
 		return publicationDescriptor{}, "", &host.Error{Kind: host.ErrorInvalidConfiguration, Operation: "stage S3 repository", Err: errors.New("stage has no PyPI root index")}
@@ -805,6 +846,10 @@ func (adapter *Adapter) materializePublicationManifest(ctx context.Context, repo
 }
 
 func (adapter *Adapter) prepareRestore(ctx context.Context, repository host.Repository, restoreID string, after publicationDescriptor, before host.PublishedRevision) (string, string, error) {
+	rootPath, err := singleRootPath(repository)
+	if err != nil {
+		return "", "", err
+	}
 	descriptor := restoreDescriptor{
 		PlanID: after.PlanID, ChangeID: after.ChangeID, AfterTreeSHA256: after.TreeSHA256,
 		RootExisted: before.NativeRevision != "", BeforeTreeSHA256: before.TreeSHA256,
@@ -812,7 +857,7 @@ func (adapter *Adapter) prepareRestore(ctx context.Context, repository host.Repo
 	}
 	rootDigest := ""
 	if descriptor.RootExisted {
-		content, info, err := adapter.client.Get(ctx, objectKey(repository, pypiRootPath), maximumMetadataSize)
+		content, info, err := adapter.client.Get(ctx, objectKey(repository, rootPath), maximumMetadataSize)
 		if err != nil {
 			return "", "", infrastructure("retain prior S3 root", err)
 		}
@@ -823,7 +868,7 @@ func (adapter *Adapter) prepareRestore(ctx context.Context, repository host.Repo
 		descriptor.BeforeMetadata = info.Metadata
 		_, err = adapter.client.Put(ctx, PutRequest{
 			Key: restoreRootKey(repository, restoreID), Body: bytes.NewReader(content), Size: int64(len(content)),
-			SHA256: rootDigest, ContentType: contentType(pypiRootPath),
+			SHA256: rootDigest, ContentType: contentType(rootPath),
 			Metadata: map[string]string{"sha256": rootDigest}, Conditions: Conditions{IfNoneMatch: true},
 		})
 		if errors.Is(err, ErrPrecondition) {
@@ -870,7 +915,7 @@ func (adapter *Adapter) loadStage(ctx context.Context, repository host.Repositor
 	if err != nil {
 		return publicationDescriptor{}, infrastructure("read S3 stage descriptor", err)
 	}
-	return decodePublicationDescriptor(content, "decode S3 stage descriptor")
+	return decodePublicationDescriptor(repository, content, "decode S3 stage descriptor")
 }
 
 func (adapter *Adapter) loadStagePointer(ctx context.Context, repository host.Repository, effectID string) (stagePointer, error) {
@@ -894,7 +939,7 @@ func (adapter *Adapter) loadRelease(ctx context.Context, repository host.Reposit
 	if err := json.Unmarshal(content, &descriptor); err != nil {
 		return releaseDescriptor{}, "", &host.Error{Kind: host.ErrorIndeterminate, Operation: "decode S3 release descriptor", Err: err}
 	}
-	validated, _, validationErr := descriptorFromRequest(host.StageRequest{
+	validated, _, validationErr := descriptorFromRequest(repository, host.StageRequest{
 		PlanID: strings.Repeat("0", sha256.Size*2), ChangeID: "release:000000000000", TreeSHA256: descriptor.TreeSHA256,
 		Files: descriptor.Files, CommitPaths: descriptor.CommitPaths,
 	})
@@ -913,7 +958,7 @@ func (adapter *Adapter) loadRelease(ctx context.Context, repository host.Reposit
 	return descriptor, digestBytes(content), nil
 }
 
-func decodePublicationDescriptor(content []byte, operation string) (publicationDescriptor, error) {
+func decodePublicationDescriptor(repository host.Repository, content []byte, operation string) (publicationDescriptor, error) {
 	var descriptor publicationDescriptor
 	if err := json.Unmarshal(content, &descriptor); err != nil {
 		return publicationDescriptor{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: operation, Err: err}
@@ -922,7 +967,7 @@ func decodePublicationDescriptor(content []byte, operation string) (publicationD
 		PlanID: descriptor.PlanID, ChangeID: descriptor.ChangeID, TreeSHA256: descriptor.TreeSHA256,
 		Files: descriptor.Files, CommitPaths: descriptor.CommitPaths,
 	}
-	validated, _, err := descriptorFromRequest(request)
+	validated, _, err := descriptorFromRequest(repository, request)
 	if err != nil || !reflect.DeepEqual(validated, descriptor) {
 		return publicationDescriptor{}, &host.Error{Kind: host.ErrorIndeterminate, Operation: operation, Err: errors.New("descriptor is not canonical")}
 	}
@@ -1246,6 +1291,10 @@ func revisionFromRestore(nativeRevision string, descriptor restoreDescriptor) ho
 }
 
 func (adapter *Adapter) validateRestoreTarget(ctx context.Context, repository host.Repository, descriptor restoreDescriptor, rootContent []byte) error {
+	rootPath, err := singleRootPath(repository)
+	if err != nil {
+		return err
+	}
 	if descriptor.BeforeTreeSHA256 == "" {
 		return nil
 	}
@@ -1278,7 +1327,7 @@ func (adapter *Adapter) validateRestoreTarget(ctx context.Context, repository ho
 			return infrastructure("inspect retained S3 release object", err)
 		}
 	}
-	immutableRoot, _, err := adapter.client.Get(ctx, releaseKey(repository, revision.TreeSHA256, pypiRootPath), maximumMetadataSize)
+	immutableRoot, _, err := adapter.client.Get(ctx, releaseKey(repository, revision.TreeSHA256, rootPath), maximumMetadataSize)
 	if errors.Is(err, ErrNotFound) {
 		return &host.Error{Kind: host.ErrorIndeterminate, Operation: "validate S3 restore target", Err: errors.New("retained immutable root is missing")}
 	}
@@ -1296,8 +1345,12 @@ func (adapter *Adapter) validateRestoreTarget(ctx context.Context, repository ho
 }
 
 func (adapter *Adapter) restorePostcondition(ctx context.Context, repository host.Repository, descriptor restoreDescriptor, restore host.RestoreRef) (bool, host.PublishedRevision, error) {
+	rootPath, err := singleRootPath(repository)
+	if err != nil {
+		return false, host.PublishedRevision{}, err
+	}
 	if !descriptor.RootExisted {
-		_, err := adapter.client.Head(ctx, objectKey(repository, pypiRootPath))
+		_, err := adapter.client.Head(ctx, objectKey(repository, rootPath))
 		if errors.Is(err, ErrNotFound) {
 			return true, host.PublishedRevision{}, nil
 		}
@@ -1306,7 +1359,7 @@ func (adapter *Adapter) restorePostcondition(ctx context.Context, repository hos
 		}
 		return false, host.PublishedRevision{}, nil
 	}
-	content, info, err := adapter.client.Get(ctx, objectKey(repository, pypiRootPath), maximumMetadataSize)
+	content, info, err := adapter.client.Get(ctx, objectKey(repository, rootPath), maximumMetadataSize)
 	if errors.Is(err, ErrNotFound) {
 		return false, host.PublishedRevision{}, nil
 	}
@@ -1346,7 +1399,7 @@ func effectIdentifier(planID, changeID string) string {
 }
 
 func (adapter *Adapter) stageResult(ctx context.Context, repository host.Repository, identifier string, descriptor publicationDescriptor) (host.StagedPublication, error) {
-	routes, err := clientRoutes(strings.TrimSuffix(repository.CanonicalEndpoint, "/")+"/.snailmail/stages/"+identifier, descriptor.Files, nil)
+	routes, err := clientRoutes(strings.TrimSuffix(repository.CanonicalEndpoint, "/")+"/.snailmail/stages/"+identifier, "", descriptor.Files, nil)
 	if err != nil {
 		return host.StagedPublication{}, err
 	}
@@ -1382,13 +1435,17 @@ func (adapter *Adapter) issueAccess(ctx context.Context, repository host.Reposit
 	return access, nil
 }
 
-func canonicalClientRoutes(endpoint, treeSHA256 string, files []host.File, rootContent []byte) ([]host.ClientRoute, error) {
+// canonicalClientRoutes says where a client reads each published file from. The
+// root is served from the canonical endpoint, because that is the object a
+// commit switched; every other file is read from its immutable release, which
+// nothing rewrites.
+func canonicalClientRoutes(endpoint, treeSHA256, rootPath string, files []host.File, rootContent []byte) ([]host.ClientRoute, error) {
 	releaseEndpoint := strings.TrimSuffix(endpoint, "/") + "/.snailmail/releases/" + treeSHA256
 	routes := make([]host.ClientRoute, 0, len(files))
 	for _, file := range files {
 		base := releaseEndpoint
 		content := []byte(nil)
-		if file.Path == pypiRootPath {
+		if file.Path == rootPath {
 			base = endpoint
 			content = rootContent
 		}
@@ -1401,11 +1458,11 @@ func canonicalClientRoutes(endpoint, treeSHA256 string, files []host.File, rootC
 	return routes, nil
 }
 
-func clientRoutes(endpoint string, files []host.File, rootContent []byte) ([]host.ClientRoute, error) {
+func clientRoutes(endpoint, rootPath string, files []host.File, rootContent []byte) ([]host.ClientRoute, error) {
 	routes := make([]host.ClientRoute, 0, len(files))
 	for _, file := range files {
 		content := []byte(nil)
-		if file.Path == pypiRootPath {
+		if rootPath != "" && file.Path == rootPath {
 			content = rootContent
 		}
 		route, err := clientRoute(endpoint, file, content)
