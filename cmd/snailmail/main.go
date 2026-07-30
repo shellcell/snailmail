@@ -138,7 +138,8 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	format := args[0]
 	flags := newCommandFlags("setup "+format, stderr).withWorkspace().withJSON()
 	name := flags.String("name", "", "repository name")
-	output := flags.String("output", "", "workspace-relative published directory")
+	output := flags.String("output", "",
+		"published directory: workspace-relative for a local host, an absolute remote path for rsync")
 	hostType := flags.String("host", "local", "host type: local, s3, or github-pages")
 	visibility := flags.String("visibility", "public", "repository visibility")
 	gatePolicy := flags.String("gate", "auto", "publication gate: auto, pr, or approval")
@@ -146,6 +147,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	signingKey := flags.String("signing-key", "", "repository signing key name")
 	allowUnsigned := flags.Bool("allow-unsigned", false, "explicitly allow a new unsigned Debian repository")
 	track := flags.String("track", "stable", "rendered placement track")
+	sshTarget := flags.String("target", "", "ssh destination for an rsync host, such as deploy@packages.example")
 	bucket := flags.String("bucket", "", "S3 bucket")
 	prefix := flags.String("prefix", "", "S3 object prefix")
 	region := flags.String("region", "", "AWS region")
@@ -176,6 +178,7 @@ func runSetup(args []string, stdout, stderr io.Writer) error {
 	if err := engine.SetupRepository(engine.SetupRepositoryRequest{
 		Root: flags.Root(), Name: *name, Format: format, Output: *output,
 		HostType: *hostType, Visibility: *visibility, Gate: *gatePolicy, ApprovalKeys: resolvedApprovalKeys, SigningKey: *signingKey, AllowUnsigned: *allowUnsigned, Bucket: *bucket, Prefix: *prefix,
+		Target: *sshTarget,
 		Region: *region, Endpoint: *endpoint, CanonicalEndpoint: *canonicalEndpoint,
 		UsePathStyle: *usePathStyle,
 		ReadAuth:     *readAuth, CredentialBroker: *credentialBroker,

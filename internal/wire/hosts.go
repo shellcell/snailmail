@@ -8,6 +8,7 @@ import (
 	commandcredential "github.com/shellcell/snailmail/adapters/credential/command"
 	githubpages "github.com/shellcell/snailmail/adapters/host/githubpages"
 	localhost "github.com/shellcell/snailmail/adapters/host/local"
+	rsynchost "github.com/shellcell/snailmail/adapters/host/rsync"
 	s3host "github.com/shellcell/snailmail/adapters/host/s3"
 	"github.com/shellcell/snailmail/host"
 )
@@ -35,6 +36,8 @@ func (resolver *HostResolver) Resolve(ctx context.Context, repository host.Repos
 			return s3host.NewAWS(ctx, repository, broker)
 		}
 		return s3host.NewAWS(ctx, repository)
+	case "rsync":
+		return rsynchost.New(&rsynchost.SSHRunner{Target: repository.Target}), nil
 	case "github-pages":
 		return githubpages.New(), nil
 	default:

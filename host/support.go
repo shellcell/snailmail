@@ -83,6 +83,21 @@ var formatSupport = map[string]map[string]FormatSupport{
 	// tree, which is atomic and format-neutral, so a suite's Release and its
 	// Packages and pool become live together. That is what Debian needs and
 	// what an object store cannot offer without an ordered multi-object commit.
+	// A directory reached over ssh commits by renaming one symlink over another,
+	// which makes the whole tree live at once. That is the same format-neutral
+	// atomicity Pages gets from an orphan commit, and it is why this host serves
+	// every format — including a signed yum repository, whose repomd.xml and
+	// repomd.xml.asc must become live together and which an object store therefore
+	// cannot serve at all. The adapter never inspects commit paths, because with a
+	// whole-tree swap their number does not matter.
+	"rsync": {
+		"pypi": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		"deb":  {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		"helm": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		"raw":  {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		"rpm":  {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+		"apk":  {Publish: true, RemoteClientVerification: true, InstallDocument: true},
+	},
 	"github-pages": {
 		"pypi": {Publish: true, RemoteClientVerification: true, InstallDocument: true},
 		"deb":  {Publish: true, RemoteClientVerification: true, InstallDocument: true},

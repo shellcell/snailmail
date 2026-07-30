@@ -123,7 +123,7 @@ func Setup(root string, options SetupOptions) error {
 		Format: options.Format, Lock: lockPath, Gate: gatePolicy, ApprovalKeys: append([]string(nil), options.ApprovalKeys...), SigningKeys: append([]string(nil), options.SigningKeys...), Visibility: visibility,
 		Track: options.Track,
 		Host: HostConfig{
-			Type: hostType, Path: filepath.ToSlash(options.Output), Bucket: options.Bucket,
+			Type: hostType, Path: filepath.ToSlash(options.Output), Target: options.Target, Bucket: options.Bucket,
 			Prefix: options.Prefix, Region: options.Region, Endpoint: options.Endpoint,
 			CanonicalEndpoint: options.CanonicalEndpoint, UsePathStyle: options.UsePathStyle,
 			ReadAuth: options.ReadAuth, CredentialBroker: options.CredentialBroker,
@@ -487,6 +487,35 @@ func validateRepositoryHost(name string, repository Repository) error {
 		// without it the published listing has no install instructions to show
 		// and clients get no address to point at. It is documentation only:
 		// nothing publishes to it, so it is validated and otherwise unused.
+		if repository.Host.CanonicalEndpoint != "" {
+			if err := validateHTTPURL(repository.Host.CanonicalEndpoint); err != nil {
+				return fmt.Errorf("repository %q base URL: %w", name, err)
+			}
+		}
+	case "rsync":
+		if err := requireHostServesFormat(name, repository); err != nil {
+			return err
+		}
+		if repository.Host.Target == "" {
+			return fmt.Errorf("repository %q rsync host requires an ssh target", name)
+		}
+		if strings.ContainsAny(repository.Host.Target, " \t\r\n\x00") {
+			return fmt.Errorf("repository %q rsync host target %q is not a valid ssh destination", name, repository.Host.Target)
+		}
+		// Absolute, because a relative path is resolved against whichever home
+		// directory the ssh user has, and ssh_config can change that user without
+		// this workspace knowing.
+		if !strings.HasPrefix(repository.Host.Path, "/") || path.Clean(repository.Host.Path) == "/" {
+			return fmt.Errorf("repository %q rsync host path must be an absolute path below the filesystem root", name)
+		}
+		if repository.Host.Bucket != "" || repository.Host.Prefix != "" || repository.Host.Repository != "" || repository.Host.Branch != "" {
+			return fmt.Errorf("repository %q rsync host has configuration belonging to another host type", name)
+		}
+		// Nothing here can issue scoped read credentials: the directory is as
+		// public as the web server in front of it makes it.
+		if repository.Visibility != "public" {
+			return fmt.Errorf("repository %q: rsync hosting serves whatever the web server serves, so it supports public repositories only", name)
+		}
 		if repository.Host.CanonicalEndpoint != "" {
 			if err := validateHTTPURL(repository.Host.CanonicalEndpoint); err != nil {
 				return fmt.Errorf("repository %q base URL: %w", name, err)
@@ -1549,6 +1578,8 @@ func publicationTargets(repository Repository) []string {
 	switch repository.Host.Type {
 	case "s3":
 		return []string{"s3 bucket " + repository.Host.Bucket + " under prefix /" + strings.Trim(repository.Host.Prefix, "/")}
+	case "rsync":
+		return []string{repository.Host.Target + ":" + repository.Host.Path}
 	case "github-pages":
 		targets := []string{"GitHub Pages branch " + repository.Host.Branch + " of " + repository.Host.Repository}
 		if repository.Host.PreviewRepository != "" {

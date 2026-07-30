@@ -674,6 +674,40 @@ is this package published?* That is the price of splitting, and it is the reason
 not to split by default.
 
 
+### 6.2 What makes an ssh publication atomic
+
+An object store gives a conditional PUT, and every guarantee the S3 adapter makes
+is built on it. A directory reached over ssh gives neither conditionals nor
+transactions, so an adapter for it has to build both out of POSIX, and it is worth
+saying which primitives before writing the code.
+
+**Atomicity comes from `rename(2)` on a symlink.** The published path is a symlink
+into `.snailmail/releases/<tree>/`, and a publication becomes live when a new
+symlink is renamed over the old one. `rename` is atomic within a filesystem, so a
+client either follows the old revision or the new one and never a half-written
+tree. The tree itself is copied into a temporary directory and renamed into place
+first, so the symlink never points at a partial release. This is the same
+two-phase shape the object store uses — write everything, then switch one thing —
+with a symlink playing the part of the root object.
+
+**Conditionality comes from `mkdir(2)`.** There is no compare-and-swap on a
+symlink, so a lock is taken by creating a directory, which fails if it already
+exists and is atomic on every POSIX filesystem including NFS. The expected
+revision is read and the swap performed while holding it. Two runners publishing
+at once means one fails, as everywhere else — not one waits.
+
+**Restore is not offered.** Rolling back means pointing the symlink at an earlier
+release, which the mechanism supports; what it cannot do is establish that the
+earlier release is still intact, because nothing on the far side verifies it. The
+adapter declines rather than offering a rollback whose target it cannot check, the
+same way the local adapter does.
+
+The consequence worth stating: this host requires the published path and the
+release directory to be on **one filesystem**, because `rename` is not atomic
+across mount points. An adapter cannot detect that reliably from the near side, so
+it is a documented requirement rather than a checked one.
+
+
 ## 7. `snailmail setup <format>`
 
 The wizard is the adoption surface, so it produces five things, not one:

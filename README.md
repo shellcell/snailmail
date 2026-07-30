@@ -370,6 +370,60 @@ prefixes. What you lose is the shared view: `snailmail site` describes one
 workspace, so splitting means several index pages and no single answer to where a
 package is published.
 
+## Publishing over ssh
+
+The `rsync` host publishes to a directory on a machine you reach over ssh — the
+shape most people already have, where a web server serves a filesystem path.
+
+```sh
+snailmail setup rpm --name yum --host rsync \
+  --target deploy@packages.example \
+  --output /srv/www/yum \
+  --base-url https://packages.example/yum
+```
+
+`--output` is the absolute path on the far side, where for a local host it is
+workspace-relative. `--target` is the ssh destination; port, key and jump host
+belong in `ssh_config`.
+
+**This is the only host that serves every format**, including a signed yum
+repository. A revision goes live by renaming one symlink, so the whole tree
+switches at once and the number of files that must change together does not
+matter. An object store commits one object and no more, which is why it cannot
+serve Debian, Alpine, or signed yum at all.
+
+Two POSIX primitives carry the guarantees, neither of them from the transport:
+
+- **`rename(2)` makes a publication atomic.** The published path is a symlink into
+  `.snailmail/releases/<tree>/`, and a revision goes live when a new symlink is
+  renamed over the old one. A client follows one whole revision or the other,
+  never a half-copied tree. The tree is copied to a staging path and renamed into
+  its release first, so the symlink never points at a partial release.
+- **`mkdir(2)` makes it conditional.** There is no compare-and-swap on a symlink,
+  so the expected revision is checked and the swap performed while holding a lock
+  directory whose creation fails if it already exists. Two runners publishing at
+  once means one fails, not one waits — the same answer every other host gives.
+
+`snailmail collect` works here too. Every revision leaves a tree under
+`.snailmail/releases/`, and the swap that makes a new one live does not remove the
+one it replaced. Collection keeps the live revision — read from the far side, not
+trusted from the workspace — and whatever retention names. Unlike object storage
+there is no restore target held back, because rollback is not offered, so an older
+revision survives only if you ask for it.
+
+Requirements and limits, stated because they are not checked from this side:
+
+- The published path and its release directory must be on **one filesystem**,
+  since `rename` is not atomic across mount points.
+- ssh options — port, key, jump host — belong in `ssh_config`. A second place to
+  configure ssh is a second place for it to be wrong.
+- A path that already exists and was not published by snailmail is **refused**
+  rather than replaced, so a publication cannot unpublish somebody else's files.
+- **Rollback is not offered.** Pointing the symlink at an earlier release is easy;
+  establishing that the release is still intact is not, because nothing on the far
+  side verifies it. The adapter declines rather than claiming a rollback it cannot
+  check.
+
 ## Browsing a bucket-hosted repository
 
 A repository published to object storage serves `index.html` at its root, so

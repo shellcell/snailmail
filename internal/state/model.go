@@ -81,8 +81,13 @@ type KeyRef struct {
 }
 
 type HostConfig struct {
-	Type              string `toml:"type" json:"type"`
-	Path              string `toml:"path,omitempty" json:"path,omitempty"`
+	Type string `toml:"type" json:"type"`
+	Path string `toml:"path,omitempty" json:"path,omitempty"`
+	// Target is the ssh destination for an rsync host: a hostname, user@host, or
+	// a name from ssh_config. Everything else about the connection — port, key,
+	// jump host — belongs in ssh_config, because an operator already has a place
+	// for it and a second one is a second place for it to be wrong.
+	Target            string `toml:"target,omitempty" json:"target,omitempty"`
 	Bucket            string `toml:"bucket,omitempty" json:"bucket,omitempty"`
 	Prefix            string `toml:"prefix,omitempty" json:"prefix,omitempty"`
 	Region            string `toml:"region,omitempty" json:"region,omitempty"`
@@ -380,6 +385,7 @@ type SetupOptions struct {
 	AllowUnsigned     bool
 	Track             string
 	Visibility        string
+	Target            string
 	Bucket            string
 	Prefix            string
 	Region            string

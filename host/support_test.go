@@ -10,7 +10,7 @@ import (
 func TestSupportsDeniesUnknownPairs(t *testing.T) {
 	for _, pair := range [][2]string{
 		{"", ""},
-		{"rsync", "pypi"},
+		{"rsync", "cargo"},
 		// cargo has no format implementation, so no host can serve it.
 		{"local", "cargo"},
 		// An object store commits one object, so a format qualifies only if one

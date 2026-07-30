@@ -59,11 +59,13 @@ type Repository struct {
 	// it: one whose non-root paths are rewritten between revisions, so a new
 	// revision cannot simply be written alongside the live one. Nil otherwise,
 	// including for formats that need no staging at all.
-	RootRewriter      RootRewriter
-	Type              string
-	Visibility        string
-	WorkspaceRoot     string
-	Path              string
+	RootRewriter  RootRewriter
+	Type          string
+	Visibility    string
+	WorkspaceRoot string
+	Path          string
+	// Target is the ssh destination for an rsync host.
+	Target            string
 	Bucket            string
 	Prefix            string
 	Region            string
